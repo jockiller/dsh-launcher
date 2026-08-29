@@ -184,8 +184,8 @@ fn platform_config_dir(platform: PlatformTarget, lookup: EnvLookup<'_>) -> Optio
             .join(APP_DIR_NAME),
         PlatformTarget::Unix => {
             let base = lookup("XDG_CONFIG_HOME")
+                .filter(|value| value.starts_with('/'))
                 .map(PathBuf::from)
-                .filter(|base| base.is_absolute())
                 .unwrap_or_else(|| home.join(".config"));
             base.join(APP_DIR_NAME)
         }
