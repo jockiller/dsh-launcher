@@ -19,14 +19,14 @@ jobs:
           - name: macOS arm64
             os: macos-15
             rust-target: aarch64-apple-darwin
-            bundles: dmg
+            bundles: app
             artifact: macos-arm64
             paths: |
               src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
           - name: macOS x64
             os: macos-15-intel
             rust-target: x86_64-apple-darwin
-            bundles: dmg
+            bundles: app
             artifact: macos-x64
             paths: |
               src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
@@ -117,21 +117,40 @@ jobs:
           fi
           pnpm exec tauri build --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }}
 
-      - name: Verify macOS local-network metadata and signature
+      - name: Sign macOS app and create DMG
         if: runner.os == 'macOS'
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
         run: |
-          app=$(find "src-tauri/target/${{ matrix.rust-target }}/release/bundle/macos" -maxdepth 1 -name '*.app' -print -quit)
-          test -n "$app"
-          description=$(plutil -extract NSLocalNetworkUsageDescription raw "$app/Contents/Info.plist")
-          test -n "$description"
-          if [[ -n "$APPLE_CERTIFICATE" ]]; then
-            codesign --verify --deep --strict --verbose=2 "$app"
-          else
-            echo "APPLE_CERTIFICATE is not configured; local-network permission identity may not be tracked reliably."
+          bundle_dir="src-tauri/target/${{ matrix.rust-target }}/release/bundle"
+          app=$(find "$bundle_dir/macos" -maxdepth 1 -name '*.app' -print -quit)
+          if [[ -z "$app" ]]; then
+            echo "No macOS app bundle was generated for ${{ matrix.rust-target }}." >&2
+            exit 1
           fi
+
+          plist="$app/Contents/Info.plist"
+          description=$(plutil -extract NSLocalNetworkUsageDescription raw "$plist")
+          local_networking=$(plutil -extract NSAppTransportSecurity.NSAllowsLocalNetworking raw "$plist")
+          test -n "$description"
+          test "$local_networking" = "true"
+
+          if [[ -z "$APPLE_CERTIFICATE" ]]; then
+            codesign --force --deep --sign - --identifier ai.deepseek.dsh-launcher "$app"
+          fi
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+          dmg_dir="$bundle_dir/dmg"
+          stage="$dmg_dir/.stage"
+          dmg="$dmg_dir/DSH_Launcher_${{ matrix.artifact }}.dmg"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          ditto "$app" "$stage/DSH Launcher.app"
+          ln -s /Applications "$stage/Applications"
+          rm -f "$dmg"
+          hdiutil create -quiet -volname "DSH Launcher" -srcfolder "$stage" -ov -format UDZO "$dmg"
+          rm -rf "$stage"
 
       - name: Archive AppImage with executable permissions
         if: runner.os == 'Linux'

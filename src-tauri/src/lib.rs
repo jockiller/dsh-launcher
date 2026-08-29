@@ -1,6 +1,4 @@
 mod config;
-#[cfg(target_os = "macos")]
-mod local_network;
 mod service;
 
 use std::path::PathBuf;
@@ -109,7 +107,9 @@ fn service_status(state: State<'_, AppState>) -> Result<ServiceStatus, String> {
 
 #[tauri::command]
 fn embedded_webview_open(app: AppHandle) -> bool {
-    app.get_webview_window("dsh-webview").is_some()
+    app.get_webview_window("dsh-webview")
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false)
 }
 
 #[tauri::command]
@@ -131,9 +131,6 @@ pub fn run() {
             service: Mutex::new(ServiceManager::new()),
         })
         .setup(|app| {
-            #[cfg(target_os = "macos")]
-            local_network::trigger_privacy_prompt();
-
             let config = LauncherConfig::load();
             if config.auto_start {
                 let state = app.state::<AppState>();

@@ -75,7 +75,7 @@ pnpm run tauri build
 
 The included GitHub Actions workflow ([.github/workflows/build.yml](.github/workflows/build.yml)) uses pnpm 11 to build candidate artifacts on native macOS, Windows, and Linux runners, with arm64 and x64 covered on all three platforms: DMG for macOS, NSIS for Windows, and DEB, RPM, and AppImage for Linux.
 
-macOS identifies an app's Local Network privilege by its code signature. Configure an Apple Developer ID certificate so the permission remains reliable across upgrades and reinstalls. Unsigned or ad-hoc signed packages still build, but macOS may not track their permission state consistently. The GitHub Actions workflow supports these repository secrets:
+The macOS build does not require an Apple Developer account. Without a certificate, the workflow ad-hoc signs the complete `.app` with a fixed bundle identifier before creating the DMG, allowing macOS to read the Local Network usage description and request permission. Ad-hoc signing provides neither notarization nor a trusted developer identity, so upgrades or reinstalls may require permission again. For stable identity across releases and formal distribution, configure these repository secrets:
 
 - `APPLE_CERTIFICATE`: Base64-encoded `.p12` certificate
 - `APPLE_CERTIFICATE_PASSWORD`: Certificate password

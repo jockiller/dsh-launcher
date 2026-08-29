@@ -1115,8 +1115,11 @@ fn perform_launch_action(
 
 fn open_embedded_webview(app: &AppHandle, url: &str) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("dsh-webview") {
-        window.set_focus().map_err(|error| error.to_string())?;
-        return Ok(());
+        return window
+            .show()
+            .and_then(|_| window.unminimize())
+            .and_then(|_| window.set_focus())
+            .map_err(|error| format!("显示内置 WebView 失败：{error}"));
     }
     let parsed = url
         .parse()
@@ -1157,10 +1160,12 @@ fn open_embedded_webview(app: &AppHandle, url: &str) -> Result<(), String> {
 fn register_window_state_persistence(window: &WebviewWindow) {
     let app = window.app_handle().clone();
     window.on_window_event(move |event| {
-        if matches!(event, WindowEvent::CloseRequested { .. })
+        if let WindowEvent::CloseRequested { api, .. } = event
             && let Some(window) = app.get_webview_window("dsh-webview")
         {
             save_window_state(&window);
+            api.prevent_close();
+            let _ = window.hide();
         }
     });
 }
@@ -1225,30 +1230,60 @@ fn rectangles_overlap(
 fn close_embedded_webview(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("dsh-webview") {
         save_window_state(&window);
-        let _ = window.close();
+        let _ = window.destroy();
     }
 }
 
+#[cfg(target_os = "macos")]
 pub fn open_default(url: &str) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    let status = Command::new("open").arg(url).status();
-    #[cfg(target_os = "windows")]
-    let status = {
-        // start 是 cmd 内建命令，必须经 cmd.exe 调用；参数逐项传递，URL 由内部按已校验的 host/port 拼装。
-        let mut command = Command::new("cmd");
-        command.args(["/C", "start", "", url]);
-        suppress_console_window(&mut command);
-        command.status()
-    };
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let result = open_default_unix(url);
-    #[cfg(not(all(unix, not(target_os = "macos"))))]
-    let result = status
+    Command::new("open")
+        .arg(url)
+        .status()
         .map_err(|error| format!("打开浏览器失败：{error}"))?
         .success()
         .then_some(())
-        .ok_or_else(|| "打开浏览器失败".into());
-    result
+        .ok_or_else(|| "打开浏览器失败".into())
+}
+
+#[cfg(target_os = "windows")]
+pub fn open_default(url: &str) -> Result<(), String> {
+    open_default_windows(url)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn open_default(url: &str) -> Result<(), String> {
+    open_default_unix(url)
+}
+
+#[cfg(windows)]
+fn open_default_windows(url: &str) -> Result<(), String> {
+    let mut failures = Vec::new();
+
+    let mut explorer = Command::new("explorer.exe");
+    explorer.arg(url);
+    suppress_console_window(&mut explorer);
+    match explorer.status() {
+        Ok(status) if status.success() => return Ok(()),
+        Ok(status) => failures.push(format!("explorer.exe 退出码 {status}")),
+        Err(error) => failures.push(format!("explorer.exe：{error}")),
+    }
+
+    // `start` is a cmd built-in. Keep this fallback for stripped-down Windows
+    // environments where Explorer cannot resolve the URL shell association.
+    let mut command = Command::new("cmd.exe");
+    command.args(["/D", "/C", "start", "", url]);
+    suppress_console_window(&mut command);
+    match command.status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!(
+            "打开浏览器失败：{}；cmd.exe 退出码 {status}",
+            failures.join("；")
+        )),
+        Err(error) => Err(format!(
+            "打开浏览器失败：{}；cmd.exe：{error}",
+            failures.join("；")
+        )),
+    }
 }
 
 /// 纯逻辑：按桌面环境给出打开 URL 的候选程序及参数，按尝试顺序排列。

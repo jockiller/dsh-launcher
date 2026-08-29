@@ -75,7 +75,7 @@ pnpm run tauri build
 
 仓库中的 GitHub Actions 工作流（[.github/workflows/build.yml](.github/workflows/build.yml)）使用 pnpm 11 在原生 macOS、Windows 和 Linux runner 上构建候选产物，三个平台均覆盖 arm64 / x64：macOS 生成 DMG，Windows 生成 NSIS，Linux 生成 DEB、RPM 和 AppImage。
 
-macOS 的“本地网络”权限以代码签名标识应用。要让权限在升级和重装后可靠保持，请配置 Apple Developer ID 签名证书；未签名或 ad-hoc 签名包仍可构建，但系统可能无法稳定识别其权限状态。GitHub Actions 支持以下仓库 Secrets：
+macOS 构建不要求 Apple Developer 账户。未配置证书时，工作流会先对完整 `.app` 执行 ad-hoc 签名并固定 Bundle ID，再从签名后的应用生成 DMG；这可让系统读取本地网络用途声明并申请权限。ad-hoc 签名不提供公证或可信开发者身份，升级或重装后可能需要重新授权。若需要稳定的跨版本权限身份和正式分发，请配置以下 GitHub Actions 仓库 Secrets：
 
 - `APPLE_CERTIFICATE`：Base64 编码的 `.p12` 证书
 - `APPLE_CERTIFICATE_PASSWORD`：证书密码
