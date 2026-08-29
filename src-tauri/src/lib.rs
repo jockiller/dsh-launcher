@@ -7,6 +7,8 @@ use std::sync::Mutex;
 use config::LauncherConfig;
 use serde::Serialize;
 use service::{ServiceManager, ServiceStatus};
+#[cfg(windows)]
+use tauri::WindowEvent;
 use tauri::{AppHandle, Manager, RunEvent, State};
 
 struct AppState {
@@ -124,6 +126,14 @@ fn open_service_url(app: AppHandle, state: State<'_, AppState>) -> Result<(), St
     service::open_configured(&app, &LauncherConfig::load(), &url)
 }
 
+fn shutdown_service(handle: &AppHandle) {
+    if let Some(state) = handle.try_state::<AppState>()
+        && let Ok(mut service) = state.service.lock()
+    {
+        let _ = service.stop(Some(handle));
+    }
+}
+
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -157,11 +167,22 @@ pub fn run() {
         .expect("failed to build DSH Launcher");
 
     app.run(|handle, event| {
-        if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit)
-            && let Some(state) = handle.try_state::<AppState>()
-            && let Ok(mut service) = state.service.lock()
+        #[cfg(windows)]
+        if let RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::CloseRequested { api, .. },
+            ..
+        } = &event
+            && label == "main"
         {
-            let _ = service.stop(Some(handle));
+            api.prevent_close();
+            shutdown_service(handle);
+            handle.exit(0);
+            return;
+        }
+
+        if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
+            shutdown_service(handle);
         }
     });
 }
