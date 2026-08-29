@@ -1,0 +1,106 @@
+name: Build desktop packages
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            os: macos-15
+            rust-target: aarch64-apple-darwin
+            bundles: dmg
+            artifact: macos-arm64
+            paths: |
+              src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          - name: macOS x64
+            os: macos-15-intel
+            rust-target: x86_64-apple-darwin
+            bundles: dmg
+            artifact: macos-x64
+            paths: |
+              src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+          - name: Windows x64
+            os: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+            bundles: nsis
+            artifact: windows-x64
+            paths: |
+              src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          - name: Linux x64
+            os: ubuntu-22.04
+            rust-target: x86_64-unknown-linux-gnu
+            bundles: deb,rpm,appimage
+            artifact: linux-x64
+            paths: |
+              src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
+              src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm
+              src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.tar.gz
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf libfuse2
+
+      - name: Install pnpm 11
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.rust-target }}
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run frontend checks
+        run: pnpm run build
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build desktop package
+        run: pnpm exec tauri build --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }}
+
+      - name: Archive AppImage with executable permissions
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          appimage=$(find "src-tauri/target/${{ matrix.rust-target }}/release/bundle/appimage" -maxdepth 1 -name '*.AppImage' -print -quit)
+          test -n "$appimage"
+          chmod +x "$appimage"
+          tar -czf "$appimage.tar.gz" -C "$(dirname "$appimage")" "$(basename "$appimage")"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-launcher-${{ matrix.artifact }}
+          path: ${{ matrix.paths }}
+          if-no-files-found: error

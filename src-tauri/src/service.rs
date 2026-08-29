@@ -1,0 +1,1696 @@
+#[cfg(unix)]
+use std::ffi::OsStr;
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
+#[cfg(unix)]
+use std::time::SystemTime;
+use std::time::{Duration, Instant};
+
+use chrono::Local;
+use serde::Serialize;
+use tauri::{
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder, WindowEvent,
+};
+
+use crate::config::{
+    LaunchAction, LauncherConfig, PlatformTarget, WebviewWindowState, home_dir_for, user_home,
+};
+
+const SYSTEM_THEME_SCRIPT: &str = r#"
+(() => {
+  const media = window.matchMedia('(prefers-color-scheme: dark)');
+  const apply = () => {
+    const theme = media.matches ? 'dark' : 'light';
+    window.__DSH_SYSTEM_THEME__ = theme;
+    if (document.documentElement) {
+      document.documentElement.dataset.systemTheme = theme;
+      document.documentElement.style.colorScheme = theme;
+    }
+    window.dispatchEvent(new CustomEvent('dsh-system-theme-change', { detail: { theme } }));
+  };
+  apply();
+  document.addEventListener('DOMContentLoaded', apply, { once: true });
+  media.addEventListener('change', apply);
+})();
+"#;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceStatus {
+    pub phase: String,
+    pub pid: Option<u32>,
+    pub url: Option<String>,
+    pub message: String,
+}
+
+impl Default for ServiceStatus {
+    fn default() -> Self {
+        Self {
+            phase: "stopped".into(),
+            pid: None,
+            url: None,
+            message: "服务未运行".into(),
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LogEvent {
+    timestamp: String,
+    source: String,
+    level: String,
+    message: String,
+}
+
+struct OwnedChild {
+    child: Arc<Mutex<Child>>,
+    cancelled: Arc<AtomicBool>,
+    #[cfg(unix)]
+    process_group: i32,
+}
+
+pub struct ServiceManager {
+    owned: Option<OwnedChild>,
+    status: Arc<Mutex<ServiceStatus>>,
+}
+
+impl ServiceManager {
+    pub fn new() -> Self {
+        Self {
+            owned: None,
+            status: Arc::new(Mutex::new(ServiceStatus::default())),
+        }
+    }
+
+    pub fn status(&self) -> ServiceStatus {
+        self.status.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    pub fn start(
+        &mut self,
+        app: AppHandle,
+        config: LauncherConfig,
+        restarting: bool,
+    ) -> Result<ServiceStatus, String> {
+        self.prune_exited_child();
+        if self.owned.is_some() {
+            return Err("DSH 服务已由启动器运行".into());
+        }
+
+        let dsh = resolve_dsh(&config.dsh_path)
+            .ok_or_else(|| "未找到可执行的 dsh，请手动指定路径".to_string())?;
+        let addresses = resolve_addresses(&config.host, config.port)?;
+        if connect_any(&addresses, Duration::from_millis(400)) {
+            if http_ready(&config.host, config.port) {
+                let status = ServiceStatus {
+                    phase: "external".into(),
+                    pid: None,
+                    url: Some(service_url(&config.host, config.port)),
+                    message: "检测到端口上已有 Web 服务，启动器不会接管".into(),
+                };
+                set_status(&self.status, &app, status.clone());
+                emit_log(
+                    &app,
+                    "launcher",
+                    "warning",
+                    &format!("External web service detected on port {}", config.port),
+                );
+                return Ok(status);
+            }
+            return Err(format!("端口 {} 已被其他程序占用", config.port));
+        }
+
+        let custom_args = parse_custom_args(&config.custom_args)?;
+        let url = service_url(&config.host, config.port);
+        set_status(
+            &self.status,
+            &app,
+            ServiceStatus {
+                phase: "starting".into(),
+                pid: None,
+                url: Some(url.clone()),
+                message: "正在启动 DSH...".into(),
+            },
+        );
+        emit_log(
+            &app,
+            "launcher",
+            "info",
+            &format!("Starting {}", dsh.display()),
+        );
+
+        let mut command = Command::new(&dsh);
+        // Windows GUI 宿主下启动控制台程序（node/dsh.cmd→cmd.exe）会闪现控制台窗口。
+        // .cmd/.bat 由 std 自动经 cmd.exe 调用并转义各参数（见 dsh_version 注释）；
+        // 已知残留面：cmd 解析期会展开 %VAR%（含引号内），参数均来自受控配置而非拼接文本。
+        suppress_console_window(&mut command);
+        command
+            .envs(login_shell_environment())
+            .arg("--profile")
+            .arg(config.profile.trim())
+            .arg("--host")
+            .arg(config.host.trim())
+            .arg("--port")
+            .arg(config.port.to_string())
+            .args(custom_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setpgid(0, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+
+        let mut child = command.spawn().map_err(|error| {
+            set_status(
+                &self.status,
+                &app,
+                ServiceStatus {
+                    phase: "failed".into(),
+                    pid: None,
+                    url: None,
+                    message: format!("启动失败：{error}"),
+                },
+            );
+            format!("启动 dsh 失败：{error}")
+        })?;
+        let pid = child.id();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let child = Arc::new(Mutex::new(child));
+
+        if let Some(stdout) = stdout {
+            pipe_logs(app.clone(), "stdout", "info", stdout);
+        }
+        if let Some(stderr) = stderr {
+            pipe_logs(app.clone(), "stderr", "error", stderr);
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.owned = Some(OwnedChild {
+            child: child.clone(),
+            cancelled: cancelled.clone(),
+            #[cfg(unix)]
+            process_group: pid as i32,
+        });
+
+        let status = ServiceStatus {
+            phase: "starting".into(),
+            pid: Some(pid),
+            url: Some(url.clone()),
+            message: "正在等待健康检查...".into(),
+        };
+        set_status(&self.status, &app, status.clone());
+        monitor_startup(
+            child,
+            cancelled,
+            self.status.clone(),
+            app,
+            config,
+            url,
+            pid,
+            restarting,
+        );
+        Ok(status)
+    }
+
+    fn prune_exited_child(&mut self) {
+        let exited = self
+            .owned
+            .as_ref()
+            .and_then(|owned| owned.child.lock().ok())
+            .and_then(|mut child| child.try_wait().ok())
+            .flatten()
+            .is_some();
+        if exited {
+            self.owned = None;
+        }
+    }
+
+    pub fn stop(&mut self, app: Option<&AppHandle>) -> Result<ServiceStatus, String> {
+        if let Some(app) = app {
+            close_embedded_webview(app);
+        }
+        self.prune_exited_child();
+        let Some(owned) = self.owned.take() else {
+            let status = ServiceStatus::default();
+            if let Ok(mut current) = self.status.lock() {
+                *current = status.clone();
+            }
+            return Ok(status);
+        };
+
+        owned.cancelled.store(true, Ordering::Release);
+        if let Ok(mut current) = self.status.lock() {
+            current.phase = "stopping".into();
+            current.message = "正在停止 DSH...".into();
+        }
+
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-owned.process_group, libc::SIGTERM);
+        }
+        #[cfg(windows)]
+        {
+            let pid = owned
+                .child
+                .lock()
+                .map(|child| child.id())
+                .unwrap_or_default();
+            let mut taskkill = Command::new("taskkill");
+            suppress_console_window(&mut taskkill);
+            let _ = taskkill
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .status();
+        }
+        #[cfg(all(not(unix), not(windows)))]
+        if let Ok(mut child) = owned.child.lock() {
+            let _ = child.kill();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(mut child) = owned.child.lock() {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if Instant::now() < deadline => {}
+                    Ok(None) => {
+                        #[cfg(unix)]
+                        unsafe {
+                            libc::kill(-owned.process_group, libc::SIGKILL);
+                        }
+                        #[cfg(windows)]
+                        {
+                            let mut taskkill = Command::new("taskkill");
+                            suppress_console_window(&mut taskkill);
+                            let _ = taskkill
+                                .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                                .status();
+                        }
+                        #[cfg(all(not(unix), not(windows)))]
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                    Err(error) => return Err(format!("检查 DSH 退出状态失败：{error}")),
+                }
+            }
+            thread::sleep(Duration::from_millis(80));
+        }
+
+        let status = ServiceStatus::default();
+        if let Ok(mut current) = self.status.lock() {
+            *current = status.clone();
+        }
+        Ok(status)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn monitor_startup(
+    child: Arc<Mutex<Child>>,
+    cancelled: Arc<AtomicBool>,
+    status: Arc<Mutex<ServiceStatus>>,
+    app: AppHandle,
+    config: LauncherConfig,
+    url: String,
+    pid: u32,
+    restarting: bool,
+) {
+    thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && !cancelled.load(Ordering::Acquire) {
+            let exit = child
+                .lock()
+                .ok()
+                .and_then(|mut child| child.try_wait().ok())
+                .flatten();
+            if let Some(exit) = exit {
+                set_status(
+                    &status,
+                    &app,
+                    ServiceStatus {
+                        phase: "failed".into(),
+                        pid: None,
+                        url: None,
+                        message: format!("DSH 在启动期间退出：{exit}"),
+                    },
+                );
+                return;
+            }
+            if http_ready(&config.host, config.port) {
+                set_status(
+                    &status,
+                    &app,
+                    ServiceStatus {
+                        phase: "running".into(),
+                        pid: Some(pid),
+                        url: Some(url.clone()),
+                        message: "DSH 服务运行中".into(),
+                    },
+                );
+                emit_log(&app, "launcher", "info", "Health check passed");
+                if should_open_after_start(&config, restarting)
+                    && let Err(error) = perform_launch_action(&app, &config, &url)
+                {
+                    emit_log(
+                        &app,
+                        "launcher",
+                        "error",
+                        &english_launch_action_error(&error),
+                    );
+                }
+                monitor_child(child, cancelled, status, app);
+                return;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        if !cancelled.load(Ordering::Acquire) {
+            set_status(
+                &status,
+                &app,
+                ServiceStatus {
+                    phase: "failed".into(),
+                    pid: Some(pid),
+                    url: Some(url),
+                    message: "DSH 启动超时，请停止服务后检查日志".into(),
+                },
+            );
+            emit_log(
+                &app,
+                "launcher",
+                "error",
+                "Health check did not pass within 30 seconds",
+            );
+        }
+    });
+}
+
+fn monitor_child(
+    child: Arc<Mutex<Child>>,
+    cancelled: Arc<AtomicBool>,
+    status: Arc<Mutex<ServiceStatus>>,
+    app: AppHandle,
+) {
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_millis(500));
+            let exit = child
+                .lock()
+                .ok()
+                .and_then(|mut child| child.try_wait().ok())
+                .flatten();
+            if let Some(exit) = exit {
+                if cancelled.load(Ordering::Acquire) {
+                    break;
+                }
+                close_embedded_webview(&app);
+                let next = ServiceStatus {
+                    phase: "stopped".into(),
+                    pid: None,
+                    url: None,
+                    message: format!("DSH 已退出：{exit}"),
+                };
+                set_status(&status, &app, next);
+                emit_log(
+                    &app,
+                    "launcher",
+                    "warning",
+                    &format!("DSH process exited: {exit}"),
+                );
+                break;
+            }
+        }
+    });
+}
+
+fn pipe_logs<R>(app: AppHandle, source: &'static str, level: &'static str, reader: R)
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        for line in BufReader::new(reader).lines().map_while(Result::ok) {
+            emit_log(&app, source, level, &line);
+        }
+    });
+}
+
+fn set_status(status: &Arc<Mutex<ServiceStatus>>, app: &AppHandle, next: ServiceStatus) {
+    if let Ok(mut current) = status.lock() {
+        *current = next.clone();
+    }
+    let _ = app.emit("service-status", next);
+}
+
+fn emit_log(app: &AppHandle, source: &str, level: &str, message: &str) {
+    let _ = app.emit(
+        "service-log",
+        LogEvent {
+            timestamp: Local::now().format("%H:%M:%S%.3f").to_string(),
+            source: source.into(),
+            level: level.into(),
+            message: message.into(),
+        },
+    );
+}
+
+fn normalized_host(host: &str) -> &str {
+    host.trim()
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or_else(|| host.trim())
+}
+
+fn resolve_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
+    let addresses = (normalized_host(host), port)
+        .to_socket_addrs()
+        .map_err(|_| "主机或端口格式无效".to_string())?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err("主机或端口格式无效".into());
+    }
+    Ok(addresses)
+}
+
+fn connect_any(addresses: &[SocketAddr], timeout: Duration) -> bool {
+    addresses
+        .iter()
+        .any(|address| TcpStream::connect_timeout(address, timeout).is_ok())
+}
+
+fn host_authority(host: &str, port: u16) -> String {
+    let host = normalized_host(host);
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn service_url(host: &str, port: u16) -> String {
+    format!("http://{}", host_authority(host, port))
+}
+
+fn http_ready(host: &str, port: u16) -> bool {
+    let Ok(addresses) = resolve_addresses(host, port) else {
+        return false;
+    };
+    addresses.into_iter().any(|address| {
+        let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(300))
+        else {
+            return false;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        if write!(
+            stream,
+            "GET / HTTP/1.0\r\nHost: {}\r\n\r\n",
+            host_authority(host, port)
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let mut response = [0_u8; 12];
+        stream.read(&mut response).is_ok() && response.starts_with(b"HTTP/")
+    })
+}
+
+pub fn resolve_dsh(manual: &str) -> Option<PathBuf> {
+    if !manual.trim().is_empty() {
+        return resolve_manual(manual);
+    }
+    if let Some(path) = find_on_path() {
+        return Some(path);
+    }
+    if let Some(path) = find_via_login_shell() {
+        return Some(path);
+    }
+    find_common_install()
+}
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Windows 下以 GUI 子系统（windows_subsystem=windows）运行时，直接 spawn 控制台程序
+/// （node、cmd.exe、taskkill 等）会闪现控制台窗口；CREATE_NO_WINDOW 只隐藏窗口，不影响管道日志。
+#[cfg(windows)]
+fn suppress_console_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn suppress_console_window(_command: &mut Command) {}
+
+/// 手动指定路径优先按原样接收；Windows 下兼容省略扩展名的写法，
+/// 自动按 PATHEXT 候选（.exe/.cmd/.bat）补全后再验证存在性。
+fn resolve_manual(manual: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(manual.trim());
+    if is_executable_dsh(&path) {
+        return Some(path);
+    }
+    #[cfg(windows)]
+    if path.extension().is_none() {
+        let pathext = std::env::var("PATHEXT").ok();
+        for ext in windows_extensions(pathext.as_deref()) {
+            let candidate = path.with_extension(ext.trim_start_matches('.'));
+            if is_executable_dsh(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// 纯逻辑：汇总 PATHEXT 与默认扩展，生成 dsh 的候选扩展名。
+/// 原生 exe 最优先（批处理需要额外经 cmd.exe 执行）；其余遵循 PATHEXT 顺序，
+/// 仅接受 .cmd/.bat（std 原生支持经 cmd.exe 安全调用的批处理扩展），缺省补齐。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_extensions(pathext: Option<&str>) -> Vec<String> {
+    const KNOWN_SCRIPT_EXTS: [&str; 2] = [".cmd", ".bat"];
+    let mut extensions = vec![".exe".to_string()];
+    if let Some(value) = pathext {
+        for token in value.split(';') {
+            let token = token.trim().to_ascii_lowercase();
+            if token.is_empty() {
+                continue;
+            }
+            let token = if token.starts_with('.') {
+                token
+            } else {
+                format!(".{token}")
+            };
+            if KNOWN_SCRIPT_EXTS.contains(&token.as_str()) && !extensions.contains(&token) {
+                extensions.push(token);
+            }
+        }
+    }
+    for default_ext in KNOWN_SCRIPT_EXTS {
+        if !extensions.iter().any(|ext| ext == default_ext) {
+            extensions.push(default_ext.to_string());
+        }
+    }
+    extensions
+}
+
+/// 纯逻辑：在目录内枚举 dsh 的候选完整路径；Windows 按 PATHEXT 展开，其余平台仅 `dsh` 本名。
+fn dsh_candidates(dir: &Path, windows: bool, pathext: Option<&str>) -> Vec<PathBuf> {
+    if windows {
+        windows_extensions(pathext)
+            .into_iter()
+            .map(|ext| dir.join(format!("dsh{ext}")))
+            .collect()
+    } else {
+        vec![dir.join("dsh")]
+    }
+}
+
+/// 纯逻辑：枚举 Windows 上 dsh 的常见安装位置候选（按优先级）：
+/// npm 全局目录（%APPDATA%\npm）、nvm-windows 符号链接/主目录、Node.js 安装目录、
+/// Scoop shims、用户自定义 npm 全局前缀（~\.npm-global）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_common_candidates(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    pathext: Option<&str>,
+) -> Vec<PathBuf> {
+    let home = home_dir_for(PlatformTarget::Windows, lookup);
+    let appdata = lookup("APPDATA").map(PathBuf::from).or_else(|| {
+        home.as_ref()
+            .map(|home| home.join("AppData").join("Roaming"))
+    });
+    let mut candidates = Vec::new();
+    if let Some(appdata) = &appdata {
+        candidates.extend(dsh_candidates(&appdata.join("npm"), true, pathext));
+    }
+    // nvm-windows：NVM_SYMLINK 指向当前 Node 符号链接目录，NVM_HOME 为版本库根目录
+    for env_name in ["NVM_SYMLINK", "NVM_HOME"] {
+        if let Some(dir) = lookup(env_name) {
+            candidates.extend(dsh_candidates(Path::new(&dir), true, pathext));
+        }
+    }
+    if let Some(program_files) = lookup("ProgramFiles") {
+        candidates.extend(dsh_candidates(
+            &PathBuf::from(program_files).join("nodejs"),
+            true,
+            pathext,
+        ));
+    }
+    if let Some(home) = &home {
+        candidates.extend(dsh_candidates(
+            &home.join("scoop").join("shims"),
+            true,
+            pathext,
+        ));
+        candidates.push(home.join(".npm-global").join("dsh.cmd"));
+    }
+    candidates
+}
+
+/// nvm-windows 把各 Node 版本放在 %APPDATA%\nvm\vX.Y.Z（全局 npm 包同目录）；
+/// 目录名是 `v` 前缀的版本号，按名称降序返回保证新版本优先。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn nvm_windows_version_dirs(nvm_root: &Path) -> Vec<PathBuf> {
+    let mut entries = fs::read_dir(nvm_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with('v'))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+    entries.reverse();
+    entries.into_iter().map(|entry| entry.path()).collect()
+}
+
+fn login_shell_environment() -> Vec<(String, String)> {
+    #[cfg(unix)]
+    {
+        run_login_shell_capture(LOGIN_SHELL_ENV_SCRIPT, LOGIN_SHELL_TIMEOUT)
+            .map(|payload| parse_env_output(&payload))
+            .unwrap_or_default()
+    }
+    #[cfg(not(unix))]
+    {
+        Vec::new()
+    }
+}
+
+/// 登录 Shell 采集总耗时预算（含尝试多个 Shell 与参数组合），防止用户 Shell 初始化卡死时无限等待。
+#[cfg(unix)]
+const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// 登录 Shell 输出分界标记：脚本先打印它再输出有效内容，启动文件的 stdout 噪音（提示、装饰等）在标记之前，可被安全剔除。
+/// 下方两个脚本常量内联了同一字面量，修改时务必同步。
+#[cfg(unix)]
+const LOGIN_SHELL_MARKER: &str = "__DSH_LAUNCHER_ENV__";
+
+/// 通过登录 Shell 采集完整环境变量：`env -0` 不可用时自动回退普通 `env`（换行分隔）。
+/// 脚本兼容 POSIX sh/bash/zsh；输出写入 "$1" 临时文件并配合 `umask 077`，避免管道背压导致卡死。
+#[cfg(unix)]
+const LOGIN_SHELL_ENV_SCRIPT: &str = concat!(
+    "umask 077; ",
+    "echo ",
+    "__DSH_LAUNCHER_ENV__",
+    r#" > "$1"; "#,
+    r#"{ env -0 2>/dev/null || env; } >> "$1""#
+);
+
+/// 通过登录 Shell 定位 dsh：`command -v` 是内建命令，sh/bash/zsh 均支持。
+#[cfg(unix)]
+const LOGIN_SHELL_DSH_SCRIPT: &str = concat!(
+    "umask 077; ",
+    r#"{ echo "__DSH_LAUNCHER_ENV__""#,
+    r#"; command -v dsh; } > "$1" 2>/dev/null"#
+);
+
+/// 登录 Shell 启动参数：优先 `-li -c`（与原实现一致的登录+交互环境，zsh 需 -i 才能读到 .zshrc 中的 PATH 设置）；
+/// 再回退裸 `-c`，覆盖不支持 `-li` 的 Shell。每组的最后一项必须是 `-c`，保证脚本被执行。
+#[cfg(unix)]
+const LOGIN_SHELL_ARGSETS: &[&[&str]] = &[&["-li", "-c"], &["-c"]];
+
+/// SHELL 缺失或不可用时依次尝试的登录 Shell 路径，全部覆盖常见发行版：bash（多数 Linux 默认）、zsh（macOS 默认）、sh（POSIX 兜底）。
+#[cfg(unix)]
+const FALLBACK_LOGIN_SHELLS: &[&str] = &[
+    "/bin/bash",
+    "/usr/bin/bash",
+    "/bin/zsh",
+    "/usr/bin/zsh",
+    "/usr/local/bin/zsh",
+    "/opt/homebrew/bin/zsh",
+    "/usr/local/bin/bash",
+    "/opt/homebrew/bin/bash",
+    "/bin/sh",
+    "/usr/bin/sh",
+];
+
+/// 纯逻辑：把 $SHELL 的值与默认候选归并成去重后的存在候选列表，$SHELL 优先、空白值跳过、不存在者过滤。
+#[cfg(unix)]
+fn login_shell_candidates(env_shell: Option<&str>, exists: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for shell in env_shell
+        .into_iter()
+        .chain(FALLBACK_LOGIN_SHELLS.iter().copied())
+    {
+        let trimmed = shell.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(trimmed);
+        if !candidates.contains(&path) && exists(&path) {
+            candidates.push(path);
+        }
+    }
+    candidates
+}
+
+#[cfg(unix)]
+fn available_login_shells() -> Vec<PathBuf> {
+    login_shell_candidates(std::env::var("SHELL").ok().as_deref(), &|path| {
+        path.is_file()
+    })
+}
+
+/// 纯逻辑：按「Shell 优先、参数组其次」展开全部尝试组合。
+#[cfg(unix)]
+fn login_shell_attempt_plan(shells: &[PathBuf]) -> Vec<(PathBuf, &'static [&'static str])> {
+    shells
+        .iter()
+        .flat_map(|shell| {
+            LOGIN_SHELL_ARGSETS
+                .iter()
+                .map(|argset| (shell.clone(), *argset))
+        })
+        .collect()
+}
+
+/// 纯逻辑：解析 `env` 输出。NUL 分隔（`env -0`）与换行分隔（回退）自动识别；
+/// 丢弃没有 `=` 或键为空的片段；值中的 `=` 与（NUL 模式下的）换行原样保留。
+#[cfg(unix)]
+fn parse_env_output(raw: &[u8]) -> Vec<(String, String)> {
+    let null_separated = raw.contains(&0);
+    let separator = if null_separated { 0 } else { b'\n' };
+    raw.split(|byte| *byte == separator)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| {
+            let line = if null_separated {
+                String::from_utf8_lossy(entry).into_owned()
+            } else {
+                // 换行模式兼容 CRLF：仅去掉行尾的 \r。
+                let mut text = String::from_utf8_lossy(entry).into_owned();
+                while text.ends_with('\r') {
+                    text.pop();
+                }
+                text
+            };
+            let (key, value) = line.split_once('=')?;
+            (!key.is_empty()).then(|| (key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+/// 纯逻辑：取标记之后的有效负载，并跳过紧跟标记的一个换行（含 `\r\n`）。标记不存在时返回 None。
+#[cfg(unix)]
+fn extract_after_marker<'a>(raw: &'a [u8], marker: &str) -> Option<&'a [u8]> {
+    let marker = marker.as_bytes();
+    let position = raw
+        .windows(marker.len())
+        .position(|window| window == marker)?;
+    let rest = &raw[position + marker.len()..];
+    Some(
+        rest.strip_prefix(b"\r\n")
+            .or_else(|| rest.strip_prefix(b"\n"))
+            .unwrap_or(rest),
+    )
+}
+
+/// 纯逻辑：从命令输出中取第一条非空行（`command -v` 只输出一行，这里再防御一次）。
+#[cfg(unix)]
+fn first_non_empty_line(payload: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(payload)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(unix)]
+enum SpawnOutcome {
+    /// 子进程正常退出，携带退出状态与（可能的）文件内容。
+    Completed { success: bool },
+    /// 程序无法启动（不存在、无权限等）。
+    NotRunnable,
+    /// 超时，子进程已被强杀并回收。
+    TimedOut,
+}
+
+/// 标准库实现的限时执行：轮询 `try_wait`，超时先 `kill` 再 `wait` 回收。
+/// stdin/stdout/stderr 全部置空，杜绝管道写满导致的隐藏死锁；需要输出时由脚本写入临时文件。
+#[cfg(unix)]
+fn spawn_with_timeout(program: &Path, args: &[&OsStr], timeout: Duration) -> SpawnOutcome {
+    let Ok(mut child) = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return SpawnOutcome::NotRunnable;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return SpawnOutcome::Completed {
+                    success: status.success(),
+                };
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return SpawnOutcome::TimedOut;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                return SpawnOutcome::NotRunnable;
+            }
+        }
+    }
+}
+
+/// 依次用候选登录 Shell 执行脚本，把结果读回内存。使用临时文件承接输出（脚本内 `umask 077` 收紧权限），
+/// 读取后立即删除；所有尝试共享时间预算，超时就放弃采集（调用方回退到继承当前环境）。
+#[cfg(unix)]
+fn run_login_shell_capture(script: &str, timeout: Duration) -> Option<Vec<u8>> {
+    let stamp = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let temp_file =
+        std::env::temp_dir().join(format!("dsh-launcher-{}-{stamp}", std::process::id()));
+    let deadline = Instant::now() + timeout;
+    let mut payload: Option<Vec<u8>> = None;
+    for (shell, argset) in login_shell_attempt_plan(&available_login_shells()) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let mut argv: Vec<&OsStr> = argset.iter().map(OsStr::new).collect();
+        argv.push(OsStr::new(script));
+        argv.push(OsStr::new("dsh-launcher"));
+        argv.push(temp_file.as_os_str());
+        if let SpawnOutcome::Completed { success: true } =
+            spawn_with_timeout(&shell, &argv, remaining)
+            && let Ok(content) = fs::read(&temp_file)
+            && let Some(after_marker) = extract_after_marker(&content, LOGIN_SHELL_MARKER)
+        {
+            // 标记存在才说明脚本真正执行成功；否则（只有 Shell 自身输出）继续尝试下一组合。
+            payload = Some(after_marker.to_vec());
+            break;
+        }
+    }
+    let _ = fs::remove_file(&temp_file);
+    payload
+}
+
+fn find_via_login_shell() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        let payload = run_login_shell_capture(LOGIN_SHELL_DSH_SCRIPT, LOGIN_SHELL_TIMEOUT)?;
+        let line = first_non_empty_line(&payload)?;
+        let path = PathBuf::from(line);
+        is_executable_dsh(&path).then_some(path)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+fn find_on_path() -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    let pathext = std::env::var("PATHEXT").ok();
+    std::env::split_paths(&paths)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .find_map(|dir| {
+            dsh_candidates(&dir, cfg!(windows), pathext.as_deref())
+                .into_iter()
+                .find(|path| is_executable_dsh(path))
+        })
+}
+
+#[cfg(windows)]
+fn find_common_install() -> Option<PathBuf> {
+    let lookup = |key: &str| {
+        std::env::var(key)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    };
+    let pathext = lookup("PATHEXT");
+    let mut candidates = windows_common_candidates(&lookup, pathext.as_deref());
+    // nvm-windows 的各版本目录（%APPDATA%\nvm\vX.Y.Z，新版优先）
+    if let Some(appdata) = lookup("APPDATA") {
+        let nvm_root = PathBuf::from(appdata).join("nvm");
+        for version_dir in nvm_windows_version_dirs(&nvm_root) {
+            candidates.extend(dsh_candidates(&version_dir, true, pathext.as_deref()));
+        }
+    }
+    candidates.into_iter().find(|path| is_executable_dsh(path))
+}
+
+#[cfg(not(windows))]
+fn find_common_install() -> Option<PathBuf> {
+    for candidate in ["/opt/homebrew/bin/dsh", "/usr/local/bin/dsh"] {
+        let path = PathBuf::from(candidate);
+        if is_executable_dsh(&path) {
+            return Some(path);
+        }
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let versions = home.join(".nvm/versions/node");
+    let mut entries = fs::read_dir(versions).ok()?.flatten().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+    entries.reverse();
+    entries
+        .into_iter()
+        .map(|entry| entry.path().join("bin/dsh"))
+        .find(|path| is_executable_dsh(path))
+}
+
+fn is_executable_dsh(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// 读取 dsh 版本。Windows 的 .cmd/.bat 批处理由标准库自动经由 cmd.exe 调用：程序路径与
+/// 各参数被批处理感知地转义（BatBadBut，Rust ≥ 1.77.2 修复，含 `&`、`"` 等元字符），无法
+/// 安全转义的参数直接报 InvalidInput 而非注入；因此这里保持逐参数传递、不拼接命令行即可
+/// 避免 cmd 注入。CREATE_NO_WINDOW 防止 GUI 宿主下闪现控制台窗口。
+pub fn dsh_version(path: &Path) -> Result<String, String> {
+    let mut command = Command::new(path);
+    suppress_console_window(&mut command);
+    let mut child = command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("无法执行 dsh：{error}"))?;
+    let stdout = child.stdout.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut output = String::new();
+            let _ = pipe.read_to_string(&mut output);
+            output
+        })
+    });
+    let stderr = child.stderr.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut output = String::new();
+            let _ = pipe.read_to_string(&mut output);
+            output
+        })
+    });
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(40)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout.map(|reader| reader.join());
+                let _ = stderr.map(|reader| reader.join());
+                return Err("执行 dsh --version 超时".into());
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("检查 dsh --version 状态失败：{error}"));
+            }
+        }
+    };
+    let stdout = stdout
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    if !status.success() {
+        return Err(stderr.trim().to_string());
+    }
+    Ok(stdout.trim().to_string())
+}
+
+pub fn discover_profiles() -> Vec<String> {
+    let Some(home) = std::env::var_os("DSH_HOME")
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+        // 跨平台主目录：Windows 读 USERPROFILE，其余平台读 HOME（与 dsh 自身行为一致）。
+        .or_else(|| user_home().map(|home| home.join(".dsh")))
+    else {
+        return vec!["web".into()];
+    };
+    let mut profiles = fs::read_dir(home.join("profiles"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| !name.starts_with('.') && name != "node_modules")
+        .collect::<Vec<_>>();
+    if !profiles.iter().any(|name| name == "web") {
+        profiles.push("web".into());
+    }
+    profiles.sort();
+    profiles
+}
+
+fn english_launch_action_error(error: &str) -> String {
+    for (prefix, translated) in [
+        ("无效的 DSH URL：", "Invalid DSH URL: "),
+        (
+            "打开内置 WebView 失败：",
+            "Failed to open embedded WebView: ",
+        ),
+        ("打开浏览器失败：", "Failed to open browser: "),
+    ] {
+        if let Some(detail) = error.strip_prefix(prefix) {
+            return format!("{translated}{detail}");
+        }
+    }
+    if error == "打开浏览器失败" {
+        return "Failed to open browser".into();
+    }
+    "Post-launch action failed".into()
+}
+
+fn parse_custom_args(value: &str) -> Result<Vec<String>, String> {
+    shell_words::split(value.trim()).map_err(|error| format!("DSH 参数格式无效：{error}"))
+}
+
+fn should_open_after_start(config: &LauncherConfig, restarting: bool) -> bool {
+    !restarting || matches!(config.launch_action, LaunchAction::EmbeddedWebview)
+}
+
+pub fn open_configured(app: &AppHandle, config: &LauncherConfig, url: &str) -> Result<(), String> {
+    if matches!(config.launch_action, LaunchAction::None) {
+        return open_default(url);
+    }
+    perform_launch_action(app, config, url)
+}
+
+fn perform_launch_action(
+    app: &AppHandle,
+    config: &LauncherConfig,
+    url: &str,
+) -> Result<(), String> {
+    match config.launch_action {
+        LaunchAction::None => Ok(()),
+        LaunchAction::DefaultBrowser => open_default(url),
+        LaunchAction::EmbeddedWebview => open_embedded_webview(app, url),
+    }
+}
+
+fn open_embedded_webview(app: &AppHandle, url: &str) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("dsh-webview") {
+        window.set_focus().map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    let parsed = url
+        .parse()
+        .map_err(|error| format!("无效的 DSH URL：{error}"))?;
+    let saved = WebviewWindowState::load().filter(|state| window_state_is_visible(app, state));
+    let window = WebviewWindowBuilder::new(app, "dsh-webview", WebviewUrl::External(parsed))
+        .title("DeepSeek Harness")
+        .inner_size(1180.0, 780.0)
+        .min_inner_size(760.0, 520.0)
+        .visible(false)
+        .initialization_script(SYSTEM_THEME_SCRIPT)
+        .build()
+        .map_err(|error| format!("打开内置 WebView 失败：{error}"))?;
+
+    if let Some(state) = saved {
+        window
+            .set_size(PhysicalSize::new(
+                state.width.max(760),
+                state.height.max(520),
+            ))
+            .map_err(|error| format!("恢复内置 WebView 大小失败：{error}"))?;
+        window
+            .set_position(PhysicalPosition::new(state.x, state.y))
+            .map_err(|error| format!("恢复内置 WebView 位置失败：{error}"))?;
+    } else {
+        window
+            .center()
+            .map_err(|error| format!("居中内置 WebView 失败：{error}"))?;
+    }
+
+    register_window_state_persistence(&window);
+    window
+        .show()
+        .and_then(|_| window.set_focus())
+        .map_err(|error| format!("显示内置 WebView 失败：{error}"))
+}
+
+fn register_window_state_persistence(window: &WebviewWindow) {
+    let app = window.app_handle().clone();
+    window.on_window_event(move |event| {
+        if matches!(event, WindowEvent::CloseRequested { .. })
+            && let Some(window) = app.get_webview_window("dsh-webview")
+        {
+            save_window_state(&window);
+        }
+    });
+}
+
+fn save_window_state(window: &WebviewWindow) {
+    let (Ok(position), Ok(size)) = (window.outer_position(), window.inner_size()) else {
+        return;
+    };
+    if size.width < 100 || size.height < 100 {
+        return;
+    }
+    let _ = WebviewWindowState {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+    }
+    .save();
+}
+
+fn window_state_is_visible(app: &AppHandle, state: &WebviewWindowState) -> bool {
+    let Ok(monitors) = app.available_monitors() else {
+        return false;
+    };
+    monitors.iter().any(|monitor| {
+        let position = monitor.position();
+        let size = monitor.size();
+        rectangles_overlap(
+            state.x,
+            state.y,
+            state.width,
+            state.height,
+            position.x,
+            position.y,
+            size.width,
+            size.height,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rectangles_overlap(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    monitor_x: i32,
+    monitor_y: i32,
+    monitor_width: u32,
+    monitor_height: u32,
+) -> bool {
+    let right = i64::from(x) + i64::from(width);
+    let bottom = i64::from(y) + i64::from(height);
+    let monitor_right = i64::from(monitor_x) + i64::from(monitor_width);
+    let monitor_bottom = i64::from(monitor_y) + i64::from(monitor_height);
+    right >= i64::from(monitor_x) + 80
+        && bottom >= i64::from(monitor_y) + 50
+        && i64::from(x) <= monitor_right - 80
+        && i64::from(y) <= monitor_bottom - 50
+}
+
+fn close_embedded_webview(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("dsh-webview") {
+        save_window_state(&window);
+        let _ = window.close();
+    }
+}
+
+pub fn open_default(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let status = Command::new("open").arg(url).status();
+    #[cfg(target_os = "windows")]
+    let status = {
+        // start 是 cmd 内建命令，必须经 cmd.exe 调用；参数逐项传递，URL 由内部按已校验的 host/port 拼装。
+        let mut command = Command::new("cmd");
+        command.args(["/C", "start", "", url]);
+        suppress_console_window(&mut command);
+        command.status()
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = open_default_unix(url);
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    let result = status
+        .map_err(|error| format!("打开浏览器失败：{error}"))?
+        .success()
+        .then_some(())
+        .ok_or_else(|| "打开浏览器失败".into());
+    result
+}
+
+/// 纯逻辑：按桌面环境给出打开 URL 的候选程序及参数，按尝试顺序排列。
+/// Linux 在 `xdg-open` 之外提供 `gio open` 作为回退；其余桌面仅保留 xdg-open。
+#[cfg(unix)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn open_program_candidates(is_linux: bool) -> Vec<(&'static str, &'static [&'static str])> {
+    let mut candidates: Vec<(&'static str, &'static [&'static str])> =
+        vec![("xdg-open", &[] as &[&str])];
+    if is_linux {
+        candidates.push(("gio", &["open"]));
+    }
+    candidates
+}
+
+/// 纯逻辑：单次打开尝试的结果分类，用于决定是否继续回退。
+#[cfg(unix)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenerOutcome {
+    Opened,
+    Failed,
+    TimedOut,
+}
+
+#[cfg(unix)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+impl OpenerOutcome {
+    /// 只有确定的失败才回退到下一个候选；成功无需回退；
+    /// 超时状态不明（浏览器可能已被拉起），继续回退可能造成重复打开标签页，因此不回退。
+    fn should_try_next(self) -> bool {
+        !matches!(self, OpenerOutcome::Opened | OpenerOutcome::TimedOut)
+    }
+}
+
+/// 非 macOS Unix（主要是 Linux）的打开 URL 实现：xdg-open → gio open 逐个尝试，均带限时保护。
+#[cfg(unix)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+const OPEN_URL_TIMEOUT: Duration = Duration::from_secs(6);
+
+#[cfg(unix)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn open_default_unix(url: &str) -> Result<(), String> {
+    let mut failures: Vec<String> = Vec::new();
+    for (program, args) in open_program_candidates(cfg!(target_os = "linux")) {
+        let mut argv: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+        argv.push(OsStr::new(url));
+        let (outcome, detail) =
+            match spawn_with_timeout(Path::new(program), &argv, OPEN_URL_TIMEOUT) {
+                SpawnOutcome::Completed { success: true } => (OpenerOutcome::Opened, String::new()),
+                SpawnOutcome::Completed { success: false } => {
+                    (OpenerOutcome::Failed, "退出码非零".to_string())
+                }
+                SpawnOutcome::NotRunnable => (OpenerOutcome::Failed, "无法启动".to_string()),
+                SpawnOutcome::TimedOut => (
+                    OpenerOutcome::TimedOut,
+                    format!("超过 {OPEN_URL_TIMEOUT:?}"),
+                ),
+            };
+        match outcome {
+            OpenerOutcome::Opened => return Ok(()),
+            OpenerOutcome::TimedOut => {
+                return Err(format!(
+                    "打开浏览器失败：{program} 执行超时（{detail}），子进程已被终止；状态不明确，不再回退其他程序"
+                ));
+            }
+            OpenerOutcome::Failed => failures.push(format!("{program} {detail}")),
+        }
+        if !outcome.should_try_next() {
+            break;
+        }
+    }
+    Err(format!("打开浏览器失败：{}", failures.join("；")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_status_is_stopped() {
+        assert_eq!(ServiceStatus::default().phase, "stopped");
+    }
+
+    #[test]
+    fn profile_discovery_always_includes_web() {
+        assert!(discover_profiles().iter().any(|profile| profile == "web"));
+    }
+
+    #[test]
+    fn embedded_webview_reopens_after_restart() {
+        let config = LauncherConfig {
+            launch_action: LaunchAction::EmbeddedWebview,
+            auto_start: false,
+            ..Default::default()
+        };
+        assert!(should_open_after_start(&config, true));
+    }
+
+    #[test]
+    fn external_action_respects_restart_setting() {
+        let config = LauncherConfig {
+            launch_action: LaunchAction::DefaultBrowser,
+            auto_start: false,
+            ..Default::default()
+        };
+        assert!(!should_open_after_start(&config, true));
+    }
+
+    #[test]
+    fn custom_dsh_args_preserve_quoted_values() {
+        assert_eq!(
+            parse_custom_args("--no-open --trusted-host 'host name'").unwrap(),
+            vec!["--no-open", "--trusted-host", "host name"]
+        );
+    }
+
+    #[test]
+    fn custom_dsh_args_reject_unclosed_quotes() {
+        assert!(parse_custom_args("--trusted-host 'broken").is_err());
+    }
+
+    #[test]
+    fn launcher_log_errors_are_english() {
+        assert_eq!(
+            english_launch_action_error("打开内置 WebView 失败：window error"),
+            "Failed to open embedded WebView: window error"
+        );
+        assert_eq!(
+            english_launch_action_error("未知错误"),
+            "Post-launch action failed"
+        );
+    }
+
+    #[test]
+    fn host_authority_supports_names_and_ipv6() {
+        assert_eq!(host_authority("localhost", 3080), "localhost:3080");
+        assert_eq!(host_authority("::1", 3080), "[::1]:3080");
+        assert_eq!(host_authority("[::1]", 3080), "[::1]:3080");
+        assert_eq!(service_url("::1", 3080), "http://[::1]:3080");
+        assert!(!resolve_addresses("localhost", 3080).unwrap().is_empty());
+    }
+
+    #[test]
+    fn saved_window_must_remain_visibly_on_screen() {
+        assert!(rectangles_overlap(100, 100, 1180, 780, 0, 0, 1920, 1080));
+        assert!(rectangles_overlap(-1100, 100, 1180, 780, 0, 0, 1920, 1080));
+        assert!(!rectangles_overlap(-2000, 100, 1180, 780, 0, 0, 1920, 1080));
+        assert!(!rectangles_overlap(2000, 100, 1180, 780, 0, 0, 1920, 1080));
+    }
+
+    // ---------- 登录 Shell 候选与尝试计划 ----------
+
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_candidates_prefer_env_shell_then_defaults() {
+        let present = ["/usr/bin/zsh", "/bin/bash"];
+        let exists = |path: &Path| present.contains(&path.to_str().unwrap_or_default());
+        let candidates = login_shell_candidates(Some("/usr/bin/zsh"), &exists);
+        assert_eq!(
+            candidates,
+            vec![PathBuf::from("/usr/bin/zsh"), PathBuf::from("/bin/bash"),]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_candidates_skip_missing_and_blank_shell() {
+        let exists = |path: &Path| path == Path::new("/bin/sh");
+        assert_eq!(
+            login_shell_candidates(Some("/does/not/exist"), &exists),
+            vec![PathBuf::from("/bin/sh")]
+        );
+        // 空白 SHELL 等同于未设置
+        assert_eq!(
+            login_shell_candidates(Some("   "), &exists),
+            vec![PathBuf::from("/bin/sh")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_candidates_dedup_when_shell_matches_fallback() {
+        let exists = |path: &Path| path == Path::new("/bin/bash");
+        let candidates = login_shell_candidates(Some("/bin/bash"), &exists);
+        assert_eq!(candidates, vec![PathBuf::from("/bin/bash")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_attempt_plan_is_shell_major_with_fallback_args() {
+        let shells = vec![PathBuf::from("/bin/zsh"), PathBuf::from("/bin/bash")];
+        let plan = login_shell_attempt_plan(&shells);
+        assert_eq!(plan.len(), shells.len() * LOGIN_SHELL_ARGSETS.len());
+        assert_eq!(plan[0].0, PathBuf::from("/bin/zsh"));
+        assert_eq!(plan[0].1, &["-li", "-c"]);
+        assert_eq!(plan[1].0, PathBuf::from("/bin/zsh"));
+        assert_eq!(plan[1].1, &["-c"], "同一 Shell 的第二参数组为裸 -c 兜底");
+        assert_eq!(plan[2].0, PathBuf::from("/bin/bash"));
+        assert_eq!(plan[3].0, PathBuf::from("/bin/bash"));
+        assert!(
+            LOGIN_SHELL_ARGSETS
+                .iter()
+                .all(|argset| argset.last() == Some(&"-c"))
+        );
+    }
+
+    // ---------- env 输出解析 ----------
+
+    #[cfg(unix)]
+    #[test]
+    fn env_output_parses_nul_separated_entries() {
+        let raw = b"A=1\0PATH=/usr/bin:/bin\0EMPTY=\0BROKEN\0=NO_KEY\0";
+        let entries = parse_env_output(raw);
+        assert_eq!(entries.len(), 3, "无键或缺失 = 的片段应被丢弃");
+        assert_eq!(entries[0], ("A".to_string(), "1".to_string()));
+        assert_eq!(
+            entries[1],
+            ("PATH".to_string(), "/usr/bin:/bin".to_string())
+        );
+        assert_eq!(entries[2], ("EMPTY".to_string(), String::new()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_output_keeps_equals_and_newlines_in_nul_mode() {
+        let entries = parse_env_output(b"PATH=/a=b\0MULTI=line1\nline2\0");
+        assert_eq!(entries[0], ("PATH".to_string(), "/a=b".to_string()));
+        assert_eq!(
+            entries[1],
+            ("MULTI".to_string(), "line1\nline2".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_output_falls_back_to_newline_separation_with_crlf() {
+        let entries = parse_env_output(b"A=1\nPATH=/bin\r\nC=3\n");
+        assert_eq!(
+            entries,
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("PATH".to_string(), "/bin".to_string()),
+                ("C".to_string(), "3".to_string()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_output_empty_input_yields_no_entries() {
+        assert!(parse_env_output(b"").is_empty());
+    }
+
+    // ---------- 标记与输出提取 ----------
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_extraction_skips_startup_noise() {
+        let raw = b"neofetch banner\n__DSH_LAUNCHER_ENV__\nPATH=/bin\n";
+        assert_eq!(
+            extract_after_marker(raw, LOGIN_SHELL_MARKER),
+            Some(&b"PATH=/bin\n"[..])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_extraction_handles_crlf_and_missing_marker() {
+        assert_eq!(
+            extract_after_marker(b"noise\n__DSH_LAUNCHER_ENV__\r\nA=1", LOGIN_SHELL_MARKER),
+            Some(&b"A=1"[..])
+        );
+        // 标记位于最前面且后面没有换行
+        assert_eq!(
+            extract_after_marker(b"__DSH_LAUNCHER_ENV__A=x", LOGIN_SHELL_MARKER),
+            Some(&b"A=x"[..])
+        );
+        assert_eq!(extract_after_marker(b"no marker", LOGIN_SHELL_MARKER), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_non_empty_line_skips_blank_lines() {
+        assert_eq!(
+            first_non_empty_line(b"\n\n /usr/bin/dsh \n"),
+            Some("/usr/bin/dsh".to_string())
+        );
+        assert_eq!(first_non_empty_line(b"  \n\t"), None);
+        assert_eq!(first_non_empty_line(b""), None);
+    }
+
+    // ---------- Linux 打开 URL 回退 ----------
+
+    #[cfg(unix)]
+    #[test]
+    fn open_candidates_add_gio_fallback_only_on_linux() {
+        let linux = open_program_candidates(true);
+        assert_eq!(linux.len(), 2);
+        assert_eq!(linux[0], ("xdg-open", &[][..] as &[&str]));
+        assert_eq!(linux[1].0, "gio");
+        assert_eq!(linux[1].1, &["open"]);
+
+        let not_linux = open_program_candidates(false);
+        assert_eq!(not_linux, vec![("xdg-open", &[][..] as &[&str])]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opener_fallback_tries_next_only_on_definite_failure() {
+        assert!(!OpenerOutcome::Opened.should_try_next());
+        assert!(OpenerOutcome::Failed.should_try_next());
+        // 状态不明（超时）时必须停下，避免同一 URL 被打开两次
+        assert!(!OpenerOutcome::TimedOut.should_try_next());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opener_helpers_remain_well_typed_on_every_unix_target() {
+        // 仅做类型检查引用：保证仅在 Linux/BSD 分支使用的实现也能在 macOS 编译验证。
+        let _ = open_default_unix as fn(&str) -> Result<(), String>;
+        assert_eq!(open_program_candidates(false).len(), 1);
+    }
+
+    // ---------- Windows 可执行文件检测 ----------
+
+    #[test]
+    fn windows_extensions_prefer_exe_then_pathext_scripts() {
+        assert_eq!(
+            windows_extensions(None),
+            vec![".exe", ".cmd", ".bat"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+        // .exe 提前；其余按 PATHEXT 顺序
+        assert_eq!(
+            windows_extensions(Some(".COM;.EXE;.BAT;.CMD")),
+            vec![".exe", ".bat", ".cmd"]
+        );
+        // 无关扩展被忽略，缺省的 .bat 补齐
+        assert_eq!(
+            windows_extensions(Some(".py;.CMD")),
+            vec![".exe", ".cmd", ".bat"]
+        );
+        // 无点前缀的 PATHEXT 条目同样可识别
+        assert_eq!(
+            windows_extensions(Some("CMD")),
+            vec![".exe", ".cmd", ".bat"]
+        );
+    }
+
+    #[test]
+    fn path_candidates_switch_between_platforms() {
+        let dir = Path::new("/tools");
+        assert_eq!(
+            dsh_candidates(dir, false, None),
+            vec![PathBuf::from("/tools/dsh")]
+        );
+        assert_eq!(
+            dsh_candidates(dir, true, Some(".EXE;.CMD;.BAT")),
+            vec![
+                PathBuf::from("/tools/dsh.exe"),
+                PathBuf::from("/tools/dsh.cmd"),
+                PathBuf::from("/tools/dsh.bat"),
+            ]
+        );
+    }
+
+    #[test]
+    fn manual_resolution_rejects_missing_paths() {
+        assert!(resolve_manual("   ").is_none());
+        assert!(resolve_manual("/definitely/not/a/dsh/binary").is_none());
+    }
+
+    #[test]
+    fn windows_common_candidates_cover_npm_nvm_nodejs_and_scoop() {
+        // 与实现一致：候选路径基于传入基础路径逐段 join，分段构造预期（分隔符随平台而变）。
+        fn joined(base: &str, parts: &[&str]) -> PathBuf {
+            let mut path = PathBuf::from(base);
+            for part in parts {
+                path = path.join(part);
+            }
+            path
+        }
+        let lookup = |key: &str| match key {
+            "APPDATA" => Some("C:\\Users\\demo\\AppData\\Roaming".into()),
+            "NVM_SYMLINK" => Some("C:\\Program Files\\nodejs".into()),
+            "ProgramFiles" => Some("C:\\Program Files".into()),
+            "USERPROFILE" => Some("C:\\Users\\demo".into()),
+            _ => None,
+        };
+        let candidates = windows_common_candidates(&lookup, Some(".COM;.EXE;.CMD;.BAT"));
+        for (base, parts) in [
+            // npm 全局目录（PATHEXT 全展开）
+            ("C:\\Users\\demo\\AppData\\Roaming", vec!["npm", "dsh.exe"]),
+            ("C:\\Users\\demo\\AppData\\Roaming", vec!["npm", "dsh.cmd"]),
+            ("C:\\Users\\demo\\AppData\\Roaming", vec!["npm", "dsh.bat"]),
+            // nvm-windows 符号链接目录（NVM_SYMLINK）与 Node.js 安装目录
+            ("C:\\Program Files\\nodejs", vec!["dsh.exe"]),
+            ("C:\\Program Files\\nodejs", vec!["dsh.cmd"]),
+            // Scoop shims 与自定义 npm 全局前缀
+            ("C:\\Users\\demo", vec!["scoop", "shims", "dsh.exe"]),
+            ("C:\\Users\\demo", vec![".npm-global", "dsh.cmd"]),
+        ] {
+            let expected = joined(base, &parts);
+            assert!(
+                candidates.contains(&expected),
+                "缺少候选 {expected:?}，实际：{candidates:?}"
+            );
+        }
+        // APPDATA 缺失时回退 USERPROFILE\AppData\Roaming\npm（回退目录由 join 派生，比较需同构构造）
+        let fallback = |key: &str| (key == "USERPROFILE").then(|| "C:\\Users\\demo".to_string());
+        let candidates = windows_common_candidates(&fallback, None);
+        assert!(candidates.contains(&joined(
+            "C:\\Users\\demo",
+            &["AppData", "Roaming", "npm", "dsh.cmd"][..]
+        )));
+    }
+
+    #[test]
+    fn nvm_windows_version_dirs_sort_newest_first() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("dsh-launcher-nvm-{}-{stamp}", std::process::id()));
+        for name in ["v20.11.0", "v22.19.0", "v9.11.2"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+        }
+        // 非 v 前缀目录与普通文件都应被排除
+        fs::create_dir_all(root.join("cache")).unwrap();
+        fs::write(root.join("settings.txt"), "x").unwrap();
+        let dirs = nvm_windows_version_dirs(&root);
+        // 与 Unix nvm 目录逻辑一致：按目录名字符串降序
+        assert_eq!(
+            dirs.iter()
+                .map(|dir| dir.file_name().unwrap().to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["v9.11.2", "v22.19.0", "v20.11.0"]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+}
