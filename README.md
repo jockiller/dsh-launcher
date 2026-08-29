@@ -48,7 +48,7 @@ sudo xattr -r -d com.apple.quarantine "/Applications/DSH Launcher.app"
 
 只应对你信任且来源明确的应用执行此命令。
 
-首次访问局域网模型服务时，macOS 会请求“本地网络”权限。请允许访问，否则 DSH 可能无法连接局域网中的模型服务。
+首次启动时，macOS 15 或更高版本会请求“本地网络”权限。请允许访问，否则 DSH 可能无法连接局域网中的模型服务。可在“系统设置 → 隐私与安全性 → 本地网络”中修改此权限。
 
 ### 开发
 
@@ -73,4 +73,12 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 pnpm run tauri build
 ```
 
-仓库中的 GitHub Actions 工作流（[.github/workflows/build.yml](.github/workflows/build.yml)）使用 pnpm 11 在原生 macOS（arm64 / x64）、Windows（x64）和 Linux（x64）runner 上分别构建 DMG、NSIS、DEB、RPM 和 AppImage 候选产物。代码签名与 Apple 公证不包含在默认工作流中。
+仓库中的 GitHub Actions 工作流（[.github/workflows/build.yml](.github/workflows/build.yml)）使用 pnpm 11 在原生 macOS、Windows 和 Linux runner 上构建候选产物，三个平台均覆盖 arm64 / x64：macOS 生成 DMG，Windows 生成 NSIS，Linux 生成 DEB、RPM 和 AppImage。
+
+macOS 的“本地网络”权限以代码签名标识应用。要让权限在升级和重装后可靠保持，请配置 Apple Developer ID 签名证书；未签名或 ad-hoc 签名包仍可构建，但系统可能无法稳定识别其权限状态。GitHub Actions 支持以下仓库 Secrets：
+
+- `APPLE_CERTIFICATE`：Base64 编码的 `.p12` 证书
+- `APPLE_CERTIFICATE_PASSWORD`：证书密码
+- `APPLE_SIGNING_IDENTITY`：Developer ID Application 签名身份
+
+默认工作流不执行 Apple 公证。

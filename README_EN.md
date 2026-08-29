@@ -48,7 +48,7 @@ sudo xattr -r -d com.apple.quarantine "/Applications/DSH Launcher.app"
 
 Run this command only for an application you trust and obtained from a known source.
 
-macOS requests Local Network permission the first time the app accesses a model service on your LAN. Allow this permission, or DSH may be unable to connect to local network model providers.
+On first launch, macOS 15 or later requests Local Network permission. Allow it, or DSH may be unable to connect to model services on your LAN. You can change this permission in System Settings > Privacy & Security > Local Network.
 
 ### Development
 
@@ -73,4 +73,12 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 pnpm run tauri build
 ```
 
-The included GitHub Actions workflow ([.github/workflows/build.yml](.github/workflows/build.yml)) uses pnpm 11 to build DMG, NSIS, DEB, RPM, and AppImage candidate artifacts on native macOS (arm64 / x64), Windows (x64), and Linux (x64) runners. Code signing and Apple notarization are intentionally not part of the default workflow.
+The included GitHub Actions workflow ([.github/workflows/build.yml](.github/workflows/build.yml)) uses pnpm 11 to build candidate artifacts on native macOS, Windows, and Linux runners, with arm64 and x64 covered on all three platforms: DMG for macOS, NSIS for Windows, and DEB, RPM, and AppImage for Linux.
+
+macOS identifies an app's Local Network privilege by its code signature. Configure an Apple Developer ID certificate so the permission remains reliable across upgrades and reinstalls. Unsigned or ad-hoc signed packages still build, but macOS may not track their permission state consistently. The GitHub Actions workflow supports these repository secrets:
+
+- `APPLE_CERTIFICATE`: Base64-encoded `.p12` certificate
+- `APPLE_CERTIFICATE_PASSWORD`: Certificate password
+- `APPLE_SIGNING_IDENTITY`: Developer ID Application signing identity
+
+The default workflow does not perform Apple notarization.

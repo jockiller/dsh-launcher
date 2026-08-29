@@ -7,3 +7,4 @@ src-tauri/gen/schemas/
 .vscode/
 handoff.md
 package-lock.json
+/AGENTS.md

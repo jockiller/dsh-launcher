@@ -37,6 +37,13 @@ jobs:
             artifact: windows-x64
             paths: |
               src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          - name: Windows arm64
+            os: windows-11-arm
+            rust-target: aarch64-pc-windows-msvc
+            bundles: nsis
+            artifact: windows-arm64
+            paths: |
+              src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*.exe
           - name: Linux x64
             os: ubuntu-22.04
             rust-target: x86_64-unknown-linux-gnu
@@ -46,6 +53,15 @@ jobs:
               src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
               src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm
               src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.tar.gz
+          - name: Linux arm64
+            os: ubuntu-24.04-arm
+            rust-target: aarch64-unknown-linux-gnu
+            bundles: deb,rpm,appimage
+            artifact: linux-arm64
+            paths: |
+              src-tauri/target/aarch64-unknown-linux-gnu/release/bundle/deb/*.deb
+              src-tauri/target/aarch64-unknown-linux-gnu/release/bundle/rpm/*.rpm
+              src-tauri/target/aarch64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.tar.gz
 
     runs-on: ${{ matrix.os }}
 
@@ -88,7 +104,34 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
       - name: Build desktop package
-        run: pnpm exec tauri build --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }}
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        shell: bash
+        run: |
+          if [[ -z "$APPLE_CERTIFICATE" ]]; then
+            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY
+          elif [[ -z "$APPLE_SIGNING_IDENTITY" ]]; then
+            unset APPLE_SIGNING_IDENTITY
+          fi
+          pnpm exec tauri build --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }}
+
+      - name: Verify macOS local-network metadata and signature
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+        run: |
+          app=$(find "src-tauri/target/${{ matrix.rust-target }}/release/bundle/macos" -maxdepth 1 -name '*.app' -print -quit)
+          test -n "$app"
+          description=$(plutil -extract NSLocalNetworkUsageDescription raw "$app/Contents/Info.plist")
+          test -n "$description"
+          if [[ -n "$APPLE_CERTIFICATE" ]]; then
+            codesign --verify --deep --strict --verbose=2 "$app"
+          else
+            echo "APPLE_CERTIFICATE is not configured; local-network permission identity may not be tracked reliably."
+          fi
 
       - name: Archive AppImage with executable permissions
         if: runner.os == 'Linux'

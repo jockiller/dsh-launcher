@@ -1,4 +1,6 @@
 mod config;
+#[cfg(target_os = "macos")]
+mod local_network;
 mod service;
 
 use std::path::PathBuf;
@@ -129,6 +131,9 @@ pub fn run() {
             service: Mutex::new(ServiceManager::new()),
         })
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            local_network::trigger_privacy_prompt();
+
             let config = LauncherConfig::load();
             if config.auto_start {
                 let state = app.state::<AppState>();
