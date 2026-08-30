@@ -241,8 +241,8 @@ async fn managed_runtime_status(root: String) -> Result<managed::ManagedStatus, 
 }
 
 #[tauri::command]
-async fn check_latest_dsh() -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(managed::check_latest_dsh)
+async fn check_latest_dsh(root: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || managed::check_latest_dsh(root.as_deref()))
         .await
         .map_err(|error| format!("检查 DSH 更新异常结束：{error}"))?
 }

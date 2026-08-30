@@ -16,7 +16,7 @@ English | [简体中文](README.md)
 
 DSH Launcher is a lightweight Tauri 2, React, and Rust desktop application for installing, starting, and managing a local DeepSeek Harness (DSH) Web service.
 
-> **Platform testing status:** The current version has been verified on macOS. Build configurations are provided for Windows and Linux, but they have not yet been tested on real Windows/Linux desktop environments. Treat those artifacts as candidate builds.
+> **Platform testing status:** The current version has been verified on macOS. Windows and Linux have undergone only basic testing; not all features are guaranteed to work. Treat those artifacts as candidate builds.
 
 ### Features
 

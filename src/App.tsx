@@ -138,7 +138,9 @@ export default function App() {
           void invoke<ManagedStatus>("managed_runtime_status", { root: data.config.managedRuntimeDir })
             .then(setManaged)
             .catch(() => undefined);
-          void invoke<string>("check_latest_dsh").then(setLatestDsh).catch(() => undefined);
+          void invoke<string>("check_latest_dsh", { root: data.config.managedRuntimeDir })
+            .then(setLatestDsh)
+            .catch(() => undefined);
         }
       })
       .catch((reason) => setError(errorMessage(reason)));
@@ -275,7 +277,7 @@ export default function App() {
         managedRuntimeDir: result.managedRoot,
         dshPath: result.dshPath,
       } : current);
-      void invoke<string>("check_latest_dsh").then(setLatestDsh).catch(() => undefined);
+      void invoke<string>("check_latest_dsh", { root: result.managedRoot }).then(setLatestDsh).catch(() => undefined);
     } catch (reason) {
       const message = errorMessage(reason);
       setManagedProgress(null);
@@ -371,7 +373,10 @@ export default function App() {
                 {managed ? (
                   <>
                     <span><PackageCheck size={12} />Node {managed.nodeVersion} · DSH {managed.dshVersion}{latestDsh && latestDsh !== managed.dshVersion ? ` → ${latestDsh}` : ""}</span>
-                    <button disabled={managedBusy} onClick={() => void upgradeManagedDsh()}><Download size={12} />{t.upgradeDsh}</button>
+                    {/* 仅在“确认有新版”（或版本未知）时显示升级按钮；已确认最新则隐藏 */}
+                    {(!latestDsh || latestDsh !== managed.dshVersion) && (
+                      <button disabled={managedBusy} onClick={() => void upgradeManagedDsh()}><Download size={12} />{t.upgradeDsh}</button>
+                    )}
                   </>
                 ) : (
                   <>

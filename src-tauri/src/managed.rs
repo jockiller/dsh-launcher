@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Component, Path, PathBuf};
@@ -251,8 +252,16 @@ pub fn managed_status(root: &Path) -> Result<ManagedStatus, String> {
     Ok(status_from(root, marker))
 }
 
-pub fn check_latest_dsh() -> Result<String, String> {
-    fetch_latest_dsh(false)
+/// 检测 DSH 最新版本；root 给定时读取托管标记并沿用安装时选择的 npm 镜像，
+/// 标记缺失/损坏时回退官方源。latestDsh 判空后由前端隐藏"已是最新"的升级按钮。
+fn marker_mirror(root: Option<&str>) -> bool {
+    root.and_then(|path| read_marker(Path::new(path)).ok())
+        .map(|marker| marker.use_mirror)
+        .unwrap_or(false)
+}
+
+pub fn check_latest_dsh(root: Option<&str>) -> Result<String, String> {
+    fetch_latest_dsh(marker_mirror(root))
 }
 
 fn fetch_latest_dsh(use_mirror: bool) -> Result<String, String> {
@@ -473,6 +482,10 @@ fn npm_install(
         .arg(format!("@deepseek-ai/dsh@{dsh_version}"))
         .current_dir(prefix)
         .env_remove("NODE_OPTIONS")
+        .env(
+            "PATH",
+            script_path(node_root, std::env::var_os("PATH").as_deref()),
+        )
         .env("CI", "true")
         .env("npm_config_yes", "true")
         .stdin(Stdio::null())
@@ -594,6 +607,23 @@ fn validate_install_root(root: &Path) -> Result<(), String> {
     #[cfg(windows)]
     if root.to_string_lossy().contains('%') {
         return Err("Windows 托管安装目录不能包含 % 字符".into());
+    }
+    #[cfg(windows)]
+    if is_windows_network_path(&root.to_string_lossy()) {
+        return Err(
+            "Windows 托管安装目录不能使用网络共享路径（如 \\\\Mac\\Home 共享目录），请选择本地磁盘目录"
+                .into(),
+        );
+    }
+    // PATH 分隔符会让 npm 脚本子进程的 PATH 拼接在 cmd/sh 中再被拆开，
+    // 导致托管 Node 解析失败（复现 exit 127），必须在入口拒绝。
+    #[cfg(windows)]
+    if root.to_string_lossy().contains(';') {
+        return Err("Windows 托管安装目录不能包含 ; 字符".into());
+    }
+    #[cfg(not(windows))]
+    if root.to_string_lossy().contains(':') {
+        return Err("安装目录不能包含 : 字符".into());
     }
     Ok(())
 }
@@ -745,6 +775,43 @@ fn node_executable(node_root: &Path) -> PathBuf {
         "bin/node"
     })
 }
+fn node_bin_dir(node_root: &Path) -> PathBuf {
+    if cfg!(windows) {
+        node_root.to_path_buf()
+    } else {
+        node_root.join("bin")
+    }
+}
+
+/// npm 生命周期脚本通过 cmd/sh 执行，其 PATH 不会自动包含正在运行 npm 的 node 目录；
+/// Launcher 又不修改系统 PATH，GUI 会话环境里通常没有 node。
+/// 这里把托管 Node 的 bin 目录前置拼进子进程 PATH，脚本内的 `node` 才能解析。
+fn script_path(node_root: &Path, existing: Option<&OsStr>) -> OsString {
+    let node_dir = node_bin_dir(node_root);
+    let Some(existing) = existing else {
+        return node_dir.into_os_string();
+    };
+    // split_paths 产出临时 PathBuf，join_paths 需要 AsRef<OsStr> 项：
+    // 统一收拢为 OsString 后再借用，避免闭包内借用局部值。
+    let mut entries: Vec<OsString> = vec![node_dir.into_os_string()];
+    entries.extend(std::env::split_paths(existing).map(|entry| entry.into_os_string()));
+    match std::env::join_paths(entries.iter().map(|entry| entry.as_os_str())) {
+        Ok(joined) => joined,
+        Err(_) => {
+            // join_paths 只在条目内含平台分隔符时失败；直接拼接兜底，托管 Node 仍保持在最前。
+            let delimiter = if cfg!(windows) { ";" } else { ":" };
+            let mut joined = node_bin_dir(node_root).into_os_string();
+            joined.push(delimiter);
+            joined.push(existing);
+            joined
+        }
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_windows_network_path(text: &str) -> bool {
+    text.replace('/', "\\").starts_with("\\\\")
+}
 fn npm_cli(node_root: &Path) -> PathBuf {
     if cfg!(windows) {
         node_root.join("node_modules/npm/bin/npm-cli.js")
@@ -804,5 +871,76 @@ mod tests {
             use_mirror: false,
         };
         assert_ne!(marker.schema, MANAGED_SCHEMA);
+    }
+
+    #[test]
+    fn marker_mirror_follows_saved_marker() {
+        let dir =
+            std::env::temp_dir().join(format!("dsh-launcher-mirror-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        write_marker(
+            &dir,
+            &Marker {
+                schema: MANAGED_SCHEMA,
+                node_version: "22.0.0".into(),
+                dsh_version: "0.1.0".into(),
+                use_mirror: true,
+            },
+        )
+        .unwrap();
+        assert!(marker_mirror(dir.to_str()));
+        // 标记缺失或无法读取时回退官方源
+        assert!(!marker_mirror(dir.join("missing").to_str()));
+        assert!(!marker_mirror(None));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn script_path_puts_managed_node_bin_first() {
+        let node_root = Path::new("/node-root");
+        let existing = if cfg!(windows) {
+            r"C:\Windows;C:\Tools"
+        } else {
+            "/usr/bin:/usr/local/bin"
+        };
+        let joined = script_path(node_root, Some(OsStr::new(existing)));
+        let entries: Vec<PathBuf> = std::env::split_paths(&joined).collect();
+        assert_eq!(entries.first(), Some(&node_bin_dir(node_root)));
+        let original: Vec<PathBuf> = std::env::split_paths(OsStr::new(existing)).collect();
+        assert_eq!(&entries[1..], original.as_slice());
+    }
+
+    #[test]
+    fn script_path_without_inherited_path_keeps_only_node() {
+        let node_root = Path::new("/node-root");
+        let joined = script_path(node_root, None);
+        assert_eq!(
+            std::env::split_paths(&joined).collect::<Vec<PathBuf>>(),
+            vec![node_bin_dir(node_root)]
+        );
+    }
+
+    #[test]
+    fn windows_network_paths_are_detected() {
+        assert!(is_windows_network_path(r"\\Mac\Home\Downloads\td"));
+        assert!(is_windows_network_path("//Mac/Home/Downloads/td"));
+        assert!(!is_windows_network_path("C:\\Users\\me\\dsh"));
+        assert!(!is_windows_network_path("C:/Users/me/dsh"));
+    }
+
+    #[test]
+    fn script_path_falls_back_to_raw_concat_on_invalid_entry() {
+        // 条目内含平台分隔符会让 join_paths 失败，此时应退化为直接拼接且托管 Node 在最前。
+        // 两平台都构造真正含分隔符的条目，确保实际走的是兜底分支而非正常拼接。
+        let node_root = if cfg!(windows) {
+            Path::new(r"C:\no;de")
+        } else {
+            Path::new("/node:root")
+        };
+        let existing = if cfg!(windows) { r"C:\bin" } else { "/usr/bin" };
+        let joined = script_path(node_root, Some(OsStr::new(existing)));
+        let text = joined.to_string_lossy();
+        assert!(text.starts_with(&node_bin_dir(node_root).to_string_lossy().to_string()));
+        assert!(text.contains(existing));
     }
 }
