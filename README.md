@@ -2,88 +2,54 @@
 
 简体中文 | [English](README_EN.md)
 
-## 项目截图
+**超小的 DSH 启动器，无侵入，你不需要担心有任何插件冲突。支持一键安装和自动启动。**
 
-**DSH Launcher**
+轻量桌面应用，一键安装、启动和管理本地 DeepSeek Harness（DSH）Web 服务。基于 Tauri 2 + React + Rust。
+
+## 界面
 
 ![DSH Launcher 桌面界面](docs/images/launcher.png)
 
-**内置 DeepSeek Harness WebView**
-
 ![DeepSeek 内置 WebView](docs/images/webview.png)
 
-## 简介
+## 功能
 
-DSH Launcher 是一个基于 Tauri 2、React 和 Rust 的轻量桌面启动器，用于安装、启动和管理本机的 DeepSeek Harness（DSH）Web 服务。
+- **自动识别**：自动检测已安装的 DSH，也可手动选择
+- **一键安装**：在空目录中自动下载校验 Node LTS 并安装 DSH，不修改系统 PATH
+- **一键升级**：自动检测托管 DSH 新版本，确认后停止服务再升级
+- **服务管理**：启动 / 停止 / 重启，HTTP 健康检查，实时日志
+- **开箱即用**：服务就绪后自动打开内置 WebView 或默认浏览器
+- **灵活配置**：Profile、监听地址、端口与附加 DSH 参数
+- **兼容外部安装**：已有的 DSH 以只读方式检测使用，不会被修改
+- **全平台**：macOS / Windows / Linux（arm64 与 x64），跟随系统明暗主题
 
-> **平台测试状态：** 当前版本已在 macOS 上验证。Windows 和 Linux 仅进行了简单测试，不保证所有功能可用，请将对应平台产物视为候选版本。
+## 使用提示
 
-### 功能
+- 插件的安装与升级仍通过 DSH 自身的命令和配置完成
+- 托管环境只提供 DSH 升级，不升级 Node；升级前会确认并停止服务，完成后不自动重启
+- 外部 DSH 需确认可正常运行：`dsh --version`
 
-- 自动检测或手动选择 `dsh` 可执行文件
-- 在用户选择的空目录中一键安装独立 Node LTS 与 DSH
-- 检测并升级 Launcher 托管的 DSH，升级前确认并停止服务
-- 检测 Launcher Release，并在有更新时显示版本红点
-- 配置 Profile、监听主机、端口和额外 DSH 参数
-- 启动、停止和重启由 Launcher 创建的 DSH 服务
-- HTTP 健康检查和实时 stdout/stderr 日志
-- 服务就绪后打开内置 WebView 或默认浏览器
-- 支持 macOS、Windows 和 Linux 的系统明暗主题
-- Launcher 退出时仅回收自己创建的 DSH 进程，不接管端口上已有的外部服务
+## macOS 首次启动
 
-### 使用边界
+- 应用未经 Apple 公证，若提示"未知开发者"，将 `DSH Launcher.app` 放入 `/Applications` 后执行：
 
-DSH Launcher 可以继续使用已有的外部 DSH，也可以在用户选择的空目录中创建独立的托管环境。托管安装会下载并校验 Node 官方最新 LTS，再安装 DSH；此后只提供 DSH 升级，不提供 Node 升级。外部安装保持只读检测，不会被 Launcher 修改。插件安装、添加、删除和更新仍应通过 DSH 自身的命令和配置完成。
+  ```bash
+  sudo xattr -r -d com.apple.quarantine "/Applications/DSH Launcher.app"
+  ```
 
-升级托管 DSH 前会请求确认并停止 Launcher 管理的服务，完成后不会自动重启。若使用外部安装，请先确保 `dsh` 可正常运行：
+- macOS 15+ 首次启动会请求"本地网络"权限，请允许（系统设置 → 隐私与安全性 → 本地网络）
 
-```bash
-dsh --version
-```
+## 从源码构建
 
-### macOS 安装提示
-
-未经 Apple 公证的构建可能被 macOS 标记为来自未知开发者。请先将 `DSH Launcher.app` 放入 `/Applications`。如果仍无法打开，可以移除应用的 quarantine 属性：
-
-```bash
-sudo xattr -r -d com.apple.quarantine "/Applications/DSH Launcher.app"
-```
-
-只应对你信任且来源明确的应用执行此命令。
-
-首次启动时，macOS 15 或更高版本会请求“本地网络”权限。请允许访问，否则 DSH 可能无法连接局域网中的模型服务。可在“系统设置 → 隐私与安全性 → 本地网络”中修改此权限。
-
-### 开发
-
-要求：Node.js 22、Rust 1.88 或更高版本，以及对应平台的 Tauri 2 系统依赖。
+要求：Node.js 22+、Rust 1.88+，以及平台对应的 Tauri 2 依赖。
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm run tauri dev
+pnpm run tauri dev        # 本地开发
+pnpm run build:mac        # macOS 构建（补签 + 权限元数据校验）
+pnpm run tauri build      # Windows / Linux 构建
 ```
 
-执行检查：
+## License
 
-```bash
-pnpm run build
-cargo test --manifest-path src-tauri/Cargo.toml
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-```
-
-### 构建桌面安装包
-
-macOS 本地构建必须使用补签命令，避免绕过本地网络权限所需的签名校验：
-
-```bash
-pnpm run build:mac
-```
-
-Windows/Linux 可使用 `pnpm run tauri build`。仓库中的 GitHub Actions 工作流（[.github/workflows/build.yml](.github/workflows/build.yml)）使用 pnpm 11 在原生 macOS、Windows 和 Linux runner 上构建候选产物，三个平台均覆盖 arm64 / x64：macOS 生成 DMG，Windows 生成 NSIS，Linux 生成 DEB、RPM 和 AppImage。
-
-macOS 构建不要求 Apple Developer 账户。未配置证书时，工作流会先对完整 `.app` 执行 ad-hoc 签名并固定 Bundle ID，再从签名后的应用生成 DMG；这可让系统读取本地网络用途声明并申请权限。ad-hoc 签名不提供公证或可信开发者身份，升级或重装后可能需要重新授权。若需要稳定的跨版本权限身份和正式分发，请配置以下 GitHub Actions 仓库 Secrets：
-
-- `APPLE_CERTIFICATE`：Base64 编码的 `.p12` 证书
-- `APPLE_CERTIFICATE_PASSWORD`：证书密码
-- `APPLE_SIGNING_IDENTITY`：Developer ID Application 签名身份
-
-默认工作流不执行 Apple 公证。
+[MIT](LICENSE)
