@@ -929,9 +929,10 @@ mod tests {
     }
 
     #[test]
-    fn script_path_falls_back_to_raw_concat_on_invalid_entry() {
-        // 条目内含平台分隔符会让 join_paths 失败，此时应退化为直接拼接且托管 Node 在最前。
-        // 两平台都构造真正含分隔符的条目，确保实际走的是兜底分支而非正常拼接。
+    fn script_path_keeps_managed_node_first_even_with_separator_entries() {
+        // Unix：join_paths 对含 ':' 的条目返回 Err，退化为直接拼接，托管节点仍在最前且无引号。
+        // Windows：join_paths 不会报错，而是给含 ';' 的条目加引号（cmd 对带引号 PATH 解析
+        // 不可靠，因此 validate_install_root 已直接拒绝该类目录）；这里只锁住“托管节点目录排最前”。
         let node_root = if cfg!(windows) {
             Path::new(r"C:\no;de")
         } else {
@@ -940,7 +941,16 @@ mod tests {
         let existing = if cfg!(windows) { r"C:\bin" } else { "/usr/bin" };
         let joined = script_path(node_root, Some(OsStr::new(existing)));
         let text = joined.to_string_lossy();
-        assert!(text.starts_with(&node_bin_dir(node_root).to_string_lossy().to_string()));
+        if cfg!(windows) {
+            assert!(text.starts_with(&format!(
+                r#""{}""#,
+                node_bin_dir(node_root).to_string_lossy()
+            )));
+        } else {
+            assert!(text.starts_with(&node_bin_dir(node_root).to_string_lossy().to_string()));
+            // Unix 兜底拼接不会引入引号
+            assert!(!text.contains('"'));
+        }
         assert!(text.contains(existing));
     }
 }
