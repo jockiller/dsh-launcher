@@ -72,11 +72,13 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
 ### 构建桌面安装包
 
+macOS 本地构建必须使用补签命令，避免绕过本地网络权限所需的签名校验：
+
 ```bash
-pnpm run tauri build
+pnpm run build:mac
 ```
 
-仓库中的 GitHub Actions 工作流（[.github/workflows/build.yml](.github/workflows/build.yml)）使用 pnpm 11 在原生 macOS、Windows 和 Linux runner 上构建候选产物，三个平台均覆盖 arm64 / x64：macOS 生成 DMG，Windows 生成 NSIS，Linux 生成 DEB、RPM 和 AppImage。
+Windows/Linux 可使用 `pnpm run tauri build`。仓库中的 GitHub Actions 工作流（[.github/workflows/build.yml](.github/workflows/build.yml)）使用 pnpm 11 在原生 macOS、Windows 和 Linux runner 上构建候选产物，三个平台均覆盖 arm64 / x64：macOS 生成 DMG，Windows 生成 NSIS，Linux 生成 DEB、RPM 和 AppImage。
 
 macOS 构建不要求 Apple Developer 账户。未配置证书时，工作流会先对完整 `.app` 执行 ad-hoc 签名并固定 Bundle ID，再从签名后的应用生成 DMG；这可让系统读取本地网络用途声明并申请权限。ad-hoc 签名不提供公证或可信开发者身份，升级或重装后可能需要重新授权。若需要稳定的跨版本权限身份和正式分发，请配置以下 GitHub Actions 仓库 Secrets：
 

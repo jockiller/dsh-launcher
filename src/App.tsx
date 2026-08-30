@@ -252,6 +252,7 @@ export default function App() {
       } : current);
       void invoke<string>("check_latest_dsh").then(setLatestDsh).catch(() => undefined);
     } catch (reason) {
+      setManagedProgress(null);
       setError(errorMessage(reason));
     } finally {
       setManagedBusy(false);
@@ -276,6 +277,7 @@ export default function App() {
       setVersion(result.dshVersion);
       setLatestDsh(result.dshVersion);
     } catch (reason) {
+      setManagedProgress(null);
       setError(errorMessage(reason));
     } finally {
       setManagedBusy(false);

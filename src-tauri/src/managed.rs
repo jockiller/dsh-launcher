@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(not(windows))]
 use flate2::read::GzDecoder;
@@ -17,6 +17,8 @@ const NODE_INDEX_URL: &str = "https://nodejs.org/dist/index.json";
 const NPM_LATEST_URL: &str = "https://registry.npmjs.org/@deepseek-ai%2Fdsh/latest";
 const MANAGED_SCHEMA: u8 = 1;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const NPM_INSTALL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const NPM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 static OPERATION_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize)]
@@ -320,74 +322,112 @@ fn validate_relative_path(path: &Path) -> Result<(), String> {
 
 fn npm_install(app: &AppHandle, node_root: &Path, prefix: &Path) -> Result<(), String> {
     fs::create_dir_all(prefix).map_err(|e| format!("创建 DSH 安装目录失败：{e}"))?;
-    let mut child = Command::new(node_executable(node_root))
+    let mut command = Command::new(node_executable(node_root));
+    command
         .arg(npm_cli(node_root))
-        .args(["install", "--no-audit", "--no-fund", "--prefix"])
+        .args([
+            "install",
+            "--no-audit",
+            "--no-fund",
+            "--no-progress",
+            "--foreground-scripts",
+            "--fetch-timeout=60000",
+            "--fetch-retries=2",
+            "--prefix",
+        ])
         .arg(prefix)
         .arg("@deepseek-ai/dsh@latest")
+        .env("CI", "true")
+        .env("npm_config_yes", "true")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_managed_child(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|e| format!("执行 npm 安装失败：{e}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .map(|pipe| pipe_managed_logs(app.clone(), "npm-out", "info", pipe));
-    let stderr = child
-        .stderr
-        .take()
-        .map(|pipe| pipe_managed_logs(app.clone(), "npm-err", "error", pipe));
-    let status = child
-        .wait()
-        .map_err(|e| format!("等待 npm 安装结束失败：{e}"))?;
-    let stdout_tail = stdout
-        .and_then(|reader| reader.join().ok())
-        .unwrap_or_default();
-    let stderr_tail = stderr
-        .and_then(|reader| reader.join().ok())
-        .unwrap_or_default();
+    if let Some(pipe) = child.stdout.take() {
+        pipe_managed_logs(app.clone(), "npm-out", "info", pipe);
+    }
+    if let Some(pipe) = child.stderr.take() {
+        pipe_managed_logs(app.clone(), "npm-err", "error", pipe);
+    }
+
+    let started = Instant::now();
+    let mut last_heartbeat = started;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("检查 npm 安装状态失败：{e}"))?
+        {
+            break status;
+        }
+        if started.elapsed() >= NPM_INSTALL_TIMEOUT {
+            terminate_managed_child(child.id());
+            let _ = child.wait();
+            return Err(
+                "npm 安装 DSH 超过 20 分钟，已终止。请检查 npm 网络或代理设置后重试".into(),
+            );
+        }
+        if last_heartbeat.elapsed() >= NPM_HEARTBEAT_INTERVAL {
+            crate::service::emit_log(app, "installer", "info", "npm 仍在下载并安装 DSH...");
+            last_heartbeat = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(250));
+    };
     if status.success() {
         Ok(())
     } else {
-        let detail = if stderr_tail.trim().is_empty() {
-            stdout_tail.trim()
-        } else {
-            stderr_tail.trim()
-        };
-        Err(if detail.is_empty() {
-            format!("npm 安装 DSH 失败，退出状态：{status}")
-        } else {
-            format!("npm 安装 DSH 失败：{detail}")
-        })
+        Err(format!(
+            "npm 安装 DSH 失败，退出状态：{status}；详细信息见日志区"
+        ))
     }
 }
 
-fn pipe_managed_logs<R>(
-    app: AppHandle,
-    source: &'static str,
-    level: &'static str,
-    reader: R,
-) -> thread::JoinHandle<String>
+fn pipe_managed_logs<R>(app: AppHandle, source: &'static str, level: &'static str, reader: R)
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
-        let mut tail = String::new();
         for line in BufReader::new(reader).lines().map_while(Result::ok) {
             crate::service::emit_log(&app, source, level, &line);
-            tail.push_str(&line);
-            tail.push('\n');
-            if tail.len() > 4096 {
-                let mut keep_from = tail.len().saturating_sub(4096);
-                while !tail.is_char_boundary(keep_from) {
-                    keep_from += 1;
-                }
-                tail = tail[keep_from..].to_string();
-            }
         }
-        tail
-    })
+    });
+}
+
+#[cfg(unix)]
+fn configure_managed_child(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(windows)]
+fn configure_managed_child(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(0x0800_0000);
+}
+
+#[cfg(unix)]
+fn terminate_managed_child(pid: u32) {
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+fn terminate_managed_child(pid: u32) {
+    use std::os::windows::process::CommandExt;
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(0x0800_0000)
+        .status();
 }
 
 fn validate_install_root(root: &Path) -> Result<(), String> {

@@ -72,11 +72,13 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
 ### Build Desktop Packages
 
+Use the signing-aware command for local macOS builds so Local Network permission metadata and the final app signature are verified:
+
 ```bash
-pnpm run tauri build
+pnpm run build:mac
 ```
 
-The included GitHub Actions workflow ([.github/workflows/build.yml](.github/workflows/build.yml)) uses pnpm 11 to build candidate artifacts on native macOS, Windows, and Linux runners, with arm64 and x64 covered on all three platforms: DMG for macOS, NSIS for Windows, and DEB, RPM, and AppImage for Linux.
+Use `pnpm run tauri build` on Windows/Linux. The included GitHub Actions workflow ([.github/workflows/build.yml](.github/workflows/build.yml)) uses pnpm 11 to build candidate artifacts on native macOS, Windows, and Linux runners, with arm64 and x64 covered on all three platforms: DMG for macOS, NSIS for Windows, and DEB, RPM, and AppImage for Linux.
 
 The macOS build does not require an Apple Developer account. Without a certificate, the workflow ad-hoc signs the complete `.app` with a fixed bundle identifier before creating the DMG, allowing macOS to read the Local Network usage description and request permission. Ad-hoc signing provides neither notarization nor a trusted developer identity, so upgrades or reinstalls may require permission again. For stable identity across releases and formal distribution, configure these repository secrets:
 
