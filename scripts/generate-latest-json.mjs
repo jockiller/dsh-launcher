@@ -11,11 +11,10 @@
 //   *_x86_64.app.tar.gz.sig     -> darwin-x86_64    （macOS x64 热更包）
 //   *_x64-setup.exe.sig         -> windows-x86_64   （NSIS 安装器，per-user 静默重装）
 //   *_arm64-setup.exe.sig       -> windows-aarch64
-//   *_amd64.AppImage.sig        -> linux-x86_64     （AppImage 自替换，无 root）
-//   *_arm64.AppImage.sig        -> linux-aarch64
 //
-// 注意：latest.json 只输出这 6 个平台；Windows 更新包经 minisign 校验后由 NSIS
-// 安装器完成重装，DEB/RPM 不纳入热更（需要 root，/Linux 上由用户自行跳转到 Release）。
+// 注意：latest.json 只输出这 4 个平台——热更新仅支持 macOS 与 Windows；Linux
+//（DEB/RPM/AppImage）不参与热更：AppImage 自替换未经实机验证、deb/rpm 需要
+// root，Linux 用户统一走"打开 Release 页面手动下载"。
 
 import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -36,11 +35,6 @@ const ROUTES = [
   [/_x86_64\.app\.tar\.gz\.sig$/, "darwin-x86_64"],
   [/_x64-setup\.exe\.sig$/, "windows-x86_64"],
   [/_arm64-setup\.exe\.sig$/, "windows-aarch64"],
-  [/_amd64\.AppImage\.sig$/i, "linux-x86_64"],
-  // 注意：Tauri 对 AppImage 的 arm64 产物命名为 _aarch64（实测 v0.9.0 CI 日志），
-  // Windows NSIS 才是 _arm64；两条路由并存以防命名口径变化。
-  [/_aarch64\.AppImage\.sig$/i, "linux-aarch64"],
-  [/_arm64\.AppImage\.sig$/i, "linux-aarch64"],
 ];
 
 function collectFiles(root) {

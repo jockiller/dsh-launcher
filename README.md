@@ -38,7 +38,7 @@
   sudo xattr -r -d com.apple.quarantine "/Applications/DSH Launcher.app"
   ```
 
-- macOS 15+ 首次启动会请求"本地网络"权限，请允许（系统设置 → 隐私与安全性 → 本地网络）
+- macOS 15+ 首次启动会请求"本地网络"权限——如需访问本地局域网中的模型服务，请允许该权限（系统设置 → 隐私与安全性 → 本地网络）
 
 ## 从源码构建
 

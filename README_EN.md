@@ -38,7 +38,7 @@ A lightweight desktop app to install, start, and manage a local DeepSeek Harness
   sudo xattr -r -d com.apple.quarantine "/Applications/DSH Launcher.app"
   ```
 
-- On macOS 15+, allow the Local Network permission on first launch (System Settings → Privacy & Security → Local Network)
+- On macOS 15+, the app asks for Local Network permission on first launch — allow it if you need to reach model services on your LAN (System Settings → Privacy & Security → Local Network)
 
 ## Build from Source
 

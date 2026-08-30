@@ -559,7 +559,11 @@ export default function App() {
             <header><h2 id="app-update-title">{t.appUpdateTitle.replace("{0}", releaseUpdate.latestVersion ?? "")}</h2></header>
             <div className="install-dialog-body">
               <div className="app-update-notes">
-                {releaseUpdate.notes ? releaseUpdate.notes : t.appUpdateNotesEmpty}
+                {/* Linux 不参与应用内热更新，仅提示手动下载 */}
+                {navigator.platform.startsWith("Linux") && <p className="window-close-hint">{t.appUpdateLinuxHint}</p>}
+                <div className="app-update-notes-content">
+                  {releaseUpdate.notes ? releaseUpdate.notes : t.appUpdateNotesEmpty}
+                </div>
               </div>
               {appUpdateProgress && !appUpdateInstalled && (
                 <div className="managed-progress" aria-live="polite">
@@ -581,14 +585,20 @@ export default function App() {
             </div>
             <footer>
               <button type="button" onClick={() => setAppUpdateDialogOpen(false)}>{t.cancel}</button>
-              {releaseUpdate.releaseUrl && (
-                <button type="button" onClick={() => void openReleaseUrl()}>
+              {/* Linux 上"在 GitHub 查看"是唯一行动出口，升级为 primary 主按钮；隐藏热更按钮后保持行动指引清晰 */}
+              {releaseUpdate.releaseUrl && !appUpdateInstalled && (
+                <button
+                  type="button"
+                  className={`github-download${navigator.platform.startsWith("Linux") ? " primary" : ""}`}
+                  disabled={appUpdateBusy}
+                  onClick={() => void openReleaseUrl()}
+                >
                   <ExternalLink size={13} />{t.viewOnGitHub}
                 </button>
               )}
               {appUpdateInstalled ? (
                 <button type="button" className="primary" disabled={appUpdateBusy} onClick={() => void restartApp()}><RotateCw size={13} />{t.appUpdateRestartNow}</button>
-              ) : (
+              ) : !navigator.platform.startsWith("Linux") && (
                 <button type="button" className="primary" disabled={appUpdateBusy} onClick={() => void runAppUpdate()}>
                   <Download size={13} />{appUpdateBusy && !appUpdateProgress ? t.appUpdateLoading : appUpdateProgress ? t.appUpdateInstallRunning : t.appUpdateInstallAction}
                 </button>
