@@ -25,8 +25,8 @@ jobs:
             updater-arch: arm64
             paths: |
               src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
-              src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*_arm64.app.tar.gz
-              src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*_arm64.app.tar.gz.sig
+              src-tauri/target/aarch64-apple-darwin/release/bundle/macos/DSH_Launcher_macos-arm64.app.tar.gz
+              src-tauri/target/aarch64-apple-darwin/release/bundle/macos/DSH_Launcher_macos-arm64.app.tar.gz.sig
           - name: macOS x64
             os: macos-15-intel
             rust-target: x86_64-apple-darwin
@@ -35,8 +35,8 @@ jobs:
             updater-arch: x64
             paths: |
               src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
-              src-tauri/target/x86_64-apple-darwin/release/bundle/macos/*_x64.app.tar.gz
-              src-tauri/target/x86_64-apple-darwin/release/bundle/macos/*_x64.app.tar.gz.sig
+              src-tauri/target/x86_64-apple-darwin/release/bundle/macos/DSH_Launcher_macos-x64.app.tar.gz
+              src-tauri/target/x86_64-apple-darwin/release/bundle/macos/DSH_Launcher_macos-x64.app.tar.gz.sig
           - name: Windows x64
             os: windows-latest
             rust-target: x86_64-pc-windows-msvc
