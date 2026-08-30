@@ -22,27 +22,26 @@ jobs:
             rust-target: aarch64-apple-darwin
             bundles: app
             artifact: macos-arm64
-            updater-arch: aarch64
+            updater-arch: arm64
             paths: |
               src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
-              src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*_aarch64.app.tar.gz
-              src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*_aarch64.app.tar.gz.sig
+              src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*_arm64.app.tar.gz
+              src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*_arm64.app.tar.gz.sig
           - name: macOS x64
             os: macos-15-intel
             rust-target: x86_64-apple-darwin
             bundles: app
             artifact: macos-x64
-            updater-arch: x86_64
+            updater-arch: x64
             paths: |
               src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
-              src-tauri/target/x86_64-apple-darwin/release/bundle/macos/*_x86_64.app.tar.gz
-              src-tauri/target/x86_64-apple-darwin/release/bundle/macos/*_x86_64.app.tar.gz.sig
+              src-tauri/target/x86_64-apple-darwin/release/bundle/macos/*_x64.app.tar.gz
+              src-tauri/target/x86_64-apple-darwin/release/bundle/macos/*_x64.app.tar.gz.sig
           - name: Windows x64
             os: windows-latest
             rust-target: x86_64-pc-windows-msvc
             bundles: nsis
             artifact: windows-x64
-            updater-arch: x86_64
             paths: |
               src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
               src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe.sig
@@ -51,7 +50,6 @@ jobs:
             rust-target: aarch64-pc-windows-msvc
             bundles: nsis
             artifact: windows-arm64
-            updater-arch: aarch64
             paths: |
               src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*.exe
               src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*.exe.sig
@@ -60,7 +58,6 @@ jobs:
             rust-target: x86_64-unknown-linux-gnu
             bundles: deb,rpm,appimage
             artifact: linux-x64
-            updater-arch: ""
             paths: |
               src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
               src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm
@@ -70,7 +67,6 @@ jobs:
             rust-target: aarch64-unknown-linux-gnu
             bundles: deb,rpm,appimage
             artifact: linux-arm64
-            updater-arch: ""
             paths: |
               src-tauri/target/aarch64-unknown-linux-gnu/release/bundle/deb/*.deb
               src-tauri/target/aarch64-unknown-linux-gnu/release/bundle/rpm/*.rpm
@@ -166,7 +162,7 @@ jobs:
 
           scripts/sign-macos-app.sh "$app"
 
-          tarball_base="DSH_Launcher_${{ matrix.updater-arch }}.app.tar.gz"
+          tarball_base="DSH_Launcher_macos-${{ matrix.updater-arch }}.app.tar.gz"
           rm -f "$bundle_dir/macos/$tarball_base" "$bundle_dir/macos/$tarball_base.sig"
           tar -czf "$bundle_dir/macos/$tarball_base" -C "$(dirname "$app")" "$(basename "$app")"
           pnpm exec tauri signer sign "$bundle_dir/macos/$tarball_base"
@@ -186,22 +182,58 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          # GitHub 上传 Release 资产时会把文件名中的空格替换为点号；latest.json 的 URL
-          # 使用改后的名字，因此先把 NSIS 产物改名成与最终资产名一致，避免热更 URL 404。
+          # 统一 Release 资产命名为 DSH_Launcher_windows-<arch>-setup.exe（arch:
+          # x64/arm64），文件名自带系统标识；同时保持不含空格——GitHub 上传
+          # Release 资产时会把空格替换为点号，latest.json 的 URL 必须与最终资产
+          # 名一致，否则热更下载会 404。
           cd "src-tauri/target/${{ matrix.rust-target }}/release/bundle/nsis"
-          for f in *" "*; do
+          for f in *-setup.exe *-setup.exe.sig; do
             [[ -e "$f" ]] || continue
-            mv -f "$f" "${f// /.}"
+            # tauri 产物名形如 "DSH Launcher_<版本>_<arch>-setup.exe[.sig]"
+            tail="${f##*_}"
+            if [[ "$f" == *.sig ]]; then
+              mv -f "$f" "DSH_Launcher_windows-${tail%%-setup.exe*}-setup.exe.sig"
+            else
+              mv -f "$f" "DSH_Launcher_windows-${tail%%-setup.exe*}-setup.exe"
+            fi
           done
 
-      - name: Archive AppImage with executable permissions
+      - name: Rename Linux assets and archive AppImage
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          appimage=$(find "src-tauri/target/${{ matrix.rust-target }}/release/bundle/appimage" -maxdepth 1 -name '*.AppImage' -print -quit)
+          # 统一 Release 资产命名为 DSH_Launcher_linux-<arch>.<ext>，文件名自带
+          # 系统标识，不必单靠扩展名辨认平台；<arch> 沿用各包格式惯例：
+          # deb 用 amd64/arm64，rpm 用 x86_64/aarch64，AppImage 用 amd64/aarch64。
+          bundle_dir="src-tauri/target/${{ matrix.rust-target }}/release/bundle"
+
+          # deb：tauri 产物名形如 "DSH Launcher_<版本>_amd64.deb"
+          for f in "$bundle_dir"/deb/*.deb; do
+            [[ -e "$f" ]] || continue
+            base="$(basename "$f")"
+            mv -f "$f" "$bundle_dir/deb/DSH_Launcher_linux-${base##*_}"
+          done
+
+          # rpm：tauri 产物名形如 "DSH Launcher-<版本>-<release>.<arch>.rpm"
+          for f in "$bundle_dir"/rpm/*.rpm; do
+            [[ -e "$f" ]] || continue
+            base="$(basename "$f")"
+            release_arch="${base%.rpm}"
+            release_arch="${release_arch##*-}"   # "<release>.<arch>"
+            mv -f "$f" "$bundle_dir/rpm/DSH_Launcher_linux-${release_arch#*.}.rpm"
+          done
+
+          # AppImage：补执行位、改名后打包（解压出来即统一命名的 AppImage）
+          appimage_dir="$bundle_dir/appimage"
+          appimage="$(find "$appimage_dir" -maxdepth 1 -name '*.AppImage' -print -quit)"
           test -n "$appimage"
+          base="$(basename "$appimage")"
+          arch="${base%.AppImage}"
+          arch="${arch##*_}"
+          new_name="DSH_Launcher_linux-${arch}.AppImage"
           chmod +x "$appimage"
-          tar -czf "$appimage.tar.gz" -C "$(dirname "$appimage")" "$(basename "$appimage")"
+          mv -f "$appimage" "$appimage_dir/$new_name"
+          tar -czf "$appimage_dir/$new_name.tar.gz" -C "$appimage_dir" "$new_name"
 
       - uses: actions/upload-artifact@v4
         with:

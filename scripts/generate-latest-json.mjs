@@ -6,11 +6,12 @@
 // - 环境变量 GITHUB_REPOSITORY / GITHUB_REF_NAME 由 GitHub Actions 提供，
 //   本地调试时可显式传入 repo 与 tag 参数。
 //
-// 平台映射（按 .sig 文件名匹配，url 指向同 Release 的对应产物）：
-//   *_aarch64.app.tar.gz.sig    -> darwin-aarch64   （macOS arm64 热更包，由 CI 重签后改名）
-//   *_x86_64.app.tar.gz.sig     -> darwin-x86_64    （macOS x64 热更包）
-//   *_x64-setup.exe.sig         -> windows-x86_64   （NSIS 安装器，per-user 静默重装）
-//   *_arm64-setup.exe.sig       -> windows-aarch64
+// 平台映射（按 .sig 文件名匹配，url 指向同 Release 的对应产物。各平台产物在
+// build.yml 中统一改名为 DSH_Launcher_<系统>-<架构>...，无空格，与最终资产名一致）：
+//   DSH_Launcher_macos-arm64.app.tar.gz.sig   -> darwin-aarch64   （macOS arm64 热更包，CI 重签后改名）
+//   DSH_Launcher_macos-x64.app.tar.gz.sig     -> darwin-x86_64    （macOS x64 热更包）
+//   DSH_Launcher_windows-x64-setup.exe.sig    -> windows-x86_64   （NSIS 安装器，per-user 静默重装）
+//   DSH_Launcher_windows-arm64-setup.exe.sig  -> windows-aarch64
 //
 // 注意：latest.json 只输出这 4 个平台——热更新仅支持 macOS 与 Windows；Linux
 //（DEB/RPM/AppImage）不参与热更：AppImage 自替换未经实机验证、deb/rpm 需要
@@ -31,10 +32,10 @@ if (!/^\d+\.\d+\.\d+/.test(version)) {
 }
 
 const ROUTES = [
-  [/_aarch64\.app\.tar\.gz\.sig$/, "darwin-aarch64"],
-  [/_x86_64\.app\.tar\.gz\.sig$/, "darwin-x86_64"],
-  [/_x64-setup\.exe\.sig$/, "windows-x86_64"],
-  [/_arm64-setup\.exe\.sig$/, "windows-aarch64"],
+  [/^DSH_Launcher_macos-arm64\.app\.tar\.gz\.sig$/, "darwin-aarch64"],
+  [/^DSH_Launcher_macos-x64\.app\.tar\.gz\.sig$/, "darwin-x86_64"],
+  [/^DSH_Launcher_windows-x64-setup\.exe\.sig$/, "windows-x86_64"],
+  [/^DSH_Launcher_windows-arm64-setup\.exe\.sig$/, "windows-aarch64"],
 ];
 
 function collectFiles(root) {
