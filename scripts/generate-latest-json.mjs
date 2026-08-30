@@ -37,6 +37,9 @@ const ROUTES = [
   [/_x64-setup\.exe\.sig$/, "windows-x86_64"],
   [/_arm64-setup\.exe\.sig$/, "windows-aarch64"],
   [/_amd64\.AppImage\.sig$/i, "linux-x86_64"],
+  // 注意：Tauri 对 AppImage 的 arm64 产物命名为 _aarch64（实测 v0.9.0 CI 日志），
+  // Windows NSIS 才是 _arm64；两条路由并存以防命名口径变化。
+  [/_aarch64\.AppImage\.sig$/i, "linux-aarch64"],
   [/_arm64\.AppImage\.sig$/i, "linux-aarch64"],
 ];
 
