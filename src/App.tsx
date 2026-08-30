@@ -19,6 +19,7 @@ import {
   persistLanguage,
   translateBackendMessage,
   translations,
+  type Dict,
   type Lang,
 } from "./i18n";
 import { mergeLogs, type LogLine } from "./logMerge";
@@ -93,6 +94,41 @@ function systemLanguageIsChinese(): boolean {
     .some((language) => language.toLowerCase().startsWith("zh"));
 }
 
+function focusableElements(container: HTMLElement): HTMLElement[] {
+  return Array.from(
+    container.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+    ),
+  ).filter((element) => !element.hidden && element.getAttribute("aria-hidden") !== "true");
+}
+
+function managedProgressLabel(
+  progress: ManagedProgress,
+  operation: "install" | "upgrade" | null,
+  t: Dict,
+): string {
+  switch (progress.phase) {
+    case "starting":
+      return operation === "upgrade" ? t.upgradingDsh : t.preparingInstall;
+    case "metadata":
+      return t.managedProgressMetadata;
+    case "download":
+      return t.managedProgressDownload;
+    case "verify":
+      return t.managedProgressVerify;
+    case "extract":
+      return t.managedProgressExtract;
+    case "install":
+      return t.managedProgressInstall;
+    case "upgrade":
+      return t.managedProgressUpgrade;
+    case "complete":
+      return operation === "upgrade" ? t.managedProgressUpgradeComplete : t.managedProgressComplete;
+    default:
+      return t.managedProgressUnknown;
+  }
+}
+
 export default function App() {
   const [lang, setLang] = useState<Lang>(detectLanguage);
   const t = translations[lang];
@@ -115,6 +151,7 @@ export default function App() {
   const [managed, setManaged] = useState<ManagedStatus | null>(null);
   const [latestDsh, setLatestDsh] = useState<string | null>(null);
   const [managedProgress, setManagedProgress] = useState<ManagedProgress | null>(null);
+  const [managedOperation, setManagedOperation] = useState<"install" | "upgrade" | null>(null);
   const [managedBusy, setManagedBusy] = useState(false);
   const [installDialogOpen, setInstallDialogOpen] = useState(false);
   const [installDirectory, setInstallDirectory] = useState("");
@@ -128,6 +165,12 @@ export default function App() {
   const [appUpdateProgress, setAppUpdateProgress] = useState<AppUpdateProgress | null>(null);
   const [appUpdateError, setAppUpdateError] = useState<string | null>(null);
   const logEnd = useRef<HTMLDivElement>(null);
+  const pageContentRef = useRef<HTMLDivElement>(null);
+  const installDialogRef = useRef<HTMLElement>(null);
+  const appUpdateDialogRef = useRef<HTMLElement>(null);
+  const installDialogTriggerRef = useRef<HTMLElement | null>(null);
+  const appUpdateDialogTriggerRef = useRef<HTMLElement | null>(null);
+  const previousDialogRef = useRef<"install" | "update" | null>(null);
 
   const phaseLabels: Record<Phase, string> = {
     stopped: t.phaseStopped,
@@ -222,6 +265,68 @@ export default function App() {
     if (config?.autoScrollLogs) logEnd.current?.scrollIntoView({ block: "end" });
   }, [logs, config?.autoScrollLogs]);
 
+  useEffect(() => {
+    const activeDialog = installDialogOpen ? "install" : appUpdateDialogOpen ? "update" : null;
+    const dialogRef = activeDialog === "install" ? installDialogRef : appUpdateDialogRef;
+    const dialog = dialogRef.current;
+    const pageContent = pageContentRef.current;
+
+    if (!activeDialog || !dialog) {
+      const trigger = previousDialogRef.current === "install"
+        ? installDialogTriggerRef.current
+        : previousDialogRef.current === "update"
+          ? appUpdateDialogTriggerRef.current
+          : null;
+      previousDialogRef.current = null;
+      trigger?.focus();
+      return;
+    }
+
+    previousDialogRef.current = activeDialog;
+    pageContent?.setAttribute("inert", "");
+    pageContent?.setAttribute("aria-hidden", "true");
+
+    const focusDialog = () => {
+      const first = focusableElements(dialog)[0];
+      (first ?? dialog).focus();
+    };
+    const frame = window.requestAnimationFrame(focusDialog);
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        if (activeDialog === "install") setInstallDialogOpen(false);
+        else setAppUpdateDialogOpen(false);
+        return;
+      }
+      if (event.key !== "Tab") return;
+
+      const focusable = focusableElements(dialog);
+      if (focusable.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const current = document.activeElement;
+      if (event.shiftKey && (current === first || !dialog.contains(current))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (current === last || !dialog.contains(current))) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener("keydown", handleKeyDown, true);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("keydown", handleKeyDown, true);
+      pageContent?.removeAttribute("inert");
+      pageContent?.removeAttribute("aria-hidden");
+    };
+  }, [installDialogOpen, appUpdateDialogOpen]);
+
   const locked = ["running", "starting", "stopping"].includes(status.phase);
   const serviceUrl = useMemo(
     () => status.url || (config ? `http://${config.host}:${config.port}` : ""),
@@ -279,6 +384,7 @@ export default function App() {
     setInstallDialogError(null);
     setInstallDialogOpen(false);
     setManagedBusy(true);
+    setManagedOperation("install");
     setManagedProgress({ phase: "starting", message: t.preparingInstall, percent: 0 });
     setError(null);
     try {
@@ -315,6 +421,7 @@ export default function App() {
     });
     if (!confirmed) return;
     setManagedBusy(true);
+    setManagedOperation("upgrade");
     setManagedProgress({ phase: "upgrade", message: t.upgradingDsh, percent: 0 });
     setError(null);
     try {
@@ -352,6 +459,7 @@ export default function App() {
   function handleAppVersionClick(button: HTMLButtonElement) {
     button.blur();
     if (releaseUpdate?.updateAvailable) {
+      appUpdateDialogTriggerRef.current = button;
       setAppUpdateError(null);
       setAppUpdateInstalled(false);
       setAppUpdateProgress(null);
@@ -420,7 +528,7 @@ export default function App() {
 
   return (
     <main className="launcher-shell">
-      <div className="launcher-content">
+      <div className="launcher-content" ref={pageContentRef}>
         <div className="control-row">
         <div className="left-workspace">
         <section className="compact-settings expanded">
@@ -444,11 +552,11 @@ export default function App() {
                 ) : (
                   <>
                     <span>{t.managedRuntimeHint}</span>
-                    <button disabled={managedBusy || locked} onClick={() => setInstallDialogOpen(true)}><Download size={12} />{t.oneClickInstall}</button>
+                    <button disabled={managedBusy || locked} onClick={(event) => { installDialogTriggerRef.current = event.currentTarget; setInstallDialogOpen(true); }}><Download size={12} />{t.oneClickInstall}</button>
                   </>
                 )}
               </div>
-              {managedProgress && <div className="managed-progress"><span style={{ width: `${managedProgress.percent ?? 0}%` }} /><small>{managedProgress.message}</small></div>}
+              {managedProgress && <div className="managed-progress" aria-live="polite"><span style={{ width: `${managedProgress.percent ?? 0}%` }} /><small>{managedProgressLabel(managedProgress, managedOperation, t)}</small></div>}
             </div>
 
             <div className="connection-row">
@@ -478,7 +586,7 @@ export default function App() {
           </header>
           <div className="mini-console">
             {logs.length === 0 ? <div className="console-empty">{t.logEmpty}</div> : mergedLogs.map((line) => (
-              <div className={`log-line merged ${line.level}`} key={line.firstIndex}><time>{line.timestamp}</time><span className="source">{line.sources.join("+")}</span><span>{line.message}{line.count > 1 && <em className="log-count">×{line.count}</em>}</span></div>
+              <div className={`log-line merged ${line.level}`} key={line.firstIndex}><time>{line.timestamp}</time><span className="source">{line.sources.join("+")}</span><span>{line.sources.includes("installer") ? translateBackendMessage(line.message, lang) : line.message}{line.count > 1 && <em className="log-count">×{line.count}</em>}</span></div>
             ))}
             <div ref={logEnd} />
           </div>
@@ -532,13 +640,13 @@ export default function App() {
       </div>
       {installDialogOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setInstallDialogOpen(false)}>
-          <section className="install-dialog" role="dialog" aria-modal="true" aria-labelledby="install-dialog-title" onMouseDown={(event) => event.stopPropagation()} onKeyDown={(event) => { if (event.key === "Escape") setInstallDialogOpen(false); }}>
+          <section className="install-dialog" role="dialog" aria-modal="true" aria-labelledby="install-dialog-title" tabIndex={-1} ref={installDialogRef} onMouseDown={(event) => event.stopPropagation()}>
             <header><h2 id="install-dialog-title">{t.installDialogTitle}</h2></header>
             <div className="install-dialog-body">
               <label htmlFor="install-directory">{t.installDirectory}</label>
               <div className="command-input">
                 <input id="install-directory" value={installDirectory} readOnly placeholder={t.installDirectoryPlaceholder} />
-                <button type="button" autoFocus onClick={() => void chooseInstallDirectory()} title={t.chooseDirectory}><FolderOpen size={14} /></button>
+                <button type="button" onClick={() => void chooseInstallDirectory()} title={t.chooseDirectory}><FolderOpen size={14} /></button>
               </div>
               {installDialogError && <p className="install-dialog-error" role="alert">{translateBackendMessage(installDialogError, lang)}</p>}
               <label className="mirror-option">
@@ -555,7 +663,7 @@ export default function App() {
       )}
       {appUpdateDialogOpen && releaseUpdate && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setAppUpdateDialogOpen(false)}>
-          <section className="install-dialog" role="dialog" aria-modal="true" aria-labelledby="app-update-title" onMouseDown={(event) => event.stopPropagation()} onKeyDown={(event) => { if (event.key === "Escape") setAppUpdateDialogOpen(false); }}>
+          <section className="install-dialog" role="dialog" aria-modal="true" aria-labelledby="app-update-title" tabIndex={-1} ref={appUpdateDialogRef} onMouseDown={(event) => event.stopPropagation()}>
             <header><h2 id="app-update-title">{t.appUpdateTitle.replace("{0}", releaseUpdate.latestVersion ?? "")}</h2></header>
             <div className="install-dialog-body">
               <div className="app-update-notes">

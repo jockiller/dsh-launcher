@@ -38,6 +38,15 @@ const zhDict = {
   installNow: "开始安装",
   upgradeDsh: "升级 DSH",
   preparingInstall: "正在准备安装...",
+  managedProgressMetadata: "正在获取最新 Node LTS...",
+  managedProgressDownload: "正在下载 Node LTS...",
+  managedProgressVerify: "正在校验 Node 下载文件...",
+  managedProgressExtract: "正在解压 Node...",
+  managedProgressInstall: "正在安装 DSH...",
+  managedProgressUpgrade: "服务已停止，正在升级 DSH...",
+  managedProgressComplete: "Node 与 DSH 安装完成",
+  managedProgressUpgradeComplete: "DSH 升级完成，将在下次启动时生效",
+  managedProgressUnknown: "正在处理托管运行环境...",
   upgradingDsh: "正在停止服务并升级 DSH...",
   upgradeConfirmTitle: "升级 DSH",
   upgradeConfirmMessage: "升级将停止当前 DSH 服务，完成后不会自动重启。是否继续？",
@@ -114,6 +123,15 @@ const enDict: Dict = {
   installNow: "Install now",
   upgradeDsh: "Upgrade DSH",
   preparingInstall: "Preparing installation...",
+  managedProgressMetadata: "Fetching the latest Node LTS...",
+  managedProgressDownload: "Downloading Node LTS...",
+  managedProgressVerify: "Verifying the Node download...",
+  managedProgressExtract: "Extracting Node...",
+  managedProgressInstall: "Installing DSH...",
+  managedProgressUpgrade: "The service has stopped; upgrading DSH...",
+  managedProgressComplete: "Node and DSH installation complete",
+  managedProgressUpgradeComplete: "DSH upgrade complete; it will take effect on the next launch",
+  managedProgressUnknown: "Processing the managed runtime...",
   upgradingDsh: "Stopping the service and upgrading DSH...",
   upgradeConfirmTitle: "Upgrade DSH",
   upgradeConfirmMessage: "The current DSH service will stop and will not restart automatically after the upgrade. Continue?",
@@ -221,6 +239,19 @@ const backendExact: Record<string, string> = {
   "DSH 服务尚未运行": "DSH service is not running yet",
   打开浏览器失败: "Failed to open the browser",
   替换配置文件失败: "Failed to replace the config file",
+  // ---------- 托管安装/升级日志（installer 来源） ----------
+  "正在获取最新 Node LTS...": "Fetching the latest Node LTS...",
+  "正在下载 Node LTS...": "Downloading Node LTS...",
+  "Node 使用国内镜像下载，SHA-256 校验清单仍来自 Node 官方":
+    "Node is downloaded from the China mirror; the SHA-256 checksum list still comes from the official Node source",
+  "Node 使用官方源下载": "Node is downloaded from the official source",
+  "正在校验 Node 下载文件...": "Verifying the Node download...",
+  "正在解压 Node...": "Extracting Node...",
+  "正在安装 DSH...": "Installing DSH...",
+  "Node 与 DSH 安装完成": "Node and DSH installation complete",
+  "服务已停止，正在升级 DSH...": "The service has stopped; upgrading DSH...",
+  "DSH 升级完成，将在下次启动时生效": "DSH upgrade complete; it will take effect on the next launch",
+  "npm 仍在下载并安装 DSH...": "npm is still downloading and installing DSH...",
 };
 
 /**
@@ -263,6 +294,12 @@ const backendTemplates: readonly BackendTemplate[] = [
   { segments: ["显示内置 WebView 失败：", ""], en: "Failed to show the embedded WebView: {0}" },
   { segments: ["打开浏览器失败：", ""], en: "Failed to open the browser: {0}" },
   { segments: ["替换配置文件失败：", ""], en: "Failed to replace the config file: {0}" },
+  // ---------- 托管安装/升级日志（installer 来源，动态消息） ----------
+  { segments: ["正在使用 npm 源安装 DSH：", ""], en: "Installing DSH with npm registry: {0}" },
+  { segments: ["安装任务异常结束：", ""], en: "Install task ended abnormally: {0}" },
+  { segments: ["升级任务异常结束：", ""], en: "Upgrade task ended abnormally: {0}" },
+  { segments: ["检查托管环境异常结束：", ""], en: "Checking the managed runtime ended abnormally: {0}" },
+  { segments: ["检查 DSH 更新异常结束：", ""], en: "Checking for DSH updates ended abnormally: {0}" },
 ];
 
 /** 按字面量片段切分消息，命中返回占位参数，否则返回 null。 */
