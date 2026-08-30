@@ -17,6 +17,7 @@ A lightweight desktop app to install, start, and manage a local DeepSeek Harness
 - **Auto-detect**: automatically finds an installed DSH, or pick one manually
 - **One-click install**: downloads and verifies Node LTS, then installs DSH into an empty directory — no system PATH changes
 - **One-click upgrade**: detects new managed DSH releases, stops the service after confirmation, then upgrades
+- **In-place self-update**: the Launcher detects its own new versions, shows the update log, verifies signatures, and installs with a single restart — no manual download required
 - **Service management**: start / stop / restart, HTTP health checks, live logs
 - **Ready to use**: opens an embedded WebView or the default browser once the service is up
 - **Flexible config**: profile, bind address, port, and extra DSH arguments
