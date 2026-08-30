@@ -16,8 +16,9 @@ use std::time::{Duration, Instant};
 
 use chrono::Local;
 use serde::Serialize;
+use tauri::webview::NewWindowResponse;
 use tauri::{
-    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindow,
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Url, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder, WindowEvent,
 };
 
@@ -1253,11 +1254,32 @@ fn open_embedded_webview(app: &AppHandle, url: &str) -> Result<(), String> {
             .and_then(|_| window.set_focus())
             .map_err(|error| format!("显示内置 WebView 失败：{error}"));
     }
-    let parsed = url
+    let parsed: Url = url
         .parse()
         .map_err(|error| format!("无效的 DSH URL：{error}"))?;
+    let allowed_scheme = parsed.scheme().to_string();
+    let allowed_host = parsed.host_str().map(str::to_string);
+    let allowed_port = parsed.port_or_known_default();
     let saved = WebviewWindowState::load().filter(|state| window_state_is_visible(app, state));
     let window = WebviewWindowBuilder::new(app, "dsh-webview", WebviewUrl::External(parsed))
+        .on_navigation(move |next_url| {
+            let same_origin = next_url.scheme() == allowed_scheme
+                && next_url.host_str().map(str::to_string) == allowed_host
+                && next_url.port_or_known_default() == allowed_port;
+            if same_origin {
+                return true;
+            }
+            if matches!(next_url.scheme(), "http" | "https") {
+                let _ = open_default(next_url.as_str());
+            }
+            false
+        })
+        .on_new_window(move |next_url, _| {
+            if matches!(next_url.scheme(), "http" | "https") {
+                let _ = open_default(next_url.as_str());
+            }
+            NewWindowResponse::Deny
+        })
         .title("DeepSeek Harness")
         .inner_size(1180.0, 780.0)
         .min_inner_size(760.0, 520.0)
