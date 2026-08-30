@@ -15,6 +15,7 @@ pub struct LauncherConfig {
     pub custom_args: String,
     pub auto_start: bool,
     pub auto_scroll_logs: bool,
+    pub managed_runtime_dir: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
@@ -59,6 +60,7 @@ impl Default for LauncherConfig {
             custom_args: "--no-open".into(),
             auto_start: false,
             auto_scroll_logs: true,
+            managed_runtime_dir: String::new(),
         }
     }
 }
@@ -242,6 +244,7 @@ mod tests {
         );
         assert_eq!(config.custom_args, "--no-open");
         assert!(!config.auto_start);
+        assert!(config.managed_runtime_dir.is_empty());
         assert!(config.validate().is_ok());
     }
 

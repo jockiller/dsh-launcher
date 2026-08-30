@@ -14,13 +14,16 @@ English | [简体中文](README.md)
 
 ## Overview
 
-DSH Launcher is a lightweight Tauri 2, React, and Rust desktop application for starting and managing an existing local DeepSeek Harness (DSH) Web service.
+DSH Launcher is a lightweight Tauri 2, React, and Rust desktop application for installing, starting, and managing a local DeepSeek Harness (DSH) Web service.
 
 > **Platform testing status:** The current version has been verified on macOS. Build configurations are provided for Windows and Linux, but they have not yet been tested on real Windows/Linux desktop environments. Treat those artifacts as candidate builds.
 
 ### Features
 
 - Detect `dsh` automatically or select its executable manually
+- Install a dedicated Node LTS runtime and DSH in an empty directory selected by the user
+- Detect and upgrade Launcher-managed DSH after confirmation and service shutdown
+- Check Launcher releases and mark the version when an update is available
 - Configure the profile, bind host, port, and additional DSH arguments
 - Start, stop, and restart DSH processes created by the Launcher
 - Run HTTP health checks and display live stdout/stderr logs
@@ -30,9 +33,9 @@ DSH Launcher is a lightweight Tauri 2, React, and Rust desktop application for s
 
 ### Scope
 
-DSH Launcher **only starts and manages an existing DSH installation**. It does not install or upgrade DSH, and it does not install, add, remove, or update DSH plugins. Continue to manage plugins through DSH's own commands and configuration.
+DSH Launcher can continue using an existing external DSH installation or create an isolated managed environment in an empty directory selected by the user. Managed installation downloads and verifies the latest official Node LTS release before installing DSH. After installation, the Launcher can upgrade DSH only; it does not upgrade Node. External installations remain read-only and are never modified. Continue to install, add, remove, and update plugins through DSH's own commands and configuration.
 
-Before using the Launcher, make sure `dsh` is installed and works normally:
+Upgrading managed DSH requires confirmation and stops the Launcher-owned service; it does not restart automatically afterward. When using an external installation, make sure `dsh` works normally:
 
 ```bash
 dsh --version

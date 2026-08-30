@@ -14,13 +14,16 @@
 
 ## 简介
 
-DSH Launcher 是一个基于 Tauri 2、React 和 Rust 的轻量桌面启动器，用于启动和管理本机已经安装的 DeepSeek Harness（DSH）Web 服务。
+DSH Launcher 是一个基于 Tauri 2、React 和 Rust 的轻量桌面启动器，用于安装、启动和管理本机的 DeepSeek Harness（DSH）Web 服务。
 
 > **平台测试状态：** 当前版本已在 macOS 上验证。Windows 和 Linux 构建配置已经提供，但尚未在真实 Windows/Linux 桌面环境中测试，请将对应平台产物视为候选版本。
 
 ### 功能
 
 - 自动检测或手动选择 `dsh` 可执行文件
+- 在用户选择的空目录中一键安装独立 Node LTS 与 DSH
+- 检测并升级 Launcher 托管的 DSH，升级前确认并停止服务
+- 检测 Launcher Release，并在有更新时显示版本红点
 - 配置 Profile、监听主机、端口和额外 DSH 参数
 - 启动、停止和重启由 Launcher 创建的 DSH 服务
 - HTTP 健康检查和实时 stdout/stderr 日志
@@ -30,9 +33,9 @@ DSH Launcher 是一个基于 Tauri 2、React 和 Rust 的轻量桌面启动器�
 
 ### 使用边界
 
-DSH Launcher **只负责启动和管理已有的 DSH 安装**。它不会安装或升级 DSH，也不会安装、添加、删除或更新任何 DSH 插件。插件管理仍应通过 DSH 自身提供的命令和配置完成。
+DSH Launcher 可以继续使用已有的外部 DSH，也可以在用户选择的空目录中创建独立的托管环境。托管安装会下载并校验 Node 官方最新 LTS，再安装 DSH；此后只提供 DSH 升级，不提供 Node 升级。外部安装保持只读检测，不会被 Launcher 修改。插件安装、添加、删除和更新仍应通过 DSH 自身的命令和配置完成。
 
-使用前请确保 `dsh` 已安装并可正常运行：
+升级托管 DSH 前会请求确认并停止 Launcher 管理的服务，完成后不会自动重启。若使用外部安装，请先确保 `dsh` 可正常运行：
 
 ```bash
 dsh --version

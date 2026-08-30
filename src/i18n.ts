@@ -26,6 +26,16 @@ const zhDict = {
   customArgsPlaceholder: "例如 --no-open",
   autoStart: "自动启动",
   selectDshDialogTitle: "选择 dsh 可执行文件",
+  selectInstallDirectory: "选择空目录安装 Node 与 DSH",
+  managedRuntimeHint: "使用独立 Node LTS 安装 DSH",
+  oneClickInstall: "一键安装",
+  upgradeDsh: "升级 DSH",
+  preparingInstall: "正在准备安装...",
+  upgradingDsh: "正在停止服务并升级 DSH...",
+  upgradeConfirmTitle: "升级 DSH",
+  upgradeConfirmMessage: "升级将停止当前 DSH 服务，完成后不会自动重启。是否继续？",
+  upgradeConfirmAction: "停止并升级",
+  cancel: "取消",
   // 日志窗口
   serviceLogs: "服务日志",
   logLineCount: "{0} 行",
@@ -53,6 +63,7 @@ const zhDict = {
   restartService: "重启服务",
   openWebGui: "打开 Web GUI",
   viewOnGitHub: "在 GitHub 上查看项目",
+  launcherUpdateAvailable: "发现 Launcher v{0}，点击查看发布说明",
 } as const;
 
 export type Dict = Record<keyof typeof zhDict, string>;
@@ -75,6 +86,16 @@ const enDict: Dict = {
   customArgsPlaceholder: "e.g. --no-open",
   autoStart: "Auto start",
   selectDshDialogTitle: "Select dsh executable",
+  selectInstallDirectory: "Select an empty directory for Node and DSH",
+  managedRuntimeHint: "Install DSH with a dedicated Node LTS runtime",
+  oneClickInstall: "Install",
+  upgradeDsh: "Upgrade DSH",
+  preparingInstall: "Preparing installation...",
+  upgradingDsh: "Stopping the service and upgrading DSH...",
+  upgradeConfirmTitle: "Upgrade DSH",
+  upgradeConfirmMessage: "The current DSH service will stop and will not restart automatically after the upgrade. Continue?",
+  upgradeConfirmAction: "Stop and upgrade",
+  cancel: "Cancel",
   serviceLogs: "Service Logs",
   logLineCount: "{0} lines",
   autoScroll: "Auto-scroll",
@@ -100,6 +121,7 @@ const enDict: Dict = {
   restartService: "Restart",
   openWebGui: "Open Web GUI",
   viewOnGitHub: "View project on GitHub",
+  launcherUpdateAvailable: "Launcher v{0} is available; click to view the release",
 };
 
 export const translations: Record<Lang, Dict> = { zh: zhDict, en: enDict };

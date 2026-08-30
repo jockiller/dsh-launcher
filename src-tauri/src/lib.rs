@@ -1,8 +1,11 @@
 mod config;
+mod managed;
 mod service;
+mod update;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use config::LauncherConfig;
 use serde::Serialize;
@@ -13,6 +16,7 @@ use tauri::{AppHandle, Manager, RunEvent, State};
 
 struct AppState {
     service: Mutex<ServiceManager>,
+    maintenance: AtomicBool,
 }
 
 #[derive(Serialize)]
@@ -71,6 +75,9 @@ fn start_service(
     state: State<'_, AppState>,
     config: LauncherConfig,
 ) -> Result<ServiceStatus, String> {
+    if state.maintenance.load(Ordering::Acquire) {
+        return Err("DSH 正在维护升级，暂时不能启动".into());
+    }
     config.validate()?;
     config.save().map_err(|e| e.to_string())?;
     state
@@ -95,6 +102,9 @@ fn restart_service(
     state: State<'_, AppState>,
     config: LauncherConfig,
 ) -> Result<ServiceStatus, String> {
+    if state.maintenance.load(Ordering::Acquire) {
+        return Err("DSH 正在维护升级，暂时不能重启".into());
+    }
     config.validate()?;
     config.save().map_err(|e| e.to_string())?;
     let mut service = state.service.lock().map_err(|e| e.to_string())?;
@@ -126,6 +136,116 @@ fn open_service_url(app: AppHandle, state: State<'_, AppState>) -> Result<(), St
     service::open_configured(&app, &LauncherConfig::load(), &url)
 }
 
+/// 启动时的 Launcher 更新检测：每次进程生命周期至多发起一次 GitHub 请求（网络请求
+/// 在阻塞线程池执行，不阻塞主线程）。网络失败返回 `None`，由前端静默处理。
+#[tauri::command]
+async fn check_launcher_update() -> Option<update::ReleaseUpdate> {
+    update::release_update().await
+}
+
+/// 打开版本按钮对应的 Release 页面：只放行本项目 GitHub Release 相关 URL，
+/// 其余一律拒绝，避免把任意 URL 交给系统默认浏览器。
+#[tauri::command]
+fn open_release_page(url: String) -> Result<(), String> {
+    if update::validate_release_url(&url) {
+        service::open_default(url.trim())
+    } else {
+        Err("仅允许打开 DSH Launcher 的 GitHub Release 页面".into())
+    }
+}
+
+#[tauri::command]
+async fn install_managed_runtime(
+    app: AppHandle,
+    root: String,
+) -> Result<managed::ManagedStatus, String> {
+    let log_app = app.clone();
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        managed::install_managed(app, PathBuf::from(root))
+    })
+    .await;
+    match task {
+        Ok(result) => {
+            if let Err(error) = &result {
+                service::emit_log(&log_app, "installer", "error", error);
+            }
+            result
+        }
+        Err(error) => {
+            let message = format!("安装任务异常结束：{error}");
+            service::emit_log(&log_app, "installer", "error", &message);
+            Err(message)
+        }
+    }
+}
+
+#[tauri::command]
+async fn upgrade_managed_dsh(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    root: String,
+) -> Result<managed::ManagedStatus, String> {
+    if let Err(error) = managed::managed_status(PathBuf::from(&root).as_path()) {
+        service::emit_log(&app, "installer", "error", &error);
+        return Err(error);
+    }
+    state
+        .maintenance
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| "已有维护升级任务正在进行".to_string())?;
+    service::emit_log(&app, "installer", "info", "Stopping DSH before upgrade");
+    let stop_result = state
+        .service
+        .lock()
+        .map_err(|error| error.to_string())
+        .and_then(|mut service| {
+            if service.status().phase == "external" {
+                return Err("检测到 Launcher 无法停止的外部 DSH 服务，请先手动停止后再升级".into());
+            }
+            service.stop(Some(&app))
+        });
+    if let Err(error) = stop_result {
+        service::emit_log(&app, "installer", "error", &error);
+        state.maintenance.store(false, Ordering::Release);
+        return Err(error);
+    }
+    let log_app = app.clone();
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        managed::upgrade_managed(app, PathBuf::from(root))
+    })
+    .await;
+    state.maintenance.store(false, Ordering::Release);
+    match task {
+        Ok(result) => {
+            if let Err(error) = &result {
+                service::emit_log(&log_app, "installer", "error", error);
+            }
+            result
+        }
+        Err(error) => {
+            let message = format!("升级任务异常结束：{error}");
+            service::emit_log(&log_app, "installer", "error", &message);
+            Err(message)
+        }
+    }
+}
+
+#[tauri::command]
+async fn managed_runtime_status(root: String) -> Result<managed::ManagedStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        managed::managed_status(PathBuf::from(root).as_path())
+    })
+    .await
+    .map_err(|error| format!("检查托管环境异常结束：{error}"))?
+}
+
+#[tauri::command]
+async fn check_latest_dsh() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(managed::check_latest_dsh)
+        .await
+        .map_err(|error| format!("检查 DSH 更新异常结束：{error}"))?
+}
+
 fn shutdown_service(handle: &AppHandle) {
     if let Some(state) = handle.try_state::<AppState>()
         && let Ok(mut service) = state.service.lock()
@@ -139,6 +259,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             service: Mutex::new(ServiceManager::new()),
+            maintenance: AtomicBool::new(false),
         })
         .setup(|app| {
             let config = LauncherConfig::load();
@@ -162,6 +283,12 @@ pub fn run() {
             embedded_webview_open,
             open_project_page,
             open_service_url,
+            check_launcher_update,
+            open_release_page,
+            install_managed_runtime,
+            upgrade_managed_dsh,
+            managed_runtime_status,
+            check_latest_dsh,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build DSH Launcher");

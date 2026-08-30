@@ -4,8 +4,6 @@ on:
   workflow_dispatch:
   pull_request:
   push:
-    branches:
-      - main
     tags:
       - "v*"
 
@@ -166,3 +164,40 @@ jobs:
           name: dsh-launcher-${{ matrix.artifact }}
           path: ${{ matrix.paths }}
           if-no-files-found: error
+
+  verify-windows-shortcut:
+    name: Verify Windows desktop shortcut
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dsh-launcher-windows-x64
+          path: installer
+
+      - name: Install NSIS package silently
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem installer -Filter *.exe | Select-Object -First 1
+          if (-not $installer) { throw "NSIS installer artifact not found" }
+          $process = Start-Process -FilePath $installer.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "NSIS installer exited with $($process.ExitCode)" }
+
+      - name: Assert desktop shortcut target
+        shell: pwsh
+        run: |
+          $desktop = [Environment]::GetFolderPath('Desktop')
+          $candidates = @(
+            (Join-Path $desktop 'DSH Launcher.lnk'),
+            (Join-Path $env:PUBLIC 'Desktop\DSH Launcher.lnk')
+          )
+          $shortcutPath = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $shortcutPath) { throw "Desktop shortcut not found: $($candidates -join ', ')" }
+          $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcutPath)
+          if ([string]::IsNullOrWhiteSpace($shortcut.TargetPath)) {
+            throw "Desktop shortcut target is empty: $shortcutPath"
+          }
+          if (-not (Test-Path -LiteralPath $shortcut.TargetPath)) {
+            throw "Desktop shortcut target does not exist: $($shortcut.TargetPath)"
+          }
+          Write-Host "$shortcutPath -> $($shortcut.TargetPath)"

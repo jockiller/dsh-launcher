@@ -461,7 +461,7 @@ fn set_status(status: &Arc<Mutex<ServiceStatus>>, app: &AppHandle, next: Service
     let _ = app.emit("service-status", next);
 }
 
-fn emit_log(app: &AppHandle, source: &str, level: &str, message: &str) {
+pub(crate) fn emit_log(app: &AppHandle, source: &str, level: &str, message: &str) {
     let _ = app.emit(
         "service-log",
         LogEvent {
@@ -987,8 +987,14 @@ fn is_executable_dsh(path: &Path) -> bool {
 /// 各参数被批处理感知地转义（BatBadBut，Rust ≥ 1.77.2 修复，含 `&`、`"` 等元字符），无法
 /// 安全转义的参数直接报 InvalidInput 而非注入；因此这里保持逐参数传递、不拼接命令行即可
 /// 避免 cmd 注入。CREATE_NO_WINDOW 防止 GUI 宿主下闪现控制台窗口。
+///
+/// 版本探测与正式启动使用同一登录 Shell 环境，避免 nvm/volta 等在 rc 文件中追加的 PATH
+/// 只对启动生效、探测时却找不到 node 的问题。成功时同时从 stdout 与 stderr 提取语义化
+/// 版本；提取不到时给出明确错误（附带输出片段便于排查）。
 pub fn dsh_version(path: &Path) -> Result<String, String> {
     let mut command = Command::new(path);
+    // Windows 下该函数返回空列表，等价于继承当前环境。
+    command.envs(login_shell_environment());
     suppress_console_window(&mut command);
     let mut child = command
         .arg("--version")
@@ -1037,9 +1043,135 @@ pub fn dsh_version(path: &Path) -> Result<String, String> {
         .and_then(|reader| reader.join().ok())
         .unwrap_or_default();
     if !status.success() {
-        return Err(stderr.trim().to_string());
+        let detail = stderr.trim();
+        let detail = if detail.is_empty() {
+            stdout.trim()
+        } else {
+            detail
+        };
+        return Err(if detail.is_empty() {
+            format!("dsh --version 以退出码 {status} 失败")
+        } else {
+            detail.to_string()
+        });
     }
-    Ok(stdout.trim().to_string())
+    parse_dsh_version(&stdout, &stderr).ok_or_else(|| version_parse_error(&stdout, &stderr))
+}
+
+/// 纯逻辑：从 dsh `--version` 的 stdout/stderr 中提取语义化版本，先 stdout 后 stderr。
+fn parse_dsh_version(stdout: &str, stderr: &str) -> Option<String> {
+    extract_semver_token(stdout).or_else(|| extract_semver_token(stderr))
+}
+
+/// 纯逻辑：成功输出中找不到版本时，给出附带输出片段的明确错误。
+fn version_parse_error(stdout: &str, stderr: &str) -> String {
+    let mut seen = stdout.trim().to_string();
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        if seen.is_empty() {
+            return "dsh --version 未返回任何输出，无法识别版本".into();
+        }
+    } else {
+        if !seen.is_empty() {
+            seen.push(' ');
+        }
+        seen.push_str(stderr);
+    }
+    const SNIPPET_LIMIT: usize = 160;
+    let snippet: String = seen.chars().take(SNIPPET_LIMIT).collect();
+    format!("未能从 dsh 输出中识别语义化版本：{snippet}")
+}
+
+/// 纯逻辑：在一段文本中扫描语义化版本号，兼容可省略的 `v`/`V` 前缀以及 prerelease 与
+/// build 元数据。只接受边界完整的 token：起点不能紧贴字母、数字、点、下划线、斜杠或
+/// 减号（避免从长数字、路径或文件名中间截取），终点同理；这样 `127.0.0.1`、
+/// `.nvm/versions/node/v22.19.0/bin` 之类不会被误判为版本。
+fn extract_semver_token(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    for start in 0..bytes.len() {
+        let (token_start, has_prefix) = match bytes[start] {
+            b'v' | b'V' => (start + 1, true),
+            b'0'..=b'9' => (start, false),
+            _ => continue,
+        };
+        // v 前缀只有紧跟数字才是版本 token（v1.2.3），否则可能是普通单词。
+        if has_prefix && !matches!(bytes.get(token_start), Some(byte) if byte.is_ascii_digit()) {
+            continue;
+        }
+        if start > 0 && is_semver_token_edge(bytes[start - 1]) {
+            continue;
+        }
+        // 前缀不进入结果，返回规范化后的版本号。
+        let Some(end) = parse_semver_at(bytes, token_start) else {
+            continue;
+        };
+        if !semver_terminator_ok(bytes, end) {
+            continue;
+        }
+        let token = &text[token_start..end];
+        if semver::Version::parse(token).is_ok() {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
+/// 纯逻辑：版本 token 起点的前一字符若属于这些字符，说明落在更长 token 内部，不能作为版本。
+fn is_semver_token_edge(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/')
+}
+
+/// 纯逻辑：从 `start` 起解析 `主.次.修订[-先行][+构建]`，成功返回结束下标（不含）。
+/// 三段数字必须存在；先行/构建段为点分隔的非空标识（字符集 `[0-9A-Za-z-]`）。
+fn parse_semver_at(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut cursor = start;
+    for component in 0..3 {
+        let digits_start = cursor;
+        while matches!(bytes.get(cursor), Some(byte) if byte.is_ascii_digit()) {
+            cursor += 1;
+        }
+        if cursor == digits_start {
+            return None;
+        }
+        if component < 2 {
+            if bytes.get(cursor) != Some(&b'.') {
+                return None;
+            }
+            cursor += 1;
+        }
+    }
+    for lead_in in *b"-+" {
+        if bytes.get(cursor) != Some(&lead_in) {
+            continue;
+        }
+        cursor += 1;
+        loop {
+            let ident_start = cursor;
+            while matches!(bytes.get(cursor), Some(byte) if byte.is_ascii_alphanumeric() || *byte == b'-')
+            {
+                cursor += 1;
+            }
+            if cursor == ident_start {
+                return None;
+            }
+            if bytes.get(cursor) == Some(&b'.') {
+                cursor += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    Some(cursor)
+}
+
+/// 纯逻辑：检查版本 token 末尾边界是否完整，排除 `1.2.3.4`、`1.2.3beta` 之类的粘连误读；
+/// 句末的 `1.2.3.` 仍被接受（点后不再跟数字即可）。
+fn semver_terminator_ok(bytes: &[u8], end: usize) -> bool {
+    match bytes.get(end) {
+        None => true,
+        Some(b'.') => !matches!(bytes.get(end + 1), Some(next) if next.is_ascii_digit()),
+        Some(byte) => !(byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'-'),
+    }
 }
 
 pub fn discover_profiles() -> Vec<String> {
@@ -1727,5 +1859,85 @@ mod tests {
             vec!["v9.11.2", "v22.19.0", "v20.11.0"]
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---------- dsh --version 输出中的语义化版本提取 ----------
+
+    #[test]
+    fn semver_token_extracts_plain_prefixed_and_prerelease() {
+        assert_eq!(extract_semver_token("1.2.5"), Some("1.2.5".into()));
+        // v/V 前缀不进入结果
+        assert_eq!(extract_semver_token("v1.2.5"), Some("1.2.5".into()));
+        assert_eq!(extract_semver_token("V1.2.5"), Some("1.2.5".into()));
+        // prerelease 与 build 元数据完整保留
+        assert_eq!(
+            extract_semver_token("v1.2.5-beta.2"),
+            Some("1.2.5-beta.2".into())
+        );
+        assert_eq!(
+            extract_semver_token("1.2.5+build.9"),
+            Some("1.2.5+build.9".into())
+        );
+        assert_eq!(
+            extract_semver_token("1.2.5-rc.1+build.9"),
+            Some("1.2.5-rc.1+build.9".into())
+        );
+        // 带说明文字与多 token 时取第一个完整版本
+        assert_eq!(
+            extract_semver_token("dsh 2.10.0 (requires node v18+)"),
+            Some("2.10.0".into())
+        );
+    }
+
+    #[test]
+    fn semver_token_rejects_addresses_paths_and_partial_numbers() {
+        // IP 地址不按 127.0.0 误读
+        assert_eq!(extract_semver_token("http://127.0.0.1:3080"), None);
+        // 路径里的版本目录不作数
+        assert_eq!(
+            extract_semver_token("/root/.nvm/versions/node/v22.19.0/bin"),
+            None
+        );
+        // 粘连 token 不拆：1.2.3.4 与 1.2.3beta
+        assert_eq!(extract_semver_token("1.2.3.4"), None);
+        assert_eq!(extract_semver_token("1.2.3beta"), None);
+        // 句末句点不阻碍识别
+        assert_eq!(
+            extract_semver_token("version is 1.2.3."),
+            Some("1.2.3".into())
+        );
+        // 非法语义化版本（前导零、纯文本、缺失段）
+        assert_eq!(extract_semver_token("v01.2.3"), None);
+        assert_eq!(extract_semver_token("1.2"), None);
+        assert_eq!(extract_semver_token("no version here"), None);
+        assert_eq!(extract_semver_token(""), None);
+    }
+
+    #[test]
+    fn dsh_version_output_prefers_stdout_then_stderr() {
+        assert_eq!(
+            parse_dsh_version("1.4.2\n", "warning: legacy mode\n"),
+            Some("1.4.2".into())
+        );
+        // stdout 无版本时回退 stderr（部分 CLI 把版本写到 stderr）
+        assert_eq!(
+            parse_dsh_version("", "v0.2.0-rc.1\n"),
+            Some("0.2.0-rc.1".into())
+        );
+        assert_eq!(parse_dsh_version("   ", "\n"), None);
+    }
+
+    #[test]
+    fn version_parse_error_is_explicit_about_missing_version() {
+        // 全空输出：明确提示未返回输出
+        let error = version_parse_error("  ", "\n");
+        assert!(error.contains("未返回任何输出"), "实际：{error}");
+        // 有输出但无版本：附上原始片段
+        let error = version_parse_error("hello\n", "world\n");
+        assert!(error.contains("语义化版本"), "实际：{error}");
+        assert!(error.contains("hello"), "实际：{error}");
+        // 片段超长时截断
+        let error = version_parse_error(&"x".repeat(400), "");
+        assert!(error.chars().count() < 400, "实际：{error}");
     }
 }

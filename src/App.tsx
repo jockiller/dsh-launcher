@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { confirm as confirmDialog, open } from "@tauri-apps/plugin-dialog";
 import {
+  Download,
   ExternalLink,
   FileSearch,
   FolderOpen,
   Moon,
+  PackageCheck,
   Power,
   RotateCw,
   Sun,
@@ -19,6 +21,7 @@ import {
   translations,
   type Lang,
 } from "./i18n";
+import { mergeLogs, type LogLine } from "./logMerge";
 
 type Phase = "stopped" | "starting" | "running" | "stopping" | "failed" | "external";
 type LaunchAction = "none" | "default_browser" | "embedded_webview";
@@ -33,19 +36,13 @@ interface Config {
   customArgs: string;
   autoStart: boolean;
   autoScrollLogs: boolean;
+  managedRuntimeDir: string;
 }
 
 interface ServiceStatus {
   phase: Phase;
   pid: number | null;
   url: string | null;
-  message: string;
-}
-
-interface LogLine {
-  timestamp: string;
-  source: string;
-  level: string;
   message: string;
 }
 
@@ -56,6 +53,25 @@ interface Bootstrap {
   dshVersion: string | null;
   profiles: string[];
   status: ServiceStatus;
+}
+
+interface ReleaseUpdate {
+  latestVersion: string | null;
+  releaseUrl: string | null;
+  updateAvailable: boolean;
+}
+
+interface ManagedStatus {
+  managedRoot: string;
+  dshPath: string;
+  nodeVersion: string;
+  dshVersion: string;
+}
+
+interface ManagedProgress {
+  phase: string;
+  message: string;
+  percent: number | null;
 }
 
 // 与后端 ServiceStatus 默认值一致；展示时经 translateBackendMessage 按当前语言渲染
@@ -78,11 +94,16 @@ export default function App() {
   const theme = themeOverride ?? systemTheme;
   const [config, setConfig] = useState<Config | null>(null);
   const [appVersion, setAppVersion] = useState("");
+  const [releaseUpdate, setReleaseUpdate] = useState<ReleaseUpdate | null>(null);
   const [profiles, setProfiles] = useState<string[]>(["web"]);
   const [version, setVersion] = useState<string | null>(null);
   const [status, setStatus] = useState<ServiceStatus>(emptyStatus);
   const [embeddedWebviewOpen, setEmbeddedWebviewOpen] = useState(false);
   const [logs, setLogs] = useState<LogLine[]>([]);
+  const [managed, setManaged] = useState<ManagedStatus | null>(null);
+  const [latestDsh, setLatestDsh] = useState<string | null>(null);
+  const [managedProgress, setManagedProgress] = useState<ManagedProgress | null>(null);
+  const [managedBusy, setManagedBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const logEnd = useRef<HTMLDivElement>(null);
@@ -104,12 +125,24 @@ export default function App() {
         setVersion(data.dshVersion);
         setProfiles(data.profiles);
         setStatus(data.status);
+        if (data.config.managedRuntimeDir) {
+          void invoke<ManagedStatus>("managed_runtime_status", { root: data.config.managedRuntimeDir })
+            .then(setManaged)
+            .catch(() => undefined);
+          void invoke<string>("check_latest_dsh").then(setLatestDsh).catch(() => undefined);
+        }
       })
       .catch((reason) => setError(errorMessage(reason)));
+    void invoke<ReleaseUpdate | null>("check_launcher_update")
+      .then((update) => setReleaseUpdate(update?.updateAvailable ? update : null))
+      .catch(() => undefined);
 
     const statusListener = listen<ServiceStatus>("service-status", ({ payload }) => setStatus(payload));
     const logListener = listen<LogLine>("service-log", ({ payload }) => {
       setLogs((current) => [...current.slice(-9998), payload]);
+    });
+    const managedListener = listen<ManagedProgress>("managed-progress", ({ payload }) => {
+      setManagedProgress(payload);
     });
     const syncRuntimeState = () => {
       void invoke<ServiceStatus>("service_status").then(setStatus).catch(() => undefined);
@@ -122,6 +155,7 @@ export default function App() {
       clearInterval(timer);
       void statusListener.then((unlisten) => unlisten());
       void logListener.then((unlisten) => unlisten());
+      void managedListener.then((unlisten) => unlisten());
     };
   }, []);
 
@@ -166,6 +200,8 @@ export default function App() {
     () => status.url || (config ? `http://${config.host}:${config.port}` : ""),
     [config, status.url],
   );
+  // 合并展示是派生视图：仅在日志列表变化时重算，logs 原始 state 不变
+  const mergedLogs = useMemo(() => mergeLogs(logs), [logs]);
 
   function patch<K extends keyof Config>(key: K, value: Config[K]) {
     setConfig((current) => (current ? { ...current, [key]: value } : current));
@@ -199,10 +235,61 @@ export default function App() {
     }
   }
 
-  async function openProjectPage(button: HTMLButtonElement) {
+  async function installManaged() {
+    const selected = await open({ multiple: false, directory: true, title: t.selectInstallDirectory });
+    if (!selected || Array.isArray(selected)) return;
+    setManagedBusy(true);
+    setManagedProgress({ phase: "starting", message: t.preparingInstall, percent: 0 });
+    setError(null);
+    try {
+      const result = await invoke<ManagedStatus>("install_managed_runtime", { root: selected });
+      setManaged(result);
+      setVersion(result.dshVersion);
+      setConfig((current) => current ? {
+        ...current,
+        managedRuntimeDir: result.managedRoot,
+        dshPath: result.dshPath,
+      } : current);
+      void invoke<string>("check_latest_dsh").then(setLatestDsh).catch(() => undefined);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setManagedBusy(false);
+    }
+  }
+
+  async function upgradeManagedDsh() {
+    if (!managed) return;
+    const confirmed = await confirmDialog(t.upgradeConfirmMessage, {
+      title: t.upgradeConfirmTitle,
+      kind: "warning",
+      okLabel: t.upgradeConfirmAction,
+      cancelLabel: t.cancel,
+    });
+    if (!confirmed) return;
+    setManagedBusy(true);
+    setManagedProgress({ phase: "upgrade", message: t.upgradingDsh, percent: 0 });
+    setError(null);
+    try {
+      const result = await invoke<ManagedStatus>("upgrade_managed_dsh", { root: managed.managedRoot });
+      setManaged(result);
+      setVersion(result.dshVersion);
+      setLatestDsh(result.dshVersion);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setManagedBusy(false);
+    }
+  }
+
+  async function openVersionPage(button: HTMLButtonElement) {
     button.blur();
     try {
-      await invoke("open_project_page");
+      if (releaseUpdate?.releaseUrl) {
+        await invoke("open_release_page", { url: releaseUpdate.releaseUrl });
+      } else {
+        await invoke("open_project_page");
+      }
     } catch (reason) {
       setError(errorMessage(reason));
     }
@@ -250,6 +337,20 @@ export default function App() {
                 <button disabled={locked} onClick={() => void detectDsh()} title={t.autoDetect}><FileSearch size={14} /></button>
                 <button disabled={locked} onClick={() => void chooseDsh()} title={t.chooseFile}><FolderOpen size={14} /></button>
               </div>
+              <div className="runtime-tools">
+                {managed ? (
+                  <>
+                    <span><PackageCheck size={12} />Node {managed.nodeVersion} · DSH {managed.dshVersion}{latestDsh && latestDsh !== managed.dshVersion ? ` → ${latestDsh}` : ""}</span>
+                    <button disabled={managedBusy} onClick={() => void upgradeManagedDsh()}><Download size={12} />{t.upgradeDsh}</button>
+                  </>
+                ) : (
+                  <>
+                    <span>{t.managedRuntimeHint}</span>
+                    <button disabled={managedBusy || locked} onClick={() => void installManaged()}><Download size={12} />{t.oneClickInstall}</button>
+                  </>
+                )}
+              </div>
+              {managedProgress && <div className="managed-progress"><span style={{ width: `${managedProgress.percent ?? 0}%` }} /><small>{managedProgress.message}</small></div>}
             </div>
 
             <div className="connection-row">
@@ -271,12 +372,15 @@ export default function App() {
 
         <section className="log-window">
           <header>
-            <div><strong>{t.serviceLogs}</strong><span>{t.logLineCount.replace("{0}", String(logs.length))}</span></div>
-            <div className="log-tools"><label><input type="checkbox" checked={config.autoScrollLogs} onChange={(event) => patch("autoScrollLogs", event.target.checked)} />{t.autoScroll}</label><button onClick={() => setLogs([])} title={t.clearLogs}><Trash2 size={13} /></button></div>
+            <div><strong>{t.serviceLogs}</strong><span>{t.logLineCount.replace("{0}", String(mergedLogs.length))}</span></div>
+            <div className="log-tools">
+              <label><input type="checkbox" checked={config.autoScrollLogs} onChange={(event) => patch("autoScrollLogs", event.target.checked)} />{t.autoScroll}</label>
+              <button onClick={() => setLogs([])} title={t.clearLogs}><Trash2 size={13} /></button>
+            </div>
           </header>
           <div className="mini-console">
-            {logs.length === 0 ? <div className="console-empty">{t.logEmpty}</div> : logs.map((line, index) => (
-              <div className={`log-line ${line.level}`} key={`${line.timestamp}-${index}`}><time>{line.timestamp}</time><span className="source">{line.source}</span><span>{line.message}</span></div>
+            {logs.length === 0 ? <div className="console-empty">{t.logEmpty}</div> : mergedLogs.map((line) => (
+              <div className={`log-line merged ${line.level}`} key={line.firstIndex}><time>{line.timestamp}</time><span className="source">{line.sources.join("+")}</span><span>{line.message}{line.count > 1 && <em className="log-count">×{line.count}</em>}</span></div>
             ))}
             <div ref={logEnd} />
           </div>
@@ -316,8 +420,13 @@ export default function App() {
           </div>
 
           {appVersion && (
-            <button className="app-version" title={t.viewOnGitHub} onClick={(event) => void openProjectPage(event.currentTarget)}>
+            <button
+              className={`app-version${releaseUpdate ? " has-update" : ""}`}
+              title={releaseUpdate?.latestVersion ? t.launcherUpdateAvailable.replace("{0}", releaseUpdate.latestVersion) : t.viewOnGitHub}
+              onClick={(event) => void openVersionPage(event.currentTarget)}
+            >
               v{appVersion}
+              {releaseUpdate && <span className="update-dot" aria-hidden="true" />}
             </button>
           )}
         </section>
