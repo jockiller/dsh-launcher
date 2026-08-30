@@ -66,10 +66,11 @@ for (const path of collectFiles(dir).sort()) {
     console.error(`平台 ${platform} 出现重复签名文件：${name}`);
     process.exit(1);
   }
-  const bundle = name.replace(/\.sig$/, "");
-  // 构建产物在本目录中；Release URL 需与上传后的文件名完全一致（对空格做百分比编码）。
-  const assetName = basenameWithoutSig(name);
-  const url = `https://github.com/${repo}/releases/download/${rawTag}/${encodeURIComponent(assetName)}`;
+  // GitHub 上传 Release 资产时会把文件名中的空格替换为点号（DSH Launcher_x.exe →
+  // DSH.Launcher_x...），latest.json 的 URL 必须与上传后的资产名一致，否则 404。
+  // 构建侧已负责把产物改名（空格→下划线/点），这里对剩余空格做同样归一化兜底。
+  const assetName = basenameWithoutSig(name).replaceAll(" ", ".");
+  const url = `https://github.com/${repo}/releases/download/${rawTag}/${assetName}`;
   const signature = readFileSync(path, "utf8").trim();
   if (!signature) {
     console.error(`签名文件为空：${path}`);

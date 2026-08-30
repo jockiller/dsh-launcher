@@ -186,6 +186,18 @@ jobs:
           hdiutil create -quiet -volname "DSH Launcher" -srcfolder "$stage" -ov -format UDZO "$dmg"
           rm -rf "$stage"
 
+      - name: Rename Windows assets for updater URLs
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # GitHub 上传 Release 资产时会把文件名中的空格替换为点号；latest.json 的 URL
+          # 使用改后的名字，因此先把 NSIS 产物改名成与最终资产名一致，避免热更 URL 404。
+          cd "src-tauri/target/${{ matrix.rust-target }}/release/bundle/nsis"
+          for f in *" "*; do
+            [[ -e "$f" ]] || continue
+            mv -f "$f" "${f// /.}"
+          done
+
       - name: Archive AppImage with executable permissions
         if: runner.os == 'Linux'
         shell: bash
