@@ -158,10 +158,11 @@ fn open_release_page(url: String) -> Result<(), String> {
 async fn install_managed_runtime(
     app: AppHandle,
     root: String,
+    use_mirror: bool,
 ) -> Result<managed::ManagedStatus, String> {
     let log_app = app.clone();
     let task = tauri::async_runtime::spawn_blocking(move || {
-        managed::install_managed(app, PathBuf::from(root))
+        managed::install_managed(app, PathBuf::from(root), use_mirror)
     })
     .await;
     match task {

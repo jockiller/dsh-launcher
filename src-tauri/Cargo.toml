@@ -1,6 +1,6 @@
 [package]
 name = "dsh-launcher"
-version = "0.7.9"
+version = "0.8.0"
 description = "A lightweight launcher for DSH Web"
 license = "MIT"
 authors = ["DSH Launcher"]

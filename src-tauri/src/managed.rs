@@ -14,11 +14,18 @@ use tauri::{AppHandle, Emitter};
 
 const MARKER_NAME: &str = ".dsh-launcher-managed.json";
 const NODE_INDEX_URL: &str = "https://nodejs.org/dist/index.json";
+const NODE_MIRROR_INDEX_URL: &str = "https://npmmirror.com/mirrors/node/index.json";
 const NPM_LATEST_URL: &str = "https://registry.npmjs.org/@deepseek-ai%2Fdsh/latest";
+const NPM_MIRROR_LATEST_URL: &str = "https://registry.npmmirror.com/@deepseek-ai%2Fdsh/latest";
 const MANAGED_SCHEMA: u8 = 1;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const NPM_INSTALL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const NPM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const NPM_OFFICIAL_REGISTRY: &str = "https://registry.npmjs.org";
+const NPM_MIRROR_REGISTRY: &str = "https://registry.npmmirror.com";
+const NODE_OFFICIAL_DIST: &str = "https://nodejs.org/dist";
+const NODE_MIRROR_DIST: &str = "https://npmmirror.com/mirrors/node";
 static OPERATION_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,6 +51,8 @@ struct Marker {
     schema: u8,
     node_version: String,
     dsh_version: String,
+    #[serde(default)]
+    use_mirror: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,20 +84,40 @@ impl Drop for OperationGuard {
     }
 }
 
-pub fn install_managed(app: AppHandle, root: PathBuf) -> Result<ManagedStatus, String> {
+pub fn install_managed(
+    app: AppHandle,
+    root: PathBuf,
+    use_mirror: bool,
+) -> Result<ManagedStatus, String> {
     let _guard = OperationGuard::acquire()?;
     validate_install_root(&root)?;
     emit_progress(&app, "metadata", "正在获取最新 Node LTS...", Some(5));
-    let release = fetch_node_release()?;
+    let release = fetch_node_release(use_mirror)?;
     let archive_name = node_archive_name(&release.version);
-    let base_url = format!("https://nodejs.org/dist/{}/", release.version);
+    let download_dist = if use_mirror {
+        NODE_MIRROR_DIST
+    } else {
+        NODE_OFFICIAL_DIST
+    };
+    let base_url = format!("{download_dist}/{}/", release.version);
+    let checksum_base_url = format!("{NODE_OFFICIAL_DIST}/{}/", release.version);
     let staging = root.join(".dsh-launcher-staging");
     let archive = staging.join(&archive_name);
     let result = (|| {
         fs::create_dir_all(&staging).map_err(|e| format!("创建安装临时目录失败：{e}"))?;
         emit_progress(&app, "download", "正在下载 Node LTS...", Some(15));
-        download_to(&(base_url.clone() + &archive_name), &archive)?;
-        let checksums = fetch_text(&(base_url + "SHASUMS256.txt"))?;
+        crate::service::emit_log(
+            &app,
+            "installer",
+            "info",
+            if use_mirror {
+                "Node 使用国内镜像下载，SHA-256 校验清单仍来自 Node 官方"
+            } else {
+                "Node 使用官方源下载"
+            },
+        );
+        download_to(&app, &(base_url + &archive_name), &archive)?;
+        let checksums = fetch_text(&(checksum_base_url + "SHASUMS256.txt"))?;
         emit_progress(&app, "verify", "正在校验 Node 下载文件...", Some(45));
         verify_sha256(&archive, expected_checksum(&checksums, &archive_name)?)?;
         emit_progress(&app, "extract", "正在解压 Node...", Some(55));
@@ -101,7 +130,14 @@ pub fn install_managed(app: AppHandle, root: PathBuf) -> Result<ManagedStatus, S
         }
         let staged_dsh = staging.join("dsh");
         emit_progress(&app, "install", "正在安装 DSH...", Some(70));
-        npm_install(&app, &extracted_node, &staged_dsh)?;
+        let expected_dsh_version = fetch_latest_dsh(use_mirror)?;
+        npm_install(
+            &app,
+            &extracted_node,
+            &staged_dsh,
+            use_mirror,
+            &expected_dsh_version,
+        )?;
         let final_node = root.join("node");
         let final_dsh = root.join("dsh");
         fs::rename(&extracted_node, &final_node).map_err(|e| format!("启用 Node 失败：{e}"))?;
@@ -111,10 +147,16 @@ pub fn install_managed(app: AppHandle, root: PathBuf) -> Result<ManagedStatus, S
         }
         let wrapper = create_wrapper(&root)?;
         let dsh_version = crate::service::dsh_version(&wrapper)?;
+        if dsh_version != expected_dsh_version {
+            return Err(format!(
+                "DSH 版本校验失败：期望 {expected_dsh_version}，实际 {dsh_version}"
+            ));
+        }
         let marker = Marker {
             schema: MANAGED_SCHEMA,
             node_version: release.version.trim_start_matches('v').to_string(),
             dsh_version: dsh_version.clone(),
+            use_mirror,
         };
         write_marker(&root, &marker)?;
         emit_progress(&app, "complete", "Node 与 DSH 安装完成", Some(100));
@@ -134,6 +176,7 @@ pub fn upgrade_managed(app: AppHandle, root: PathBuf) -> Result<ManagedStatus, S
     let mut marker = read_marker(&root)?;
     let staging = root.join(".dsh-upgrade-staging");
     let backup = root.join(".dsh-upgrade-backup");
+    let failed = root.join(".dsh-upgrade-failed");
     let temporary_wrapper = root.join(if cfg!(windows) {
         ".dsh-upgrade-check.cmd"
     } else {
@@ -141,11 +184,24 @@ pub fn upgrade_managed(app: AppHandle, root: PathBuf) -> Result<ManagedStatus, S
     });
     let _ = fs::remove_dir_all(&staging);
     let _ = fs::remove_dir_all(&backup);
+    let _ = fs::remove_dir_all(&failed);
     emit_progress(&app, "upgrade", "服务已停止，正在升级 DSH...", Some(20));
     let result = (|| {
-        npm_install(&app, &root.join("node"), &staging)?;
+        let expected_dsh_version = fetch_latest_dsh(marker.use_mirror)?;
+        npm_install(
+            &app,
+            &root.join("node"),
+            &staging,
+            marker.use_mirror,
+            &expected_dsh_version,
+        )?;
         create_wrapper_for(&root, &staging, &temporary_wrapper)?;
         let next_version = crate::service::dsh_version(&temporary_wrapper)?;
+        if next_version != expected_dsh_version {
+            return Err(format!(
+                "DSH 版本校验失败：期望 {expected_dsh_version}，实际 {next_version}"
+            ));
+        }
         let current = root.join("dsh");
         fs::rename(&current, &backup).map_err(|error| {
             format!("切换 DSH 版本失败：{error}。如遇文件占用，请停止服务后重试")
@@ -156,8 +212,20 @@ pub fn upgrade_managed(app: AppHandle, root: PathBuf) -> Result<ManagedStatus, S
         }
         marker.dsh_version = next_version;
         if let Err(error) = write_marker(&root, &marker) {
-            let _ = fs::remove_dir_all(&current);
-            let _ = fs::rename(&backup, &current);
+            fs::rename(&current, &failed).map_err(|move_error| {
+                format!(
+                    "{error}；回滚准备失败：{move_error}。旧版仍保留在 {}",
+                    backup.display()
+                )
+            })?;
+            if let Err(restore_error) = fs::rename(&backup, &current) {
+                let _ = fs::rename(&failed, &current);
+                return Err(format!(
+                    "{error}；恢复旧版失败：{restore_error}。旧版仍保留在 {}",
+                    backup.display()
+                ));
+            }
+            let _ = fs::remove_dir_all(&failed);
             return Err(error);
         }
         let _ = fs::remove_dir_all(&backup);
@@ -184,7 +252,16 @@ pub fn managed_status(root: &Path) -> Result<ManagedStatus, String> {
 }
 
 pub fn check_latest_dsh() -> Result<String, String> {
-    let payload = fetch_text(NPM_LATEST_URL)?;
+    fetch_latest_dsh(false)
+}
+
+fn fetch_latest_dsh(use_mirror: bool) -> Result<String, String> {
+    let url = if use_mirror {
+        NPM_MIRROR_LATEST_URL
+    } else {
+        NPM_LATEST_URL
+    };
+    let payload = fetch_text(url)?;
     let latest: NpmLatest =
         serde_json::from_str(&payload).map_err(|e| format!("解析 DSH 最新版本失败：{e}"))?;
     semver::Version::parse(latest.version.trim())
@@ -192,8 +269,13 @@ pub fn check_latest_dsh() -> Result<String, String> {
     Ok(latest.version)
 }
 
-fn fetch_node_release() -> Result<NodeRelease, String> {
-    let payload = fetch_text(NODE_INDEX_URL)?;
+fn fetch_node_release(use_mirror: bool) -> Result<NodeRelease, String> {
+    let url = if use_mirror {
+        NODE_MIRROR_INDEX_URL
+    } else {
+        NODE_INDEX_URL
+    };
+    let payload = fetch_text(url)?;
     let releases: Vec<NodeRelease> =
         serde_json::from_str(&payload).map_err(|e| format!("解析 Node 版本列表失败：{e}"))?;
     let file_key = node_file_key();
@@ -218,17 +300,41 @@ fn fetch_text(url: &str) -> Result<String, String> {
         .map_err(|e| format!("读取网络响应失败：{e}"))
 }
 
-fn download_to(url: &str, path: &Path) -> Result<(), String> {
+fn download_to(app: &AppHandle, url: &str, path: &Path) -> Result<(), String> {
     let response = ureq::AgentBuilder::new()
-        .timeout(HTTP_TIMEOUT)
+        .timeout(DOWNLOAD_TIMEOUT)
         .build()
         .get(url)
         .set("User-Agent", "dsh-launcher")
         .call()
         .map_err(|e| format!("下载 Node 失败：{e}"))?;
+    let total = response
+        .header("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok());
     let mut reader = response.into_reader();
     let mut file = File::create(path).map_err(|e| format!("创建下载文件失败：{e}"))?;
-    io::copy(&mut reader, &mut file).map_err(|e| format!("保存 Node 下载文件失败：{e}"))?;
+    let mut downloaded = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut last_update = Instant::now();
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|e| format!("读取 Node 下载内容失败：{e}"))?;
+        if count == 0 {
+            break;
+        }
+        io::Write::write_all(&mut file, &buffer[..count])
+            .map_err(|e| format!("保存 Node 下载文件失败：{e}"))?;
+        downloaded += count as u64;
+        if last_update.elapsed() >= Duration::from_secs(1) {
+            let percent = total.map(|size| {
+                let download_percent = downloaded.saturating_mul(27) / size.max(1);
+                (15 + download_percent.min(27)) as u8
+            });
+            emit_progress(app, "download", "正在下载 Node LTS...", percent);
+            last_update = Instant::now();
+        }
+    }
     Ok(())
 }
 
@@ -320,23 +426,53 @@ fn validate_relative_path(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn npm_install(app: &AppHandle, node_root: &Path, prefix: &Path) -> Result<(), String> {
+fn npm_install(
+    app: &AppHandle,
+    node_root: &Path,
+    prefix: &Path,
+    use_mirror: bool,
+    dsh_version: &str,
+) -> Result<(), String> {
     fs::create_dir_all(prefix).map_err(|e| format!("创建 DSH 安装目录失败：{e}"))?;
+    #[cfg(not(windows))]
+    fs::create_dir_all(prefix.join("lib"))
+        .map_err(|e| format!("创建 DSH 全局安装目录失败：{e}"))?;
+    let cache = prefix.join(".npm-cache");
+    let registry = if use_mirror {
+        NPM_MIRROR_REGISTRY
+    } else {
+        NPM_OFFICIAL_REGISTRY
+    };
+    crate::service::emit_log(
+        app,
+        "installer",
+        "info",
+        &format!("正在使用 npm 源安装 DSH：{registry}"),
+    );
     let mut command = Command::new(node_executable(node_root));
     command
         .arg(npm_cli(node_root))
         .args([
             "install",
+            "--global",
             "--no-audit",
             "--no-fund",
             "--no-progress",
             "--foreground-scripts",
+            "--package-lock=false",
+            "--strict-ssl",
             "--fetch-timeout=60000",
             "--fetch-retries=2",
-            "--prefix",
+            "--registry",
         ])
+        .arg(registry)
+        .arg("--cache")
+        .arg(&cache)
+        .arg("--prefix")
         .arg(prefix)
-        .arg("@deepseek-ai/dsh@latest")
+        .arg(format!("@deepseek-ai/dsh@{dsh_version}"))
+        .current_dir(prefix)
+        .env_remove("NODE_OPTIONS")
         .env("CI", "true")
         .env("npm_config_yes", "true")
         .stdin(Stdio::null())
@@ -365,9 +501,7 @@ fn npm_install(app: &AppHandle, node_root: &Path, prefix: &Path) -> Result<(), S
         if started.elapsed() >= NPM_INSTALL_TIMEOUT {
             terminate_managed_child(child.id());
             let _ = child.wait();
-            return Err(
-                "npm 安装 DSH 超过 20 分钟，已终止。请检查 npm 网络或代理设置后重试".into(),
-            );
+            return Err("npm 安装 DSH 超过 20 分钟，已终止".into());
         }
         if last_heartbeat.elapsed() >= NPM_HEARTBEAT_INTERVAL {
             crate::service::emit_log(app, "installer", "info", "npm 仍在下载并安装 DSH...");
@@ -375,13 +509,31 @@ fn npm_install(app: &AppHandle, node_root: &Path, prefix: &Path) -> Result<(), S
         }
         thread::sleep(Duration::from_millis(250));
     };
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "npm 安装 DSH 失败，退出状态：{status}；详细信息见日志区"
-        ))
+    if !status.success() {
+        return Err(format!("npm 退出状态：{status}；详细信息见日志区"));
     }
+    normalize_global_install(prefix)?;
+    let _ = fs::remove_dir_all(&cache);
+    dsh_entry(prefix)
+        .is_file()
+        .then_some(())
+        .ok_or_else(|| "安装结束但 DSH 入口文件缺失".into())
+}
+
+#[cfg(not(windows))]
+fn normalize_global_install(prefix: &Path) -> Result<(), String> {
+    let global_modules = prefix.join("lib/node_modules");
+    let managed_modules = prefix.join("node_modules");
+    fs::rename(&global_modules, &managed_modules)
+        .map_err(|e| format!("整理 DSH 安装目录失败：{e}"))?;
+    let _ = fs::remove_dir_all(prefix.join("lib"));
+    let _ = fs::remove_dir_all(prefix.join("bin"));
+    Ok(())
+}
+
+#[cfg(windows)]
+fn normalize_global_install(_prefix: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 fn pipe_managed_logs<R>(app: AppHandle, source: &'static str, level: &'static str, reader: R)
@@ -636,11 +788,20 @@ mod tests {
     }
 
     #[test]
+    fn old_marker_defaults_to_official_source() {
+        let marker: Marker =
+            serde_json::from_str(r#"{"schema":1,"nodeVersion":"22.0.0","dshVersion":"0.1.0"}"#)
+                .unwrap();
+        assert!(!marker.use_mirror);
+    }
+
+    #[test]
     fn marker_rejects_other_schema() {
         let marker = Marker {
             schema: 2,
             node_version: "22.0.0".into(),
             dsh_version: "0.1.0".into(),
+            use_mirror: false,
         };
         assert_ne!(marker.schema, MANAGED_SCHEMA);
     }

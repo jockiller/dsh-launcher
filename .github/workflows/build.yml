@@ -7,6 +7,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build ${{ matrix.name }}
@@ -192,3 +195,24 @@ jobs:
             throw "Desktop shortcut target does not exist: $($shortcut.TargetPath)"
           }
           Write-Host "$shortcutPath -> $($shortcut.TargetPath)"
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build
+      - verify-windows-shortcut
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dsh-launcher-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" release-assets/* --verify-tag --generate-notes --title "DSH Launcher $GITHUB_REF_NAME"

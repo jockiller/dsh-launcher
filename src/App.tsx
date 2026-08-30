@@ -81,6 +81,11 @@ function errorMessage(error: unknown) {
   return typeof error === "string" ? error : error instanceof Error ? error.message : String(error);
 }
 
+function systemLanguageIsChinese(): boolean {
+  return (navigator.languages.length ? navigator.languages : [navigator.language])
+    .some((language) => language.toLowerCase().startsWith("zh"));
+}
+
 export default function App() {
   const [lang, setLang] = useState<Lang>(detectLanguage);
   const t = translations[lang];
@@ -104,6 +109,10 @@ export default function App() {
   const [latestDsh, setLatestDsh] = useState<string | null>(null);
   const [managedProgress, setManagedProgress] = useState<ManagedProgress | null>(null);
   const [managedBusy, setManagedBusy] = useState(false);
+  const [installDialogOpen, setInstallDialogOpen] = useState(false);
+  const [installDirectory, setInstallDirectory] = useState("");
+  const [installDialogError, setInstallDialogError] = useState<string | null>(null);
+  const [useMirror, setUseMirror] = useState(systemLanguageIsChinese);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const logEnd = useRef<HTMLDivElement>(null);
@@ -235,14 +244,30 @@ export default function App() {
     }
   }
 
+  async function chooseInstallDirectory() {
+    try {
+      const selected = await open({ multiple: false, directory: true, title: t.selectInstallDirectory });
+      if (selected && !Array.isArray(selected)) {
+        setInstallDirectory(selected);
+        setInstallDialogError(null);
+      }
+    } catch (reason) {
+      setInstallDialogError(errorMessage(reason));
+    }
+  }
+
   async function installManaged() {
-    const selected = await open({ multiple: false, directory: true, title: t.selectInstallDirectory });
-    if (!selected || Array.isArray(selected)) return;
+    if (!installDirectory) return;
+    setInstallDialogError(null);
+    setInstallDialogOpen(false);
     setManagedBusy(true);
     setManagedProgress({ phase: "starting", message: t.preparingInstall, percent: 0 });
     setError(null);
     try {
-      const result = await invoke<ManagedStatus>("install_managed_runtime", { root: selected });
+      const result = await invoke<ManagedStatus>("install_managed_runtime", {
+        root: installDirectory,
+        useMirror,
+      });
       setManaged(result);
       setVersion(result.dshVersion);
       setConfig((current) => current ? {
@@ -252,8 +277,11 @@ export default function App() {
       } : current);
       void invoke<string>("check_latest_dsh").then(setLatestDsh).catch(() => undefined);
     } catch (reason) {
+      const message = errorMessage(reason);
       setManagedProgress(null);
-      setError(errorMessage(reason));
+      setError(message);
+      setInstallDialogError(message);
+      setInstallDialogOpen(true);
     } finally {
       setManagedBusy(false);
     }
@@ -348,7 +376,7 @@ export default function App() {
                 ) : (
                   <>
                     <span>{t.managedRuntimeHint}</span>
-                    <button disabled={managedBusy || locked} onClick={() => void installManaged()}><Download size={12} />{t.oneClickInstall}</button>
+                    <button disabled={managedBusy || locked} onClick={() => setInstallDialogOpen(true)}><Download size={12} />{t.oneClickInstall}</button>
                   </>
                 )}
               </div>
@@ -434,6 +462,29 @@ export default function App() {
         </section>
         </div>
       </div>
+      {installDialogOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setInstallDialogOpen(false)}>
+          <section className="install-dialog" role="dialog" aria-modal="true" aria-labelledby="install-dialog-title" onMouseDown={(event) => event.stopPropagation()} onKeyDown={(event) => { if (event.key === "Escape") setInstallDialogOpen(false); }}>
+            <header><h2 id="install-dialog-title">{t.installDialogTitle}</h2></header>
+            <div className="install-dialog-body">
+              <label htmlFor="install-directory">{t.installDirectory}</label>
+              <div className="command-input">
+                <input id="install-directory" value={installDirectory} readOnly placeholder={t.installDirectoryPlaceholder} />
+                <button type="button" autoFocus onClick={() => void chooseInstallDirectory()} title={t.chooseDirectory}><FolderOpen size={14} /></button>
+              </div>
+              {installDialogError && <p className="install-dialog-error" role="alert">{translateBackendMessage(installDialogError, lang)}</p>}
+              <label className="mirror-option">
+                <input type="checkbox" checked={useMirror} onChange={(event) => setUseMirror(event.target.checked)} />
+                <span><strong>{t.useMirror}</strong><small>{t.useMirrorDescription}</small></span>
+              </label>
+            </div>
+            <footer>
+              <button type="button" onClick={() => setInstallDialogOpen(false)}>{t.cancel}</button>
+              <button type="button" className="primary" disabled={!installDirectory} onClick={() => void installManaged()}><Download size={13} />{t.installNow}</button>
+            </footer>
+          </section>
+        </div>
+      )}
     </main>
   );
 }
