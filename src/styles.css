@@ -115,6 +115,8 @@ input:disabled, select:disabled { background: #f3f3f4; color: #85878d; }
 .install-dialog .command-input input { height: 32px; }
 .install-dialog .command-input button { width: 34px; height: 32px; }
 .install-dialog-error { margin: 0; color: #b13e47; font-size: 9px; line-height: 1.45; }
+.app-update-notes { max-height: 220px; overflow: auto; border: 1px solid #e4e4e7; border-radius: 6px; padding: 10px 12px; background: #f7f7f8; color: #494b51; font-size: 10px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+.app-update-success { margin: 0; color: #3d7a4f; font-size: 10px; font-weight: 600; }
 .mirror-option { display: flex; align-items: flex-start; gap: 9px; padding-top: 8px; color: #494b51; }
 .mirror-option input { width: 13px; height: 13px; margin: 2px 0 0; accent-color: #6d66ad; }
 .mirror-option span { display: grid; gap: 3px; }
@@ -162,6 +164,8 @@ input:disabled, select:disabled { background: #f3f3f4; color: #85878d; }
 [data-theme="dark"] .install-dialog footer { background: #1d1e22; }
 [data-theme="dark"] .install-dialog footer button { border-color: #44464c; background: #2b2c31; color: #d1d2d6; }
 [data-theme="dark"] .install-dialog footer button.primary { border-color: #7770bb; background: #6d66ad; color: #fff; }
+[data-theme="dark"] .app-update-notes { border-color: #3d3f45; background: #26272b; color: #c9cad0; }
+[data-theme="dark"] .app-update-success { color: #7fc394; }
 [data-theme="dark"] .quick-actions button:hover:not(:disabled),
 [data-theme="dark"] .runtime-tools button:hover:not(:disabled),
 [data-theme="dark"] .command-input button:hover:not(:disabled),

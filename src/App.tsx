@@ -59,6 +59,13 @@ interface ReleaseUpdate {
   latestVersion: string | null;
   releaseUrl: string | null;
   updateAvailable: boolean;
+  notes: string | null;
+}
+
+interface AppUpdateProgress {
+  phase: "progress" | "finished";
+  received: number;
+  total: number | null;
 }
 
 interface ManagedStatus {
@@ -115,6 +122,11 @@ export default function App() {
   const [useMirror, setUseMirror] = useState(systemLanguageIsChinese);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [appUpdateDialogOpen, setAppUpdateDialogOpen] = useState(false);
+  const [appUpdateBusy, setAppUpdateBusy] = useState(false);
+  const [appUpdateInstalled, setAppUpdateInstalled] = useState(false);
+  const [appUpdateProgress, setAppUpdateProgress] = useState<AppUpdateProgress | null>(null);
+  const [appUpdateError, setAppUpdateError] = useState<string | null>(null);
   const logEnd = useRef<HTMLDivElement>(null);
 
   const phaseLabels: Record<Phase, string> = {
@@ -155,6 +167,9 @@ export default function App() {
     const managedListener = listen<ManagedProgress>("managed-progress", ({ payload }) => {
       setManagedProgress(payload);
     });
+    const appUpdateListener = listen<AppUpdateProgress>("app-update-progress", ({ payload }) => {
+      setAppUpdateProgress(payload);
+    });
     const syncRuntimeState = () => {
       void invoke<ServiceStatus>("service_status").then(setStatus).catch(() => undefined);
       void invoke<boolean>("embedded_webview_open").then(setEmbeddedWebviewOpen).catch(() => undefined);
@@ -167,6 +182,7 @@ export default function App() {
       void statusListener.then((unlisten) => unlisten());
       void logListener.then((unlisten) => unlisten());
       void managedListener.then((unlisten) => unlisten());
+      void appUpdateListener.then((unlisten) => unlisten());
     };
   }, []);
 
@@ -314,8 +330,7 @@ export default function App() {
     }
   }
 
-  async function openVersionPage(button: HTMLButtonElement) {
-    button.blur();
+  async function openReleaseUrl() {
     try {
       if (releaseUpdate?.releaseUrl) {
         await invoke("open_release_page", { url: releaseUpdate.releaseUrl });
@@ -324,6 +339,54 @@ export default function App() {
       }
     } catch (reason) {
       setError(errorMessage(reason));
+    }
+  }
+
+  async function openVersionPage(button: HTMLButtonElement) {
+    button.blur();
+    await openReleaseUrl();
+  }
+
+  // 版本按钮点击：有新版本时打开"更新日志"对话框，由用户决定是否应用内更新；
+  // 无新版本时保持原有行为（打开 Release 列表页）。
+  function handleAppVersionClick(button: HTMLButtonElement) {
+    button.blur();
+    if (releaseUpdate?.updateAvailable) {
+      setAppUpdateError(null);
+      setAppUpdateInstalled(false);
+      setAppUpdateProgress(null);
+      setAppUpdateDialogOpen(true);
+      return;
+    }
+    void openVersionPage(button);
+  }
+
+  // 应用内更新：调用 Rust 侧安装（内部会先停托管 DSH、校验签名并汇报进度）。
+  // 任何失败都在对话框内展示，并提供 GitHub 手动下载的兜底路径。
+  async function runAppUpdate() {
+    if (!releaseUpdate) return;
+    setAppUpdateBusy(true);
+    setAppUpdateError(null);
+    setAppUpdateProgress(null);
+    try {
+      await invoke("app_update_install");
+      setAppUpdateInstalled(true);
+      // 立即重启：确认由对话框按钮完成，这里只负责把安装状态交给 restart 流程
+      setAppUpdateDialogOpen(true);
+    } catch (reason) {
+      setAppUpdateError(errorMessage(reason));
+    } finally {
+      setAppUpdateBusy(false);
+    }
+  }
+
+  async function restartApp() {
+    setAppUpdateBusy(true);
+    try {
+      await invoke("app_update_restart");
+    } catch (reason) {
+      setAppUpdateError(errorMessage(reason));
+      setAppUpdateBusy(false);
     }
   }
 
@@ -458,7 +521,7 @@ export default function App() {
             <button
               className={`app-version${releaseUpdate ? " has-update" : ""}`}
               title={releaseUpdate?.latestVersion ? t.launcherUpdateAvailable.replace("{0}", releaseUpdate.latestVersion) : t.viewOnGitHub}
-              onClick={(event) => void openVersionPage(event.currentTarget)}
+              onClick={(event) => handleAppVersionClick(event.currentTarget)}
             >
               v{appVersion}
               {releaseUpdate && <span className="update-dot" aria-hidden="true" />}
@@ -486,6 +549,50 @@ export default function App() {
             <footer>
               <button type="button" onClick={() => setInstallDialogOpen(false)}>{t.cancel}</button>
               <button type="button" className="primary" disabled={!installDirectory} onClick={() => void installManaged()}><Download size={13} />{t.installNow}</button>
+            </footer>
+          </section>
+        </div>
+      )}
+      {appUpdateDialogOpen && releaseUpdate && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setAppUpdateDialogOpen(false)}>
+          <section className="install-dialog" role="dialog" aria-modal="true" aria-labelledby="app-update-title" onMouseDown={(event) => event.stopPropagation()} onKeyDown={(event) => { if (event.key === "Escape") setAppUpdateDialogOpen(false); }}>
+            <header><h2 id="app-update-title">{t.appUpdateTitle.replace("{0}", releaseUpdate.latestVersion ?? "")}</h2></header>
+            <div className="install-dialog-body">
+              <div className="app-update-notes">
+                {releaseUpdate.notes ? releaseUpdate.notes : t.appUpdateNotesEmpty}
+              </div>
+              {appUpdateProgress && !appUpdateInstalled && (
+                <div className="managed-progress" aria-live="polite">
+                  <span style={{ width: appUpdateProgress.total ? `${Math.min(100, Math.round((appUpdateProgress.received / appUpdateProgress.total) * 100))}%` : "50%" }} />
+                  <small>
+                    {appUpdateProgress.total
+                      ? `${t.appUpdateInstallRunning} ${Math.round((appUpdateProgress.received / appUpdateProgress.total) * 100)}%`
+                      : t.appUpdateInstallRunning}
+                  </small>
+                </div>
+              )}
+              {appUpdateInstalled && <p className="app-update-success" role="status">{t.appUpdateInstalled}</p>}
+              {appUpdateError && (
+                <>
+                  <p className="install-dialog-error" role="alert">{translateBackendMessage(appUpdateError, lang)}</p>
+                  <p className="window-close-hint">{t.appUpdateFailed}</p>
+                </>
+              )}
+            </div>
+            <footer>
+              <button type="button" onClick={() => setAppUpdateDialogOpen(false)}>{t.cancel}</button>
+              {releaseUpdate.releaseUrl && (
+                <button type="button" onClick={() => void openReleaseUrl()}>
+                  <ExternalLink size={13} />{t.viewOnGitHub}
+                </button>
+              )}
+              {appUpdateInstalled ? (
+                <button type="button" className="primary" disabled={appUpdateBusy} onClick={() => void restartApp()}><RotateCw size={13} />{t.appUpdateRestartNow}</button>
+              ) : (
+                <button type="button" className="primary" disabled={appUpdateBusy} onClick={() => void runAppUpdate()}>
+                  <Download size={13} />{appUpdateBusy && !appUpdateProgress ? t.appUpdateLoading : appUpdateProgress ? t.appUpdateInstallRunning : t.appUpdateInstallAction}
+                </button>
+              )}
             </footer>
           </section>
         </div>

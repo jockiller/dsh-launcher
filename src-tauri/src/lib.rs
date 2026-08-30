@@ -1,3 +1,4 @@
+mod app_update;
 mod config;
 mod managed;
 mod service;
@@ -247,7 +248,7 @@ async fn check_latest_dsh(root: Option<String>) -> Result<String, String> {
         .map_err(|error| format!("检查 DSH 更新异常结束：{error}"))?
 }
 
-fn shutdown_service(handle: &AppHandle) {
+pub fn shutdown_service(handle: &AppHandle) {
     if let Some(state) = handle.try_state::<AppState>()
         && let Ok(mut service) = state.service.lock()
     {
@@ -263,6 +264,10 @@ pub fn run() {
             maintenance: AtomicBool::new(false),
         })
         .setup(|app| {
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())
+                .map_err(|error| format!("注册 updater 插件失败：{error}"))?;
+
             let config = LauncherConfig::load();
             if config.auto_start {
                 let state = app.state::<AppState>();
@@ -290,6 +295,9 @@ pub fn run() {
             upgrade_managed_dsh,
             managed_runtime_status,
             check_latest_dsh,
+            app_update::app_update_check,
+            app_update::app_update_install,
+            app_update::app_update_restart,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build DSH Launcher");

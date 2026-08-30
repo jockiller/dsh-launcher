@@ -70,7 +70,15 @@ const zhDict = {
   restartService: "重启服务",
   openWebGui: "打开 Web GUI",
   viewOnGitHub: "在 GitHub 上查看项目",
-  launcherUpdateAvailable: "发现 Launcher v{0}，点击查看发布说明",
+  launcherUpdateAvailable: "发现 Launcher v{0}，点击查看更新日志",
+  appUpdateTitle: "发现新版本 v{0}",
+  appUpdateNotesEmpty: "本次更新没有说明文本。",
+  appUpdateInstallAction: "应用内更新并自动重启",
+  appUpdateInstallRunning: "正在下载并安装更新（含签名校验）...",
+  appUpdateInstalled: "更新已安装完成！",
+  appUpdateRestartNow: "立即重启",
+  appUpdateFailed: "应用内更新失败，可改用 GitHub 手动下载。",
+  appUpdateLoading: "正在获取更新信息...",
 } as const;
 
 export type Dict = Record<keyof typeof zhDict, string>;
@@ -135,7 +143,15 @@ const enDict: Dict = {
   restartService: "Restart",
   openWebGui: "Open Web GUI",
   viewOnGitHub: "View project on GitHub",
-  launcherUpdateAvailable: "Launcher v{0} is available; click to view the release",
+  launcherUpdateAvailable: "Launcher v{0} is available; click to view the update log",
+  appUpdateTitle: "New version v{0} available",
+  appUpdateNotesEmpty: "No release notes for this update.",
+  appUpdateInstallAction: "Update in place and restart",
+  appUpdateInstallRunning: "Downloading and installing (with signature verification)...",
+  appUpdateInstalled: "Update installed!",
+  appUpdateRestartNow: "Restart now",
+  appUpdateFailed: "In-place update failed; you can download manually from GitHub instead.",
+  appUpdateLoading: "Fetching update info...",
 };
 
 export const translations: Record<Lang, Dict> = { zh: zhDict, en: enDict };

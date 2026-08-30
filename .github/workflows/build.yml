@@ -22,46 +22,62 @@ jobs:
             rust-target: aarch64-apple-darwin
             bundles: app
             artifact: macos-arm64
+            updater-arch: aarch64
             paths: |
               src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+              src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*_aarch64.app.tar.gz
+              src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*_aarch64.app.tar.gz.sig
           - name: macOS x64
             os: macos-15-intel
             rust-target: x86_64-apple-darwin
             bundles: app
             artifact: macos-x64
+            updater-arch: x86_64
             paths: |
               src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+              src-tauri/target/x86_64-apple-darwin/release/bundle/macos/*_x86_64.app.tar.gz
+              src-tauri/target/x86_64-apple-darwin/release/bundle/macos/*_x86_64.app.tar.gz.sig
           - name: Windows x64
             os: windows-latest
             rust-target: x86_64-pc-windows-msvc
             bundles: nsis
             artifact: windows-x64
+            updater-arch: x86_64
             paths: |
               src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+              src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe.sig
           - name: Windows arm64
             os: windows-11-arm
             rust-target: aarch64-pc-windows-msvc
             bundles: nsis
             artifact: windows-arm64
+            updater-arch: aarch64
             paths: |
               src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*.exe
+              src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*.exe.sig
           - name: Linux x64
             os: ubuntu-22.04
             rust-target: x86_64-unknown-linux-gnu
             bundles: deb,rpm,appimage
             artifact: linux-x64
+            updater-arch: x86_64
             paths: |
               src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
               src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm
+              src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
+              src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.sig
               src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.tar.gz
           - name: Linux arm64
             os: ubuntu-24.04-arm
             rust-target: aarch64-unknown-linux-gnu
             bundles: deb,rpm,appimage
             artifact: linux-arm64
+            updater-arch: aarch64
             paths: |
               src-tauri/target/aarch64-unknown-linux-gnu/release/bundle/deb/*.deb
               src-tauri/target/aarch64-unknown-linux-gnu/release/bundle/rpm/*.rpm
+              src-tauri/target/aarch64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
+              src-tauri/target/aarch64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.sig
               src-tauri/target/aarch64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.tar.gz
 
     runs-on: ${{ matrix.os }}
@@ -104,11 +120,23 @@ jobs:
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
+      - name: Verify updater signing key is configured
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY 未配置：createUpdaterArtifacts 已开启，构建无法为热更包签名。请先运行 pnpm tauri signer generate 并把私钥写入仓库 Secrets。"
+            exit 1
+          fi
+
       - name: Build desktop package
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         shell: bash
         run: |
           if [[ -z "$APPLE_CERTIFICATE" ]]; then
@@ -123,6 +151,8 @@ jobs:
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           bundle_dir="src-tauri/target/${{ matrix.rust-target }}/release/bundle"
           app=$(find "$bundle_dir/macos" -maxdepth 1 -name '*.app' -print -quit)
@@ -131,7 +161,19 @@ jobs:
             exit 1
           fi
 
+          # tauri 自动生成的热更包在补签之前打包。为了让替换后的 bundle 保留本地网络
+          # 权限元数据（sign-macos-app.sh 的补签），顺序必须是：补签 .app → 用补签后的
+          # .app 打包成最终热更包 → 对该最终 tarball 签名（gzip 头含时间戳，两次打包
+          # 字节不同，先签后改会导致校验失败）→ 删除 tauri 自动生成的旧产物。
+          rm -f "$bundle_dir/macos/$(basename "$app").tar.gz" \
+                "$bundle_dir/macos/$(basename "$app").tar.gz.sig"
+
           scripts/sign-macos-app.sh "$app"
+
+          tarball_base="DSH_Launcher_${{ matrix.updater-arch }}.app.tar.gz"
+          rm -f "$bundle_dir/macos/$tarball_base" "$bundle_dir/macos/$tarball_base.sig"
+          tar -czf "$bundle_dir/macos/$tarball_base" -C "$(dirname "$app")" "$(basename "$app")"
+          pnpm exec tauri signer sign "$bundle_dir/macos/$tarball_base"
 
           dmg_dir="$bundle_dir/dmg"
           stage="$dmg_dir/.stage"
@@ -220,6 +262,16 @@ jobs:
         run: |
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
             gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "DSH Launcher $GITHUB_REF_NAME"
+
+      - name: Generate updater latest.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 把 Release 说明注入 latest.json 的 notes 字段，供应用内更新日志展示。
+          gh release view "$GITHUB_REF_NAME" --json body --jq .body > release-assets/.release-notes.md
+          LATEST_NOTES="$(cat release-assets/.release-notes.md)" \
+            node scripts/generate-latest-json.mjs release-assets release-assets/latest.json
+          rm -f release-assets/.release-notes.md
 
       - name: Upload release assets
         env:

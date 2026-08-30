@@ -1,6 +1,6 @@
 [package]
 name = "dsh-launcher"
-version = "0.8.1"
+version = "0.9.0"
 description = "A lightweight launcher for DSH Web"
 license = "MIT"
 authors = ["DSH Launcher"]
@@ -30,3 +30,6 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-updater = "2"

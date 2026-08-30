@@ -34,6 +34,8 @@ pub struct ReleaseUpdate {
     pub release_url: Option<String>,
     /// 是否存在比当前版本更新的 Release。
     pub update_available: bool,
+    /// Release 说明（GitHub body 原文，Markdown），供"更新日志"对话框展示。
+    pub notes: Option<String>,
 }
 
 /// GitHub releases/latest 响应中与本功能相关的字段（其余字段忽略）。
@@ -41,6 +43,7 @@ pub struct ReleaseUpdate {
 struct ReleasePayload {
     tag_name: Option<String>,
     html_url: Option<String>,
+    body: Option<String>,
 }
 
 /// 一次进程生命周期内的检测阶段：只会从 Pending 前进到 Done 一次。
@@ -99,23 +102,35 @@ fn fetch_latest_release() -> Option<ReleaseUpdate> {
         .ok()?
         .into_string()
         .ok()?;
-    let (tag_name, html_url) = parse_release_json(&payload)?;
-    Some(evaluate_release(
-        &tag_name,
-        &html_url,
-        env!("CARGO_PKG_VERSION"),
-    ))
+    parse_release_json(&payload).map(|(tag_name, html_url, body)| {
+        evaluate_release(
+            &tag_name,
+            &html_url,
+            body.as_deref(),
+            env!("CARGO_PKG_VERSION"),
+        )
+    })
 }
 
-/// 纯逻辑：解析 GitHub API 返回的 JSON，取 `tag_name` 与 `html_url`（允许缺省 html_url）。
-fn parse_release_json(payload: &str) -> Option<(String, String)> {
+/// 纯逻辑：解析 GitHub API 返回的 JSON，取 `tag_name`、`html_url` 与 `body`
+/// （允许缺省 html_url 与 body）。
+fn parse_release_json(payload: &str) -> Option<(String, String, Option<String>)> {
     let release: ReleasePayload = serde_json::from_str(payload).ok()?;
     let tag_name = release.tag_name?.trim().to_string();
-    Some((tag_name, release.html_url.unwrap_or_default()))
+    let body = release
+        .body
+        .map(|body| body.trim().to_string())
+        .filter(|body| !body.is_empty());
+    Some((tag_name, release.html_url.unwrap_or_default(), body))
 }
 
 /// 纯逻辑：依据 tag 与当前版本综合判断可用更新；任一版本无法解析时结果为「无更新」。
-fn evaluate_release(tag_name: &str, html_url: &str, current: &str) -> ReleaseUpdate {
+fn evaluate_release(
+    tag_name: &str,
+    html_url: &str,
+    body: Option<&str>,
+    current: &str,
+) -> ReleaseUpdate {
     let latest = normalize_tag(tag_name).and_then(|tag| semver::Version::parse(&tag).ok());
     let current = semver::Version::parse(current.trim()).ok();
     let (Some(latest), Some(current)) = (latest, current) else {
@@ -123,6 +138,7 @@ fn evaluate_release(tag_name: &str, html_url: &str, current: &str) -> ReleaseUpd
             latest_version: None,
             release_url: None,
             update_available: false,
+            notes: None,
         };
     };
     // html_url 必须通过白名单校验才对外提供，否则回退到固定的 Release 列表页。
@@ -135,6 +151,8 @@ fn evaluate_release(tag_name: &str, html_url: &str, current: &str) -> ReleaseUpd
         latest_version: Some(latest.to_string()),
         release_url: Some(release_url),
         update_available: latest > current,
+        // body 是 GitHub 上的公开文本，截断到 4000 字符防止超长释放说明撑爆界面。
+        notes: body.map(|body| body.chars().take(4000).collect()),
     }
 }
 
@@ -235,22 +253,27 @@ mod tests {
 
     #[test]
     fn release_json_parses_github_payload() {
-        const PAYLOAD: &str = r#"{
+        const PAYLOAD: &str = r###"{
             "url": "https://api.github.com/repos/jockiller/dsh-launcher/releases/1",
             "tag_name": "v0.2.0",
             "name": "DSH Launcher 0.2.0",
             "html_url": "https://github.com/jockiller/dsh-launcher/releases/tag/v0.2.0",
+            "body": "## 修复\n- 一键安装",
             "prerelease": false
-        }"#;
-        let (tag_name, html_url) = parse_release_json(PAYLOAD).unwrap();
+        }"###;
+        let (tag_name, html_url, body) = parse_release_json(PAYLOAD).unwrap();
         assert_eq!(tag_name, "v0.2.0");
         assert_eq!(
             html_url,
             "https://github.com/jockiller/dsh-launcher/releases/tag/v0.2.0"
         );
+        assert_eq!(body.as_deref(), Some("## 修复\n- 一键安装"));
         // 缺 tag_name 视为失败；非法 JSON 同样失败
         assert!(parse_release_json(r#"{"html_url": "https://x"}"#).is_none());
         assert!(parse_release_json("not json").is_none());
+        // body 为空白时归一化为 None
+        let (_, _, body) = parse_release_json(r#"{"tag_name": "v1"}"#).unwrap();
+        assert_eq!(body, None);
     }
 
     #[test]
@@ -259,6 +282,7 @@ mod tests {
         let update = evaluate_release(
             "v0.2.0",
             "https://github.com/jockiller/dsh-launcher/releases/tag/v0.2.0",
+            Some("## 更新内容\n- 修复一键安装"),
             "0.1.0",
         );
         assert_eq!(
@@ -269,36 +293,39 @@ mod tests {
                     "https://github.com/jockiller/dsh-launcher/releases/tag/v0.2.0".into()
                 ),
                 update_available: true,
+                notes: Some("## 更新内容\n- 修复一键安装".into()),
             }
         );
         // prerelease 高于当前已发布版本时也算更新
-        let update = evaluate_release("v0.1.1-rc.1", "", "0.1.0");
+        let update = evaluate_release("v0.1.1-rc.1", "", None, "0.1.0");
         assert_eq!(update.latest_version.as_deref(), Some("0.1.1-rc.1"));
         assert!(update.update_available);
         // 当前版本较新（例如本地构建版本超前）时不提示
-        let update = evaluate_release("v0.1.0", "", "0.2.0");
+        let update = evaluate_release("v0.1.0", "", None, "0.2.0");
         assert!(!update.update_available);
         assert_eq!(update.latest_version.as_deref(), Some("0.1.0"));
         // 相同版本不提示
-        assert!(!evaluate_release("0.1.0", "", "0.1.0").update_available);
+        assert!(!evaluate_release("0.1.0", "", None, "0.1.0").update_available);
     }
 
     #[test]
     fn evaluate_release_falls_back_when_payload_is_invalid() {
         // tag 无法解析或当前版本无法解析：整体按无更新处理
-        let update = evaluate_release("nightly-2024", "", "0.1.0");
+        let update = evaluate_release("nightly-2024", "", None, "0.1.0");
         assert_eq!(
             update,
             ReleaseUpdate {
                 latest_version: None,
                 release_url: None,
-                update_available: false
+                update_available: false,
+                notes: None,
             }
         );
         // release 页面偏离白名单时回退到固定列表页
         let update = evaluate_release(
             "v0.2.0",
             "https://evil.com/jockiller/dsh-launcher/releases/tag/v0.2.0",
+            None,
             "0.1.0",
         );
         assert_eq!(update.release_url.as_deref(), Some(RELEASES_PAGE_URL));
@@ -310,10 +337,12 @@ mod tests {
             latest_version: Some("0.2.0".into()),
             release_url: Some(RELEASES_PAGE_URL.into()),
             update_available: true,
+            notes: Some("### 修复".into()),
         })
         .unwrap();
         assert_eq!(json["latestVersion"], "0.2.0");
         assert_eq!(json["releaseUrl"], RELEASES_PAGE_URL);
         assert_eq!(json["updateAvailable"], true);
+        assert_eq!(json["notes"], "### 修复");
     }
 }
