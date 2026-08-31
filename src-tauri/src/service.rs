@@ -1635,13 +1635,14 @@ fn is_executable_dsh(path: &Path) -> bool {
 /// 安全转义的参数直接报 InvalidInput 而非注入；因此这里保持逐参数传递、不拼接命令行即可
 /// 避免 cmd 注入。CREATE_NO_WINDOW 防止 GUI 宿主下闪现控制台窗口。
 ///
-/// 版本探测继承当前进程环境，避免每次 bootstrap/detect/validate 都启动登录 Shell。
-/// 成功时同时从 stdout 与 stderr 提取语义化版本；提取不到时给出明确错误
-/// （附带输出片段便于排查）。
+/// 版本探测与正式启动共用登录 Shell 工具链环境，保证 nvm 等以 `#!/usr/bin/env node`
+/// 安装的 dsh 能解析到 node。Shell 环境只采集一次并缓存，后续 detect/validate
+/// 不会重复执行 rc 文件。成功时同时从 stdout 与 stderr 提取语义化版本；提取不到时
+/// 给出明确错误（附带输出片段便于排查）。
 pub fn dsh_version(path: &Path) -> Result<String, String> {
     let mut command = Command::new(path);
-    // 版本探测不需要启动登录 Shell；正式服务启动时才采集用户 Shell 环境，
-    // 避免每次 bootstrap/detect/validate 都重复执行可能耗时的 rc 文件。
+    let (envs, _) = launcher_environment();
+    command.envs(envs);
     suppress_console_window(&mut command);
     let mut child = command
         .arg("--version")

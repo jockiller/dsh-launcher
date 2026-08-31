@@ -94,6 +94,8 @@ interface ManagedProgress {
 
 // 与后端 ServiceStatus 默认值一致；展示时经 translateBackendMessage 按当前语言渲染
 const emptyStatus: ServiceStatus = { phase: "stopped", pid: null, url: null, message: "服务未运行" };
+const STARTUP_OVERLAY_MIN_MS = 700;
+const STARTUP_OVERLAY_MAX_MS = 12_000;
 
 function errorMessage(error: unknown) {
   return typeof error === "string" ? error : error instanceof Error ? error.message : String(error);
@@ -173,6 +175,8 @@ export default function App() {
   const [installDialogError, setInstallDialogError] = useState<string | null>(null);
   const [useMirror, setUseMirror] = useState(systemLanguageIsChinese);
   const [busy, setBusy] = useState(false);
+  const [startupReady, setStartupReady] = useState(false);
+  const [minStartupElapsed, setMinStartupElapsed] = useState(false);
   const [externalStopOffered, setExternalStopOffered] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [appUpdateDialogOpen, setAppUpdateDialogOpen] = useState(false);
@@ -201,6 +205,7 @@ export default function App() {
   };
 
   useEffect(() => {
+    const minimumTimer = window.setTimeout(() => setMinStartupElapsed(true), STARTUP_OVERLAY_MIN_MS);
     void invoke<Bootstrap>("bootstrap")
       .then((data) => {
         setAppVersion(data.appVersion);
@@ -219,7 +224,10 @@ export default function App() {
             .catch(() => undefined);
         }
       })
-      .catch((reason) => setError(errorMessage(reason)));
+      .catch((reason) => {
+        setError(errorMessage(reason));
+        setStartupReady(true);
+      });
     void invoke<ReleaseUpdate | null>("check_launcher_update")
       .then((update) => setReleaseUpdate(update?.updateAvailable ? update : null))
       .catch(() => undefined);
@@ -242,6 +250,7 @@ export default function App() {
     const timer = window.setInterval(syncRuntimeState, 1500);
 
     return () => {
+      clearTimeout(minimumTimer);
       clearInterval(timer);
       void statusListener.then((unlisten) => unlisten());
       void logListener.then((unlisten) => unlisten());
@@ -364,6 +373,17 @@ export default function App() {
   useEffect(() => {
     if (status.phase !== "external") setExternalStopOffered(false);
   }, [status.phase]);
+
+  useEffect(() => {
+    if (!config || !minStartupElapsed) return;
+    const waitingForAutoStart = config.autoStart && status.phase === "starting";
+    if (!waitingForAutoStart) {
+      setStartupReady(true);
+      return;
+    }
+    const timeout = window.setTimeout(() => setStartupReady(true), STARTUP_OVERLAY_MAX_MS);
+    return () => clearTimeout(timeout);
+  }, [config, minStartupElapsed, status.phase]);
 
   // 强制关闭入口提供恢复路径：Esc 退回普通 external 状态（再次点击启动即为重新检测）
   useEffect(() => {
@@ -638,7 +658,17 @@ export default function App() {
     }
   }
 
-  if (!config) return <main className="loading">{t.loading}</main>;
+  if (!config || !startupReady) {
+    const message = config?.autoStart ? t.autoStarting : t.preparingEnvironment;
+    return (
+      <main className="loading" aria-busy="true" aria-live="polite">
+        <div className="loading-copy">
+          <span className="loading-spinner" aria-hidden="true" />
+          <span>{message}</span>
+        </div>
+      </main>
+    );
+  }
 
   const shouldStart = status.phase === "stopped" || status.phase === "external" || (status.phase === "failed" && !status.pid);
   const webAvailable = status.phase === "running" || status.phase === "external";

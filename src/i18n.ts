@@ -9,6 +9,8 @@ export const LANG_STORAGE_KEY = "dsh-launcher-lang";
 
 const zhDict = {
   loading: "正在加载...",
+  preparingEnvironment: "正在准备运行环境...",
+  autoStarting: "正在自动启动...",
   langToggleTitle: "切换语言 (English)",
   // 设置表单
   dshCommand: "DSH 命令",
@@ -113,6 +115,8 @@ export type Dict = Record<keyof typeof zhDict, string>;
 
 const enDict: Dict = {
   loading: "Loading...",
+  preparingEnvironment: "Preparing environment...",
+  autoStarting: "Auto-starting...",
   langToggleTitle: "Switch language (中文)",
   dshCommand: "DSH Command",
   notVerified: "Not verified",
