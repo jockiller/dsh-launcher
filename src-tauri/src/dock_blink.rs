@@ -21,10 +21,11 @@ const FRAME_PERIOD: std::time::Duration = std::time::Duration::from_millis(300);
 /// 相比原始 512px 把像素处理量降低 4 倍。
 #[allow(dead_code)]
 const WORK_SIZE_LIMIT: usize = 256;
-/// 图标内容占画布的比例。Apple 图标栅格要求方形容器约 824/1024 ≈ 0.80，
-/// 系统渲染的图标都遵循这一留白；直接铺满会显得大一圈。
+/// 图标内容占画布的比例：Apple 图标栅格要求方形容器约 824/1024 ≈ 0.805，
+/// 而打包 artwork 的圆角方块已达 0.922，故按 0.805/0.922 ≈ 0.87 缩放对齐
+/// 系统栅格（缩放后内容占比 ≈ 0.805，与邻居图标视觉一致）。
 #[allow(dead_code)]
-const CONTENT_SCALE: f64 = 0.80;
+const CONTENT_SCALE: f64 = 0.87;
 
 /// 打包图标的原始 PNG 字节（运行时解码一次）。
 #[allow(dead_code)]
