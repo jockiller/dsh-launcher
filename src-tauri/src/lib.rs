@@ -124,6 +124,30 @@ fn stop_service(app: AppHandle, state: State<'_, AppState>) -> Result<ServiceSta
 }
 
 #[tauri::command]
+async fn force_stop_external_service(
+    app: AppHandle,
+    config: LauncherConfig,
+) -> Result<ServiceStatus, String> {
+    config.validate()?;
+    // 终止流程包含多次子进程调用与最长数秒的等待，放到阻塞线程池执行，
+    // 避免长时间占用 IPC 运行时线程（沿用 install_managed_runtime 的做法）。
+    let task_app = app.clone();
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        let state = task_app.state::<AppState>();
+        state
+            .service
+            .lock()
+            .map_err(|error| error.to_string())?
+            .force_stop_external(&task_app, &config)
+    })
+    .await;
+    match task {
+        Ok(result) => result,
+        Err(error) => Err(format!("强制停止任务异常结束：{error}")),
+    }
+}
+
+#[tauri::command]
 fn restart_service(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -154,6 +178,11 @@ fn embedded_webview_open(app: AppHandle) -> bool {
 #[tauri::command]
 fn open_project_page() -> Result<(), String> {
     service::open_default("https://github.com/jockiller/dsh-launcher")
+}
+
+#[tauri::command]
+fn open_dsh_github_page() -> Result<(), String> {
+    service::open_default("https://github.com/deepseek-ai/deepseek-harness")
 }
 
 #[tauri::command]
@@ -275,11 +304,10 @@ async fn check_latest_dsh(root: Option<String>) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn check_external_dsh_update(current_version: String) -> Option<managed::ExternalDshUpdate> {
-    tauri::async_runtime::spawn_blocking(move || managed::check_external_dsh_update(&current_version))
+async fn check_dsh_version(current_version: String) -> Result<managed::DshVersionInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || managed::check_dsh_version(&current_version))
         .await
-        .ok()
-        .flatten()
+        .map_err(|error| format!("检查 DSH 版本异常结束：{error}"))?
 }
 
 pub fn shutdown_service(handle: &AppHandle) {
@@ -318,10 +346,12 @@ pub fn run() {
             validate_dsh,
             start_service,
             stop_service,
+            force_stop_external_service,
             restart_service,
             service_status,
             embedded_webview_open,
             open_project_page,
+            open_dsh_github_page,
             open_service_url,
             check_launcher_update,
             open_release_page,
@@ -329,7 +359,7 @@ pub fn run() {
             upgrade_managed_dsh,
             managed_runtime_status,
             check_latest_dsh,
-            check_external_dsh_update,
+            check_dsh_version,
             app_update::app_update_check,
             app_update::app_update_install,
             app_update::app_update_restart,

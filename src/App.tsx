@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { confirm as confirmDialog, open } from "@tauri-apps/plugin-dialog";
 import {
+  Ban,
   Copy,
   Download,
   ExternalLink,
@@ -77,9 +78,12 @@ interface ManagedStatus {
   dshVersion: string;
 }
 
-interface ExternalDshUpdate {
+interface DshVersionInfo {
+  currentVersion: string;
+  currentNotes: string | null;
   latestVersion: string;
-  notes: string | null;
+  latestNotes: string | null;
+  updateAvailable: boolean;
 }
 
 interface ManagedProgress {
@@ -151,8 +155,10 @@ export default function App() {
   const [releaseUpdate, setReleaseUpdate] = useState<ReleaseUpdate | null>(null);
   const [profiles, setProfiles] = useState<string[]>(["web"]);
   const [version, setVersion] = useState<string | null>(null);
-  const [externalDshUpdate, setExternalDshUpdate] = useState<ExternalDshUpdate | null>(null);
-  const [externalDshUpdateDialogOpen, setExternalDshUpdateDialogOpen] = useState(false);
+  const [dshVersionInfo, setDshVersionInfo] = useState<DshVersionInfo | null>(null);
+  const [dshVersionDialogOpen, setDshVersionDialogOpen] = useState(false);
+  const [dshVersionChecking, setDshVersionChecking] = useState(false);
+  const [dshVersionCheckError, setDshVersionCheckError] = useState<string | null>(null);
   const [externalDshCopyState, setExternalDshCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const [status, setStatus] = useState<ServiceStatus>(emptyStatus);
   const [embeddedWebviewOpen, setEmbeddedWebviewOpen] = useState(false);
@@ -167,6 +173,7 @@ export default function App() {
   const [installDialogError, setInstallDialogError] = useState<string | null>(null);
   const [useMirror, setUseMirror] = useState(systemLanguageIsChinese);
   const [busy, setBusy] = useState(false);
+  const [externalStopOffered, setExternalStopOffered] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [appUpdateDialogOpen, setAppUpdateDialogOpen] = useState(false);
   const [appUpdateBusy, setAppUpdateBusy] = useState(false);
@@ -177,11 +184,12 @@ export default function App() {
   const pageContentRef = useRef<HTMLDivElement>(null);
   const installDialogRef = useRef<HTMLElement>(null);
   const appUpdateDialogRef = useRef<HTMLElement>(null);
-  const externalDshUpdateDialogRef = useRef<HTMLElement>(null);
+  const dshVersionDialogRef = useRef<HTMLElement>(null);
   const installDialogTriggerRef = useRef<HTMLElement | null>(null);
   const appUpdateDialogTriggerRef = useRef<HTMLElement | null>(null);
-  const externalDshUpdateTriggerRef = useRef<HTMLElement | null>(null);
-  const previousDialogRef = useRef<"install" | "update" | "external-dsh" | null>(null);
+  const dshVersionTriggerRef = useRef<HTMLElement | null>(null);
+  const previousDialogRef = useRef<"install" | "update" | "dsh-version" | null>(null);
+  const versionCheckSeq = useRef(0);
 
   const phaseLabels: Record<Phase, string> = {
     stopped: t.phaseStopped,
@@ -198,14 +206,9 @@ export default function App() {
         setAppVersion(data.appVersion);
         setConfig({ ...data.config, dshPath: data.config.dshPath || data.detectedDsh || "" });
         setVersion(data.dshVersion);
-        setExternalDshUpdate(null);
+        setDshVersionInfo(null);
         setProfiles(data.profiles);
         setStatus(data.status);
-        if (!data.config.managedRuntimeDir && data.dshVersion) {
-          void invoke<ExternalDshUpdate | null>("check_external_dsh_update", { currentVersion: data.dshVersion })
-            .then((update) => setExternalDshUpdate(update ?? null))
-            .catch(() => undefined);
-        }
         if (data.config.managedRuntimeDir) {
           // Managed runtimes keep their existing update check; external runtimes use the separate async check below.
           void invoke<ManagedStatus>("managed_runtime_status", { root: data.config.managedRuntimeDir })
@@ -288,14 +291,14 @@ export default function App() {
       ? "install"
       : appUpdateDialogOpen
         ? "update"
-        : externalDshUpdateDialogOpen
-          ? "external-dsh"
+        : dshVersionDialogOpen
+          ? "dsh-version"
           : null;
     const dialogRef = activeDialog === "install"
       ? installDialogRef
       : activeDialog === "update"
         ? appUpdateDialogRef
-        : externalDshUpdateDialogRef;
+        : dshVersionDialogRef;
     const dialog = dialogRef.current;
     const pageContent = pageContentRef.current;
 
@@ -304,8 +307,8 @@ export default function App() {
         ? installDialogTriggerRef.current
         : previousDialogRef.current === "update"
           ? appUpdateDialogTriggerRef.current
-          : previousDialogRef.current === "external-dsh"
-            ? externalDshUpdateTriggerRef.current
+          : previousDialogRef.current === "dsh-version"
+            ? dshVersionTriggerRef.current
             : null;
       previousDialogRef.current = null;
       trigger?.focus();
@@ -326,7 +329,7 @@ export default function App() {
         event.preventDefault();
         if (activeDialog === "install") setInstallDialogOpen(false);
         else if (activeDialog === "update") setAppUpdateDialogOpen(false);
-        else setExternalDshUpdateDialogOpen(false);
+        else setDshVersionDialogOpen(false);
         return;
       }
       if (event.key !== "Tab") return;
@@ -356,7 +359,21 @@ export default function App() {
       pageContent?.removeAttribute("inert");
       pageContent?.removeAttribute("aria-hidden");
     };
-  }, [installDialogOpen, appUpdateDialogOpen, externalDshUpdateDialogOpen]);
+  }, [installDialogOpen, appUpdateDialogOpen, dshVersionDialogOpen]);
+
+  useEffect(() => {
+    if (status.phase !== "external") setExternalStopOffered(false);
+  }, [status.phase]);
+
+  // 强制关闭入口提供恢复路径：Esc 退回普通 external 状态（再次点击启动即为重新检测）
+  useEffect(() => {
+    if (!externalStopOffered) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setExternalStopOffered(false);
+    };
+    document.addEventListener("keydown", handleKeyDown, true);
+    return () => document.removeEventListener("keydown", handleKeyDown, true);
+  }, [externalStopOffered]);
 
   const locked = ["running", "starting", "stopping"].includes(status.phase);
   const serviceUrl = useMemo(
@@ -374,11 +391,25 @@ export default function App() {
     setLang((current) => (current === "zh" ? "en" : "zh"));
   }
 
-  function checkExternalDshUpdate(dshVersion: string) {
-    setExternalDshUpdate(null);
-    void invoke<ExternalDshUpdate | null>("check_external_dsh_update", { currentVersion: dshVersion })
-      .then((update) => setExternalDshUpdate(update ?? null))
-      .catch(() => undefined);
+  // 点击 DSH 版本号：打开版本弹窗并调用 check_dsh_version 检查最新版本与更新说明
+  async function checkDshVersion(button: HTMLButtonElement) {
+    if (!version) return;
+    button.blur();
+    dshVersionTriggerRef.current = button;
+    setExternalDshCopyState("idle");
+    setDshVersionCheckError(null);
+    setDshVersionInfo(null);
+    setDshVersionChecking(true);
+    setDshVersionDialogOpen(true);
+    const requestSeq = ++versionCheckSeq.current;
+    try {
+      const info = await invoke<DshVersionInfo>("check_dsh_version", { currentVersion: version });
+      if (versionCheckSeq.current === requestSeq) setDshVersionInfo(info);
+    } catch (reason) {
+      if (versionCheckSeq.current === requestSeq) setDshVersionCheckError(errorMessage(reason));
+    } finally {
+      if (versionCheckSeq.current === requestSeq) setDshVersionChecking(false);
+    }
   }
 
   async function detectDsh() {
@@ -387,7 +418,7 @@ export default function App() {
       const [path, detectedVersion] = await invoke<[string, string]>("detect_dsh");
       patch("dshPath", path);
       setVersion(detectedVersion);
-      if (!config?.managedRuntimeDir) checkExternalDshUpdate(detectedVersion);
+      setDshVersionInfo(null);
     } catch (reason) {
       setError(errorMessage(reason));
     }
@@ -400,7 +431,7 @@ export default function App() {
       const detectedVersion = await invoke<string>("validate_dsh", { path: selected });
       patch("dshPath", selected);
       setVersion(detectedVersion);
-      if (!config?.managedRuntimeDir) checkExternalDshUpdate(detectedVersion);
+      setDshVersionInfo(null);
       setError(null);
     } catch (reason) {
       setError(errorMessage(reason));
@@ -434,7 +465,7 @@ export default function App() {
       });
       setManaged(result);
       setVersion(result.dshVersion);
-      setExternalDshUpdate(null);
+      setDshVersionInfo(null);
       setConfig((current) => current ? {
         ...current,
         managedRuntimeDir: result.managedRoot,
@@ -548,9 +579,17 @@ export default function App() {
     }
   }
 
+  async function openDshGitHub() {
+    try {
+      await invoke("open_dsh_github_page");
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  }
+
   async function copyExternalDshCommand() {
-    if (!externalDshUpdate) return;
-    const command = `npm install -g @deepseek-ai/dsh@${externalDshUpdate.latestVersion}`;
+    if (!dshVersionInfo?.updateAvailable) return;
+    const command = `npm install -g @deepseek-ai/dsh@${dshVersionInfo.latestVersion}`;
     try {
       if (!navigator.clipboard?.writeText) throw new Error("Clipboard API unavailable");
       await navigator.clipboard.writeText(command);
@@ -560,11 +599,27 @@ export default function App() {
     }
   }
 
-  function openExternalDshUpdate(button: HTMLButtonElement) {
+  // 强制停止占用当前端口的外部 DSH 进程（Rust 侧会做 DSH 身份校验后再终止）
+  async function forceStopExternal(button: HTMLButtonElement) {
     button.blur();
-    setExternalDshCopyState("idle");
-    externalDshUpdateTriggerRef.current = button;
-    setExternalDshUpdateDialogOpen(true);
+    if (!config) return;
+    const confirmed = await confirmDialog(t.forceStopConfirmMessage, {
+      title: t.forceStopConfirmTitle,
+      kind: "warning",
+      okLabel: t.forceStopAction,
+      cancelLabel: t.cancel,
+    });
+    if (!confirmed) return;
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await invoke<ServiceStatus>("force_stop_external_service", { config }));
+      setExternalStopOffered(false);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function runCommand(command: "start_service" | "stop_service" | "restart_service") {
@@ -573,7 +628,9 @@ export default function App() {
     setError(null);
     try {
       const payload = command === "stop_service" ? {} : { config };
-      setStatus(await invoke<ServiceStatus>(command, payload));
+      const nextStatus = await invoke<ServiceStatus>(command, payload);
+      setStatus(nextStatus);
+      setExternalStopOffered(command === "start_service" && nextStatus.phase === "external");
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -594,16 +651,17 @@ export default function App() {
         <section className="compact-settings expanded">
           <div className="settings-body">
             <div className="mini-field wide">
-              <div className="field-label-row"><label htmlFor="dsh-path">{t.dshCommand}</label>{version && !managed && externalDshUpdate ? (
+              <div className="field-label-row"><label htmlFor="dsh-path">{t.dshCommand}</label>{version ? (
                  <button
                    type="button"
                    className="dsh-version-update"
-                   title={t.dshVersionUpdateAvailable.replace("{0}", externalDshUpdate.latestVersion)}
-                   onClick={(event) => openExternalDshUpdate(event.currentTarget)}
+                   title={dshVersionInfo?.updateAvailable ? t.dshVersionUpdateAvailable.replace("{0}", dshVersionInfo.latestVersion) : t.dshVersionCheckTitle}
+                   disabled={dshVersionChecking}
+                   onClick={(event) => void checkDshVersion(event.currentTarget)}
                  >
-                   DSH {version}<span className="update-dot" aria-hidden="true" />
+                   DSH {version}{dshVersionInfo?.updateAvailable && <span className="update-dot" aria-hidden="true" />}
                  </button>
-               ) : <span>{version ? `DSH ${version}` : t.notVerified}</span>}</div>
+               ) : <span>{t.notVerified}</span>}</div>
               <div className="command-input">
                 <input id="dsh-path" value={config.dshPath} disabled={locked} onChange={(event) => patch("dshPath", event.target.value)} />
                 <button disabled={locked} onClick={() => void detectDsh()} title={t.autoDetect}><FileSearch size={14} /></button>
@@ -671,17 +729,19 @@ export default function App() {
           </button>
           <div className={`compact-status ${status.phase}`}><span />{phaseLabels[status.phase]}{status.pid && <small>PID {status.pid}</small>}</div>
           <button
-            className={`power-button ${status.phase}`}
+            className={`power-button ${externalStopOffered ? "force-stop" : status.phase}`}
             disabled={busy || status.phase === "starting" || status.phase === "stopping"}
-            onClick={() => void runCommand(shouldStart ? "start_service" : "stop_service")}
-            title={status.phase === "external" ? t.recheckWithConfig : status.phase === "running" ? t.stopService : t.startService}
+            onClick={(event) => externalStopOffered
+              ? void forceStopExternal(event.currentTarget)
+              : void runCommand(shouldStart ? "start_service" : "stop_service")}
+            title={externalStopOffered ? t.forceStopConfirmTitle : status.phase === "external" ? t.recheckWithConfig : status.phase === "running" ? t.stopService : t.startService}
           >
-            <span className="power-ring"><Power size={45} strokeWidth={1.7} /></span>
+            <span className="power-ring">{externalStopOffered ? <Ban size={45} strokeWidth={1.7} /> : <Power size={45} strokeWidth={1.7} />}</span>
           </button>
 
           <div className="launch-copy">
-            <h1>{status.phase === "running" ? t.dshRunning : status.phase === "starting" ? t.dshStarting : status.phase === "stopping" ? t.dshStopping : t.dshStart}</h1>
-            <p>{status.phase === "external" ? t.launcherNotStarted : translateBackendMessage(status.message, lang)}</p>
+            <h1>{externalStopOffered ? t.forceStopConfirmTitle : status.phase === "running" ? t.dshRunning : status.phase === "starting" ? t.dshStarting : status.phase === "stopping" ? t.dshStopping : t.dshStart}</h1>
+            <p>{translateBackendMessage(status.message, lang)}</p>
             {status.phase === "running" && embeddedWebviewOpen && <p className="window-close-hint">{t.windowCloseHint}</p>}
           </div>
 
@@ -730,26 +790,45 @@ export default function App() {
           </section>
         </div>
       )}
-      {externalDshUpdateDialogOpen && externalDshUpdate && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={() => setExternalDshUpdateDialogOpen(false)}>
-          <section className="install-dialog" role="dialog" aria-modal="true" aria-labelledby="dsh-update-title" tabIndex={-1} ref={externalDshUpdateDialogRef} onMouseDown={(event) => event.stopPropagation()}>
-            <header><h2 id="dsh-update-title">{t.dshUpdateTitle.replace("{0}", externalDshUpdate.latestVersion)}</h2></header>
+      {dshVersionDialogOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setDshVersionDialogOpen(false)}>
+          <section className="install-dialog" role="dialog" aria-modal="true" aria-labelledby="dsh-version-title" tabIndex={-1} ref={dshVersionDialogRef} onMouseDown={(event) => event.stopPropagation()}>
+            <header><h2 id="dsh-version-title">{t.dshVersionDialogTitle}</h2></header>
             <div className="install-dialog-body">
-              <label>{t.dshUpdateNotesLabel}</label>
-              <div className="app-update-notes">{externalDshUpdate.notes || t.dshUpdateNotesEmpty}</div>
-              <label htmlFor="dsh-update-command">{t.dshUpdateCommandLabel}</label>
-              <div className="command-input update-command-input">
-                <input id="dsh-update-command" readOnly value={`npm install -g @deepseek-ai/dsh@${externalDshUpdate.latestVersion}`} />
-                <button type="button" onClick={() => void copyExternalDshCommand()} title={t.dshUpdateCopyCommand} aria-label={t.dshUpdateCopyCommand}>
-                  <Copy size={14} />
-                </button>
-              </div>
-              <p className="dsh-update-warning" role="note">{t.dshUpdateWarning}</p>
-              {externalDshCopyState === "copied" && <p className="app-update-success" role="status">{t.dshUpdateCopied}</p>}
-              {externalDshCopyState === "failed" && <p className="install-dialog-error" role="alert">{t.dshUpdateCopyFailed}</p>}
+              {dshVersionChecking && <p className="dsh-update-warning" role="status">{t.dshVersionChecking}</p>}
+              {!dshVersionChecking && dshVersionCheckError && (
+                <p className="install-dialog-error" role="alert">{translateBackendMessage(dshVersionCheckError, lang)}</p>
+              )}
+              {!dshVersionChecking && !dshVersionCheckError && dshVersionInfo && (
+                <>
+                  <p className="dsh-version-line"><strong>{t.dshVersionCurrent}</strong> v{dshVersionInfo.currentVersion}</p>
+                  <p className="dsh-version-line"><strong>{t.dshVersionLatest}</strong> v{dshVersionInfo.latestVersion}</p>
+                  <label>{t.dshCurrentNotesLabel}</label>
+                  <div className="app-update-notes">{dshVersionInfo.currentNotes || t.dshUpdateNotesEmpty}</div>
+                  {dshVersionInfo.updateAvailable ? (
+                    <>
+                      <label>{t.dshLatestNotesLabel}</label>
+                      <div className="app-update-notes">{dshVersionInfo.latestNotes || t.dshUpdateNotesEmpty}</div>
+                      <label htmlFor="dsh-update-command">{t.dshUpdateCommandLabel}</label>
+                      <div className="command-input update-command-input">
+                        <input id="dsh-update-command" readOnly value={`npm install -g @deepseek-ai/dsh@${dshVersionInfo.latestVersion}`} />
+                        <button type="button" onClick={() => void copyExternalDshCommand()} title={t.dshUpdateCopyCommand} aria-label={t.dshUpdateCopyCommand}>
+                          <Copy size={14} />
+                        </button>
+                      </div>
+                      <p className="dsh-update-warning" role="note">{t.dshUpdateWarning}</p>
+                      {externalDshCopyState === "copied" && <p className="app-update-success" role="status">{t.dshUpdateCopied}</p>}
+                      {externalDshCopyState === "failed" && <p className="install-dialog-error" role="alert">{t.dshUpdateCopyFailed}</p>}
+                    </>
+                  ) : (
+                    <p className="app-update-success" role="status">{t.dshVersionUpToDate}</p>
+                  )}
+                </>
+              )}
             </div>
             <footer>
-              <button type="button" onClick={() => setExternalDshUpdateDialogOpen(false)}>{t.cancel}</button>
+              <button type="button" onClick={() => void openDshGitHub()}><ExternalLink size={13} />{t.openDshGitHub}</button>
+              <button type="button" onClick={() => setDshVersionDialogOpen(false)}>{t.cancel}</button>
             </footer>
           </section>
         </div>

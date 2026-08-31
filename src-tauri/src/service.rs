@@ -117,7 +117,7 @@ impl ServiceManager {
                     phase: "external".into(),
                     pid: None,
                     url: Some(service_url(&config.host, config.port)),
-                    message: "检测到端口上已有 Web 服务，启动器不会接管".into(),
+                    message: "检测到端口上已有 Web 服务，启动器不会接管，您仍可以直接打开 Web GUI 使用该服务".into(),
                 };
                 set_status(&self.status, &app, status.clone());
                 emit_log(
@@ -259,6 +259,56 @@ impl ServiceManager {
         if exited {
             self.owned = None;
         }
+    }
+
+    pub fn force_stop_external(
+        &mut self,
+        app: &AppHandle,
+        config: &LauncherConfig,
+    ) -> Result<ServiceStatus, String> {
+        self.prune_exited_child();
+        if self.owned.is_some() {
+            return Err("当前 DSH 由启动器管理，请使用普通停止功能".into());
+        }
+        if self.status().phase != "external" {
+            return Err("当前未检测到可强制关闭的外部 DSH 服务".into());
+        }
+
+        let pid = external_listener_pid(config.port)?;
+        let command_line = external_process_command(pid)?;
+        if !looks_like_dsh_process(&command_line, config.port, &config.profile) {
+            return Err(format!(
+                "端口 {} 的监听进程未通过 DSH 身份校验，已拒绝终止",
+                config.port
+            ));
+        }
+        if external_listener_pid(config.port)? != pid {
+            return Err("监听进程在校验期间发生变化，已拒绝终止".into());
+        }
+
+        close_embedded_webview(app);
+        emit_log(
+            app,
+            "launcher",
+            "warning",
+            &format!("Force stopping external DSH process {pid}"),
+        );
+        terminate_external_process(pid, config.port, &command_line)?;
+
+        let addresses = resolve_addresses(&config.host, config.port)?;
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline {
+            if !connect_any(&addresses, Duration::from_millis(150)) {
+                let status = ServiceStatus::default();
+                set_status(&self.status, app, status.clone());
+                return Ok(status);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        Err(format!(
+            "外部 DSH 进程已终止，但端口 {} 仍在监听",
+            config.port
+        ))
     }
 
     pub fn stop(&mut self, app: Option<&AppHandle>) -> Result<ServiceStatus, String> {
@@ -547,6 +597,206 @@ fn http_ready(host: &str, port: u16) -> bool {
         let mut response = [0_u8; 12];
         stream.read(&mut response).is_ok() && response.starts_with(b"HTTP/")
     })
+}
+
+#[cfg(unix)]
+fn external_listener_pid(port: u16) -> Result<u32, String> {
+    let output = Command::new("lsof")
+        .args(["-nP", "-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
+        .output()
+        .map_err(|error| format!("无法执行 lsof 定位监听进程：{error}"))?;
+    if !output.status.success() {
+        return Err(format!("无法定位端口 {port} 的监听进程"));
+    }
+    parse_single_pid(&String::from_utf8_lossy(&output.stdout), port)
+}
+
+#[cfg(windows)]
+fn external_listener_pid(port: u16) -> Result<u32, String> {
+    let script = format!(
+        "(Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction Stop | Select-Object -ExpandProperty OwningProcess -Unique) -join \"`n\""
+    );
+    let mut command = Command::new("powershell.exe");
+    suppress_console_window(&mut command);
+    let output = command
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|error| format!("无法定位监听进程：{error}"))?;
+    if !output.status.success() {
+        return Err(format!("无法定位端口 {port} 的监听进程"));
+    }
+    parse_single_pid(&String::from_utf8_lossy(&output.stdout), port)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn external_listener_pid(_port: u16) -> Result<u32, String> {
+    Err("当前平台不支持关闭外部 DSH 服务".into())
+}
+
+fn parse_single_pid(output: &str, port: u16) -> Result<u32, String> {
+    let mut pids = output
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect::<Vec<_>>();
+    pids.sort_unstable();
+    pids.dedup();
+    match pids.as_slice() {
+        [pid] => Ok(*pid),
+        [] => Err(format!("无法定位端口 {port} 的监听进程")),
+        _ => Err(format!("端口 {port} 对应多个监听进程，已拒绝终止")),
+    }
+}
+
+#[cfg(unix)]
+fn external_process_command(pid: u32) -> Result<String, String> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .map_err(|error| format!("无法读取监听进程信息：{error}"))?;
+    if !output.status.success() {
+        return Err("无法读取监听进程信息，可能没有足够权限".into());
+    }
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if command.is_empty() {
+        Err("监听进程命令行为空，已拒绝终止".into())
+    } else {
+        Ok(command)
+    }
+}
+
+#[cfg(windows)]
+fn external_process_command(pid: u32) -> Result<String, String> {
+    let script = format!(
+        "(Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\" -ErrorAction Stop).CommandLine"
+    );
+    let mut command = Command::new("powershell.exe");
+    suppress_console_window(&mut command);
+    let output = command
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|error| format!("无法读取监听进程信息：{error}"))?;
+    if !output.status.success() {
+        return Err("无法读取监听进程信息，可能没有足够权限".into());
+    }
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if command.is_empty() {
+        Err("监听进程命令行为空，已拒绝终止".into())
+    } else {
+        Ok(command)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn external_process_command(_pid: u32) -> Result<String, String> {
+    Err("当前平台不支持读取外部进程信息".into())
+}
+
+fn argument_value<'a>(args: &'a [&'a str], name: &str) -> Option<&'a str> {
+    args.windows(2)
+        .find_map(|pair| (pair[0] == name).then_some(pair[1]))
+        .or_else(|| {
+            let prefix = format!("{name}=");
+            args.iter().find_map(|arg| arg.strip_prefix(&prefix))
+        })
+}
+
+fn looks_like_dsh_process(command_line: &str, port: u16, profile: &str) -> bool {
+    let lower = command_line.to_ascii_lowercase().replace('\\', "/");
+    let has_dsh_identity = lower.split_whitespace().any(|token| {
+        let token = token.trim_matches(['\'', '"']);
+        token == "dsh"
+            || token.ends_with("/dsh")
+            || token.ends_with("/dsh.cmd")
+            || token.contains("/@deepseek-ai/dsh/")
+            || token.contains("/deepseek-harness/")
+    });
+    if !has_dsh_identity {
+        return false;
+    }
+
+    let parsed = shell_words::split(command_line).unwrap_or_else(|_| {
+        command_line
+            .split_whitespace()
+            .map(ToOwned::to_owned)
+            .collect()
+    });
+    let args = parsed.iter().map(String::as_str).collect::<Vec<_>>();
+    argument_value(&args, "--port").and_then(|value| value.parse::<u16>().ok()) == Some(port)
+        && argument_value(&args, "--profile") == Some(profile.trim())
+}
+
+fn external_process_still_matches(pid: u32, port: u16, expected_command: &str) -> bool {
+    external_listener_pid(port).ok() == Some(pid)
+        && external_process_command(pid).ok().as_deref() == Some(expected_command)
+}
+
+#[cfg(unix)]
+fn terminate_external_process(pid: u32, port: u16, expected_command: &str) -> Result<(), String> {
+    if !external_process_still_matches(pid, port, expected_command) {
+        return Err("监听进程在终止前发生变化，已拒绝操作".into());
+    }
+    let native_pid = i32::try_from(pid).map_err(|_| "监听进程 PID 无效".to_string())?;
+    if unsafe { libc::kill(native_pid, libc::SIGTERM) } == -1 {
+        return Err(format!(
+            "终止外部 DSH 失败：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        // 仅依据信号探测结果判断进程是否仍在，避免每次迭代都 spawn lsof
+        if unsafe { libc::kill(native_pid, 0) } == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            // EPERM 等其他错误继续轮询，交由外层端口复查给出结论
+            thread::sleep(Duration::from_millis(150));
+            continue;
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+    // 升级 SIGKILL 前重新校验身份；进程若已退出或释放端口则无需强制终止
+    if external_listener_pid(port).ok() != Some(pid) {
+        return Ok(());
+    }
+    if external_process_command(pid)?.as_str() != expected_command {
+        return Err("监听进程在强制终止前发生变化，已拒绝操作".into());
+    }
+    if unsafe { libc::kill(native_pid, libc::SIGKILL) } == -1 {
+        return Err(format!(
+            "强制终止外部 DSH 失败：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn terminate_external_process(pid: u32, port: u16, expected_command: &str) -> Result<(), String> {
+    if !external_process_still_matches(pid, port, expected_command) {
+        return Err("监听进程在终止前发生变化，已拒绝操作".into());
+    }
+    let mut command = Command::new("taskkill");
+    suppress_console_window(&mut command);
+    let status = command
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status()
+        .map_err(|error| format!("终止外部 DSH 失败：{error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("终止外部 DSH 失败，taskkill 退出状态：{status}"))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_external_process(
+    _pid: u32,
+    _port: u16,
+    _expected_command: &str,
+) -> Result<(), String> {
+    Err("当前平台不支持关闭外部 DSH 服务".into())
 }
 
 pub fn resolve_dsh(manual: &str) -> Option<PathBuf> {

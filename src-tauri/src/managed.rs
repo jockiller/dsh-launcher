@@ -71,9 +71,12 @@ struct NpmLatest {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ExternalDshUpdate {
+pub struct DshVersionInfo {
+    pub current_version: String,
+    pub current_notes: Option<String>,
     pub latest_version: String,
-    pub notes: Option<String>,
+    pub latest_notes: Option<String>,
+    pub update_available: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,17 +284,28 @@ pub fn check_latest_dsh(root: Option<&str>) -> Result<String, String> {
     fetch_latest_dsh(marker_mirror(root))
 }
 
-/// 检测外部 DSH 是否有新版本。网络请求和版本比较均在调用方的阻塞线程中执行；
-/// 只有严格高于当前版本时才返回更新信息，更新说明获取失败不会影响升级提示。
-pub fn check_external_dsh_update(current_version: &str) -> Option<ExternalDshUpdate> {
-    let current = semver::Version::parse(current_version.trim()).ok()?;
-    let latest = semver::Version::parse(fetch_latest_dsh(false).ok()?.trim()).ok()?;
-    if latest <= current {
-        return None;
-    }
-    Some(ExternalDshUpdate {
-        latest_version: latest.to_string(),
-        notes: fetch_release_notes(&latest.to_string()),
+/// 获取当前 DSH 的发布说明并检测最新版本。网络请求和版本比较均在调用方的
+/// 阻塞线程中执行；发布说明获取失败不影响版本检测结果。
+pub fn check_dsh_version(current_version: &str) -> Result<DshVersionInfo, String> {
+    let current = semver::Version::parse(current_version.trim())
+        .map_err(|error| format!("当前 DSH 版本格式无效：{error}"))?;
+    let latest = semver::Version::parse(fetch_latest_dsh(false)?.trim())
+        .map_err(|error| format!("最新 DSH 版本格式无效：{error}"))?;
+    let update_available = latest > current;
+    let current_version = current.to_string();
+    let latest_version = latest.to_string();
+    let current_notes = fetch_release_notes(&current_version);
+    let latest_notes = if update_available {
+        fetch_release_notes(&latest_version)
+    } else {
+        current_notes.clone()
+    };
+    Ok(DshVersionInfo {
+        current_version,
+        current_notes,
+        latest_version,
+        latest_notes,
+        update_available,
     })
 }
 
