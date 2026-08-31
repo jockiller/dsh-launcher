@@ -21,7 +21,7 @@ use tauri::Url;
 use crate::service::emit_log;
 
 /// 轮询 `session/list` 的间隔。
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// token 换取 cookie 与轮询请求的单次网络超时。
 const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 /// cookie 换取在连续失败多少次后放弃（每次间隔 POLL_INTERVAL）。

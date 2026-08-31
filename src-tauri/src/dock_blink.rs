@@ -75,19 +75,25 @@ pub(crate) fn init(app: tauri::AppHandle) {
 }
 
 /// 渐变引擎：常驻降采样 base 像素与按钮掩码，按需即时生成单帧 PNG。
+/// 另保存一份**未缩放**的原图 PNG，用于闪烁结束后恢复系统初始图标。
 #[allow(dead_code)]
 struct Engine {
     /// 工作分辨率（正方形边长）。
     size: usize,
-    /// 降采样后的 base RGBA。
+    /// 补足留白后的 base RGBA（动画帧底图）。
     base_rgba: Vec<u8>,
     /// 电源按钮圆盘的像素索引（右下象限内绿色主导的像素）。
     indices: Vec<usize>,
+    /// 未补留白的系统原图 PNG（恢复初始图标用）。
+    original_png: Vec<u8>,
 }
 
 #[allow(dead_code)]
 impl Engine {
-    /// 解码打包图标 → 降采样到工作分辨率 → 定位按钮掩码；失败返回 None。
+    /// 解码打包图标 → 降采样 → 补足留白 → 定位按钮掩码；失败返回 None。
+    ///
+    /// 同时保留降采样后、未补留白的原图，供“恢复初始图标”使用
+    /// （与 bundle 图标 artwork 一致）。
     fn load() -> Option<Self> {
         let image = tauri::image::Image::from_bytes(ICON_PNG).ok()?;
         let (mut width, mut height, mut rgba) =
@@ -100,10 +106,16 @@ impl Engine {
         if width == 0 || rgba.len() < width * height * 4 {
             return None;
         }
+        let original_png = encode_png(&rgba, width, height);
         // 按系统图标栅格补足留白：直接铺满的 artwork 会比邻居图标大一圈。
         rgba = embed_scaled(&rgba, width, CONTENT_SCALE);
         let indices = locate_button(&rgba, width, height);
-        Some(Engine { size: width, base_rgba: rgba, indices })
+        Some(Engine {
+            size: width,
+            base_rgba: rgba,
+            indices,
+            original_png,
+        })
     }
 
     /// 生成第 `phase`（0..1，0=原始绿，1=完全红）帧的 PNG 字节。
@@ -114,9 +126,14 @@ impl Engine {
         encode_png(&rgba, self.size, self.size)
     }
 
-    /// base 图标的 PNG 字节（恢复原始图标时使用）。
+    /// 闪烁帧底图（补留白的绿色 base）的 PNG 字节。
     fn base_png(&self) -> Vec<u8> {
         encode_png(&self.base_rgba, self.size, self.size)
+    }
+
+    /// 初始图标（未补留白的系统原图）的 PNG 字节。
+    fn original_png(&self) -> Vec<u8> {
+        self.original_png.clone()
     }
 }
 
@@ -373,8 +390,6 @@ mod imp {
             Animated,
         }
         let Some(engine) = ENGINE.get() else { return };
-        // TODO(临时测试)：忽略会话状态，启动即闪烁；确认后改回 false。—— 已确认，恢复正常联动
-        const FORCE_BLINK: bool = false;
         // 工作状态闪烁：绿色（空闲底色）与红色（工作色）两态直接交替，
         // 无中间渐变帧——语义为“工作指示灯在闪烁”。
         let green = engine.frame_png(0.0);
@@ -383,16 +398,14 @@ mod imp {
         let mut red_active = false;
         loop {
             thread::sleep(FRAME_PERIOD);
-            if FORCE_BLINK || RUNNING.load(Ordering::Acquire) {
+            if RUNNING.load(Ordering::Acquire) {
                 let png = if red_active { &red } else { &green };
                 apply_dock_image(&app, png.clone());
                 red_active = !red_active;
                 shown = Shown::Animated;
             } else if shown == Shown::Animated {
-                // 恢复原始图标。
-                if red_active {
-                    apply_dock_image(&app, green.clone());
-                }
+                // 恢复“初始 icon 状态”：与系统包内图标完全一致的原图。
+                apply_dock_image(&app, engine.original_png());
                 shown = Shown::Original;
             }
         }
@@ -422,10 +435,10 @@ mod imp {
         ENGINE.set(engine).is_ok()
     }
 
-    /// 恢复原始 Dock 图标（动画线程异常退出时防“卡在中间帧”）。
+    /// 恢复系统初始图标（动画线程异常退出时防“卡在中间帧”）。
     pub(super) fn restore_base(app: &tauri::AppHandle) {
         if let Some(engine) = ENGINE.get() {
-            apply_dock_image(app, engine.base_png());
+            apply_dock_image(app, engine.original_png());
         }
     }
 }
