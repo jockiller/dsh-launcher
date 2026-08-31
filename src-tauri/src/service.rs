@@ -1,10 +1,15 @@
-#[cfg(unix)]
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[cfg(unix)]
+use std::sync::OnceLock;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -150,19 +155,43 @@ impl ServiceManager {
             &format!("Starting {}", dsh.display()),
         );
 
-        // 把 dsh 可执行文件所在目录（托管安装时还包括托管 Node 的 bin）前置进子进程
-        // PATH：不注入的话，启动后的服务器内部执行 `which dsh` 找不到启动器托管的 dsh。
-        let path_entries = crate::managed::service_path_entries(&dsh);
-        let mut envs = login_shell_environment();
-        prepend_service_path(&mut envs, &path_entries);
+        // 托管 DSH 需要把自己的入口与 Node 前置到 PATH，保证服务内部解析到同一运行时；
+        // 外部 DSH 只追加其目录，避免改变默认登录 Shell 中 nvm/pnpm 等工具的优先级。
+        let managed_dsh = crate::managed::is_managed_dsh(
+            &dsh,
+            (!config.managed_runtime_dir.trim().is_empty())
+                .then(|| Path::new(config.managed_runtime_dir.trim())),
+        );
+        let path_entries = crate::managed::service_path_entries(&dsh, managed_dsh);
+        let (mut envs, shell_env_loaded) = launcher_environment();
+        emit_environment_diagnostics(
+            &app,
+            "before service PATH adjustment",
+            &envs,
+            shell_env_loaded,
+        );
+        if managed_dsh {
+            prepend_service_path(&mut envs, &path_entries);
+        } else {
+            append_service_path(&mut envs, &path_entries);
+        }
         if !path_entries.is_empty() {
             emit_log(
                 &app,
                 "launcher",
                 "info",
-                &format!("Prepending to service PATH: {}", path_entries_display(&path_entries)),
+                &format!(
+                    "{} service PATH: {}",
+                    if managed_dsh {
+                        "Prepending to"
+                    } else {
+                        "Appending to"
+                    },
+                    path_entries_display(&path_entries)
+                ),
             );
         }
+        emit_environment_diagnostics(&app, "final service environment", &envs, shell_env_loaded);
 
         let mut command = Command::new(&dsh);
         // Windows GUI 宿主下启动控制台程序（node/dsh.cmd→cmd.exe）会闪现控制台窗口。
@@ -926,34 +955,164 @@ fn nvm_windows_version_dirs(nvm_root: &Path) -> Vec<PathBuf> {
     entries.into_iter().map(|entry| entry.path()).collect()
 }
 
-fn login_shell_environment() -> Vec<(String, String)> {
+/// 组装启动 DSH 子进程的环境：先继承 Launcher 环境，再用默认登录 Shell 中的工具链
+/// 变量覆盖 PATH、PNPM_HOME、nvm/volta 等。GUI 启动时通常没有读取用户 shell rc
+/// 文件；采集失败时仍保留当前环境，避免丢失 DSH_HOME、凭据等运行时变量。
+fn launcher_environment() -> (Vec<(OsString, OsString)>, bool) {
+    let base = std::env::vars_os().collect::<Vec<_>>();
+
     #[cfg(unix)]
     {
-        run_login_shell_capture(LOGIN_SHELL_ENV_SCRIPT, LOGIN_SHELL_TIMEOUT)
-            .map(|payload| parse_env_output(&payload))
-            .unwrap_or_default()
+        static SHELL_ENVIRONMENT: OnceLock<Option<Vec<(OsString, OsString)>>> = OnceLock::new();
+        let shell_env = SHELL_ENVIRONMENT.get_or_init(|| {
+            run_login_shell_capture(
+                LOGIN_SHELL_ENV_SCRIPT,
+                LOGIN_SHELL_FISH_ENV_SCRIPT,
+                LOGIN_SHELL_TIMEOUT,
+            )
+            .map(|payload| {
+                parse_env_output(&payload)
+                    .into_iter()
+                    .filter(|(key, _)| should_overlay_shell_environment_key(key))
+                    .collect()
+            })
+        });
+        let mut envs = base;
+        if let Some(shell_env) = shell_env {
+            merge_environment(&mut envs, shell_env.iter().cloned());
+            return (envs, true);
+        }
+        (envs, false)
     }
+
     #[cfg(not(unix))]
     {
-        Vec::new()
+        (base, false)
     }
 }
 
-/// 纯逻辑：把待前置的目录列表拼到 envs 中已有的 PATH 值前面（原值取自登录 Shell 环境，
-/// 缺失时回退当前进程 PATH）。PATH 大小写在 Windows 上不敏感，这里统一精确匹配 "PATH"：
-/// 登录 Shell 环境输出与当前进程变量在两端平台上均为这个名字。
-fn prepend_service_path(envs: &mut Vec<(String, String)>, entries: &[PathBuf]) {
+fn environment_key_eq(left: &OsStr, right: &OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+fn environment_value<'a>(envs: &'a [(OsString, OsString)], key: &str) -> Option<&'a OsString> {
+    let key = OsStr::new(key);
+    envs.iter()
+        .find(|(name, _)| environment_key_eq(name, key))
+        .map(|(_, value)| value)
+}
+
+#[cfg(unix)]
+fn should_overlay_shell_environment_key(key: &OsStr) -> bool {
+    matches!(
+        key.to_string_lossy().as_ref(),
+        "PATH"
+            | "MANPATH"
+            | "PNPM_HOME"
+            | "NVM_DIR"
+            | "NVM_BIN"
+            | "NVM_PATH"
+            | "VOLTA_HOME"
+            | "VOLTA_BIN"
+            | "ASDF_DIR"
+            | "ASDF_DATA_DIR"
+            | "MISE_DATA_DIR"
+            | "FNM_DIR"
+            | "FNM_MULTISHELL_PATH"
+    )
+}
+
+fn resolve_executable_from_path(envs: &[(OsString, OsString)], name: &str) -> Option<PathBuf> {
+    let path = environment_value(envs, "PATH")?;
+    let pathext = environment_value(envs, "PATHEXT")
+        .cloned()
+        .or_else(|| std::env::var_os("PATHEXT"));
+    std::env::split_paths(path).find_map(|dir| {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        for extension in pathext
+            .as_deref()
+            .unwrap_or(OsStr::new(".COM;.EXE;.BAT;.CMD"))
+            .to_string_lossy()
+            .split(';')
+        {
+            let candidate = dir.join(format!("{name}{extension}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = &pathext;
+        None
+    })
+}
+
+fn emit_environment_diagnostics(
+    app: &AppHandle,
+    stage: &str,
+    envs: &[(OsString, OsString)],
+    shell_env_loaded: bool,
+) {
+    let path = environment_value(envs, "PATH")
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<missing>".into());
+    let pnpm_home = environment_value(envs, "PNPM_HOME")
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<missing>".into());
+    let pnpm = resolve_executable_from_path(envs, "pnpm")
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<not found>".into());
+    emit_log(
+        app,
+        "launcher",
+        "info",
+        &format!(
+            "Environment diagnostics ({stage}): login shell loaded={shell_env_loaded}, PNPM_HOME={pnpm_home}, pnpm={pnpm}, PATH={path}"
+        ),
+    );
+}
+
+#[cfg(unix)]
+fn merge_environment(
+    base: &mut Vec<(OsString, OsString)>,
+    overlay: impl IntoIterator<Item = (OsString, OsString)>,
+) {
+    for (key, value) in overlay {
+        if let Some(existing) = base
+            .iter_mut()
+            .find(|(existing, _)| environment_key_eq(existing, &key))
+        {
+            existing.1 = value;
+        } else {
+            base.push((key, value));
+        }
+    }
+}
+
+/// 纯逻辑：把待前置的目录列表拼到 envs 中已有的 PATH 值前面（原值来自登录 Shell，
+/// launcher_environment 已保证失败时回退当前进程 PATH）。环境键比较遵循各平台语义，
+/// Windows 下兼容 PATH 的大小写变体。
+fn prepend_service_path(envs: &mut Vec<(OsString, OsString)>, entries: &[PathBuf]) {
     if entries.is_empty() {
         return;
     }
     let existing = envs
         .iter()
-        .find(|(key, _)| key == "PATH")
+        .find(|(key, _)| environment_key_eq(key, OsStr::new("PATH")))
         .map(|(_, value)| value.clone())
-        .or_else(|| {
-            std::env::var_os("PATH").map(|value| value.to_string_lossy().into_owned())
-        });
-    let mut parts: Vec<std::ffi::OsString> = entries
+        .or_else(|| std::env::var_os("PATH"));
+    let mut parts: Vec<OsString> = entries
         .iter()
         .map(|entry| entry.as_os_str().to_os_string())
         .collect();
@@ -961,7 +1120,7 @@ fn prepend_service_path(envs: &mut Vec<(String, String)>, entries: &[PathBuf]) {
         // 原始 PATH 是平台分隔符拼接的整串，必须先 split 再合入；
         // 直接把整串当条目交给 join_paths 会因含分隔符而失败，注入就永远不会生效。
         parts.extend(
-            std::env::split_paths(std::ffi::OsStr::new(&existing))
+            std::env::split_paths(&existing)
                 .filter(|part| !part.as_os_str().is_empty())
                 .map(|part| part.into_os_string()),
         );
@@ -971,10 +1130,42 @@ fn prepend_service_path(envs: &mut Vec<(String, String)>, entries: &[PathBuf]) {
         // 此时放弃注入，保持旧行为，绝不写坏 PATH。
         return;
     };
-    let joined = joined.to_string_lossy().into_owned();
-    match envs.iter_mut().find(|(key, _)| key == "PATH") {
+    match envs
+        .iter_mut()
+        .find(|(key, _)| environment_key_eq(key, OsStr::new("PATH")))
+    {
         Some(slot) => slot.1 = joined,
-        None => envs.push(("PATH".into(), joined)),
+        None => envs.push((OsString::from("PATH"), joined)),
+    }
+}
+
+fn append_service_path(envs: &mut Vec<(OsString, OsString)>, entries: &[PathBuf]) {
+    if entries.is_empty() {
+        return;
+    }
+    let existing = envs
+        .iter()
+        .find(|(key, _)| environment_key_eq(key, OsStr::new("PATH")))
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var_os("PATH"));
+    let mut parts = existing
+        .as_deref()
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.as_os_str().is_empty())
+        .map(|part| part.into_os_string())
+        .collect::<Vec<_>>();
+    parts.extend(entries.iter().map(|entry| entry.as_os_str().to_os_string()));
+    let Ok(joined) = std::env::join_paths(&parts) else {
+        return;
+    };
+    match envs
+        .iter_mut()
+        .find(|(key, _)| environment_key_eq(key, OsStr::new("PATH")))
+    {
+        Some(slot) => slot.1 = joined,
+        None => envs.push((OsString::from("PATH"), joined)),
     }
 }
 
@@ -1004,23 +1195,33 @@ const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(unix)]
 const LOGIN_SHELL_MARKER: &str = "__DSH_LAUNCHER_ENV__";
 
-/// 通过登录 Shell 采集完整环境变量：`env -0` 不可用时自动回退普通 `env`（换行分隔）。
-/// 脚本兼容 POSIX sh/bash/zsh；输出写入 "$1" 临时文件并配合 `umask 077`，避免管道背压导致卡死。
+/// 通过登录 Shell 采集完整环境变量：`env -0` 保留值中的换行；若系统 `env` 不支持 `-0`，
+/// 回退到普通换行分隔输出。POSIX 与 fish 使用各自的短脚本，避免把一种 Shell 的控制运算符
+/// 误传给另一种 Shell。
 #[cfg(unix)]
 const LOGIN_SHELL_ENV_SCRIPT: &str = concat!(
     "umask 077; ",
     "echo ",
     "__DSH_LAUNCHER_ENV__",
-    r#" > "$1"; "#,
-    r#"{ env -0 2>/dev/null || env; } >> "$1""#
+    r#" > "$DSH_LAUNCHER_ENV_FILE"; "#,
+    r#"env -0 >> "$DSH_LAUNCHER_ENV_FILE" 2>/dev/null || env >> "$DSH_LAUNCHER_ENV_FILE" 2>/dev/null"#
 );
 
-/// 通过登录 Shell 定位 dsh：`command -v` 是内建命令，sh/bash/zsh 均支持。
+#[cfg(unix)]
+const LOGIN_SHELL_FISH_ENV_SCRIPT: &str = concat!(
+    "umask 077; ",
+    "echo ",
+    "__DSH_LAUNCHER_ENV__",
+    r#" > "$DSH_LAUNCHER_ENV_FILE"; "#,
+    r#"env -0 >> "$DSH_LAUNCHER_ENV_FILE" 2>/dev/null; or env >> "$DSH_LAUNCHER_ENV_FILE" 2>/dev/null"#
+);
+
+/// 通过登录 Shell 定位 dsh：`command -v` 是内建命令，POSIX Shell 与 fish 均支持。
 #[cfg(unix)]
 const LOGIN_SHELL_DSH_SCRIPT: &str = concat!(
     "umask 077; ",
-    r#"{ echo "__DSH_LAUNCHER_ENV__""#,
-    r#"; command -v dsh; } > "$1" 2>/dev/null"#
+    r#"echo "__DSH_LAUNCHER_ENV__" > "$DSH_LAUNCHER_ENV_FILE"; "#,
+    r#"command -v dsh >> "$DSH_LAUNCHER_ENV_FILE" 2>/dev/null"#
 );
 
 /// 登录 Shell 启动参数：优先 `-li -c`（与原实现一致的登录+交互环境，zsh 需 -i 才能读到 .zshrc 中的 PATH 设置）；
@@ -1039,6 +1240,10 @@ const FALLBACK_LOGIN_SHELLS: &[&str] = &[
     "/opt/homebrew/bin/zsh",
     "/usr/local/bin/bash",
     "/opt/homebrew/bin/bash",
+    "/bin/fish",
+    "/usr/bin/fish",
+    "/usr/local/bin/fish",
+    "/opt/homebrew/bin/fish",
     "/bin/sh",
     "/usr/bin/sh",
 ];
@@ -1065,9 +1270,54 @@ fn login_shell_candidates(env_shell: Option<&str>, exists: &dyn Fn(&Path) -> boo
 
 #[cfg(unix)]
 fn available_login_shells() -> Vec<PathBuf> {
-    login_shell_candidates(std::env::var("SHELL").ok().as_deref(), &|path| {
-        path.is_file()
-    })
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(default_login_shell);
+    login_shell_candidates(shell.as_deref(), &|path| path.is_file())
+}
+
+#[cfg(unix)]
+fn default_login_shell() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let user = std::env::var("USER")
+            .ok()
+            .filter(|value| !value.trim().is_empty())?;
+        let record = Command::new("dscl")
+            .args([".", "-read", &format!("/Users/{user}"), "UserShell"])
+            .output()
+            .ok()?;
+        if !record.status.success() {
+            return None;
+        }
+        return String::from_utf8_lossy(&record.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("UserShell:").map(str::trim))
+            .filter(|shell| !shell.is_empty())
+            .map(str::to_string);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let user = std::env::var("USER")
+            .ok()
+            .filter(|value| !value.trim().is_empty())?;
+        let record = Command::new("getent")
+            .args(["passwd", &user])
+            .output()
+            .ok()?;
+        if !record.status.success() {
+            return None;
+        }
+        return String::from_utf8_lossy(&record.stdout)
+            .lines()
+            .next()
+            .and_then(|line| line.split(':').nth(6))
+            .map(str::trim)
+            .filter(|shell| !shell.is_empty())
+            .map(str::to_string);
+    }
 }
 
 /// 纯逻辑：按「Shell 优先、参数组其次」展开全部尝试组合。
@@ -1086,24 +1336,26 @@ fn login_shell_attempt_plan(shells: &[PathBuf]) -> Vec<(PathBuf, &'static [&'sta
 /// 纯逻辑：解析 `env` 输出。NUL 分隔（`env -0`）与换行分隔（回退）自动识别；
 /// 丢弃没有 `=` 或键为空的片段；值中的 `=` 与（NUL 模式下的）换行原样保留。
 #[cfg(unix)]
-fn parse_env_output(raw: &[u8]) -> Vec<(String, String)> {
+fn parse_env_output(raw: &[u8]) -> Vec<(OsString, OsString)> {
     let null_separated = raw.contains(&0);
     let separator = if null_separated { 0 } else { b'\n' };
     raw.split(|byte| *byte == separator)
         .filter(|entry| !entry.is_empty())
         .filter_map(|entry| {
-            let line = if null_separated {
-                String::from_utf8_lossy(entry).into_owned()
-            } else {
-                // 换行模式兼容 CRLF：仅去掉行尾的 \r。
-                let mut text = String::from_utf8_lossy(entry).into_owned();
-                while text.ends_with('\r') {
-                    text.pop();
+            let mut entry = entry.to_vec();
+            if !null_separated {
+                // 换行模式兼容 CRLF：仅去掉行尾的 `\\r`。
+                while entry.last() == Some(&b'\r') {
+                    entry.pop();
                 }
-                text
-            };
-            let (key, value) = line.split_once('=')?;
-            (!key.is_empty()).then(|| (key.to_string(), value.to_string()))
+            }
+            let position = entry.iter().position(|byte| *byte == b'=')?;
+            if position == 0 {
+                return None;
+            }
+            let key = OsString::from_vec(entry[..position].to_vec());
+            let value = OsString::from_vec(entry[position + 1..].to_vec());
+            Some((key, value))
         })
         .collect()
 }
@@ -1146,14 +1398,22 @@ enum SpawnOutcome {
 /// 标准库实现的限时执行：轮询 `try_wait`，超时先 `kill` 再 `wait` 回收。
 /// stdin/stdout/stderr 全部置空，杜绝管道写满导致的隐藏死锁；需要输出时由脚本写入临时文件。
 #[cfg(unix)]
-fn spawn_with_timeout(program: &Path, args: &[&OsStr], timeout: Duration) -> SpawnOutcome {
-    let Ok(mut child) = Command::new(program)
+fn spawn_with_timeout(
+    program: &Path,
+    args: &[&OsStr],
+    timeout: Duration,
+    environment: Option<&[(OsString, OsString)]>,
+) -> SpawnOutcome {
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
+        .stderr(Stdio::null());
+    if let Some(environment) = environment {
+        command.env_clear().envs(environment.iter().cloned());
+    }
+    let Ok(mut child) = command.spawn() else {
         return SpawnOutcome::NotRunnable;
     };
     let deadline = Instant::now() + timeout;
@@ -1180,16 +1440,94 @@ fn spawn_with_timeout(program: &Path, args: &[&OsStr], timeout: Duration) -> Spa
     }
 }
 
+#[cfg(unix)]
+fn login_shell_base_environment(shell: &Path, output_file: &Path) -> Vec<(OsString, OsString)> {
+    let mut environment = std::env::vars_os()
+        .filter(|(key, _)| !environment_key_eq(key, OsStr::new("PATH")))
+        .collect::<Vec<_>>();
+    set_environment_value(&mut environment, OsStr::new("SHELL"), shell.as_os_str());
+    set_environment_value(
+        &mut environment,
+        OsStr::new("DSH_LAUNCHER_ENV_FILE"),
+        output_file.as_os_str(),
+    );
+    set_environment_value(
+        &mut environment,
+        OsStr::new("PATH"),
+        default_login_shell_path().as_os_str(),
+    );
+    environment
+}
+
+#[cfg(unix)]
+fn default_login_shell_path() -> OsString {
+    let mut entries = vec![
+        PathBuf::from("/usr/local/sbin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/usr/sbin"),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/sbin"),
+        PathBuf::from("/bin"),
+    ];
+    #[cfg(target_os = "macos")]
+    {
+        entries.insert(0, PathBuf::from("/opt/homebrew/bin"));
+    }
+    std::env::join_paths(entries)
+        .unwrap_or_else(|_| OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"))
+}
+
+#[cfg(unix)]
+fn set_environment_value(environment: &mut Vec<(OsString, OsString)>, key: &OsStr, value: &OsStr) {
+    if let Some(existing) = environment.iter_mut().find(|(name, _)| name == key) {
+        existing.1 = value.to_os_string();
+    } else {
+        environment.push((key.to_os_string(), value.to_os_string()));
+    }
+}
+
 /// 依次用候选登录 Shell 执行脚本，把结果读回内存。使用临时文件承接输出（脚本内 `umask 077` 收紧权限），
 /// 读取后立即删除；所有尝试共享时间预算，超时就放弃采集（调用方回退到继承当前环境）。
+/// Shell 使用平台最小系统 PATH 启动，避免 GUI 继承的旧 PATH 污染 `.zprofile/.zshrc`，
+/// 同时保证 rc 文件在设置用户 PATH 前仍能调用 `uname`、`dirname` 等基础命令。
 #[cfg(unix)]
-fn run_login_shell_capture(script: &str, timeout: Duration) -> Option<Vec<u8>> {
+fn create_login_shell_capture_file() -> Option<(PathBuf, PathBuf)> {
     let stamp = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or_default();
-    let temp_file =
-        std::env::temp_dir().join(format!("dsh-launcher-{}-{stamp}", std::process::id()));
+    let temp_root = std::env::temp_dir();
+    for attempt in 0..16 {
+        let directory = temp_root.join(format!(
+            "dsh-launcher-{}-{stamp}-{attempt}",
+            std::process::id()
+        ));
+        if fs::create_dir(&directory).is_err() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700));
+        }
+        let file = directory.join("environment");
+        match OpenOptions::new().write(true).create_new(true).open(&file) {
+            Ok(_) => return Some((directory, file)),
+            Err(_) => {
+                let _ = fs::remove_dir_all(&directory);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn run_login_shell_capture(
+    posix_script: &str,
+    fish_script: &str,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    let (temp_directory, temp_file) = create_login_shell_capture_file()?;
     let deadline = Instant::now() + timeout;
     let mut payload: Option<Vec<u8>> = None;
     for (shell, argset) in login_shell_attempt_plan(&available_login_shells()) {
@@ -1197,12 +1535,17 @@ fn run_login_shell_capture(script: &str, timeout: Duration) -> Option<Vec<u8>> {
         if remaining.is_zero() {
             break;
         }
+        let shell_environment = login_shell_base_environment(&shell, &temp_file);
+        let script = if shell.file_name().is_some_and(|name| name == "fish") {
+            fish_script
+        } else {
+            posix_script
+        };
         let mut argv: Vec<&OsStr> = argset.iter().map(OsStr::new).collect();
         argv.push(OsStr::new(script));
         argv.push(OsStr::new("dsh-launcher"));
-        argv.push(temp_file.as_os_str());
         if let SpawnOutcome::Completed { success: true } =
-            spawn_with_timeout(&shell, &argv, remaining)
+            spawn_with_timeout(&shell, &argv, remaining, Some(&shell_environment))
             && let Ok(content) = fs::read(&temp_file)
             && let Some(after_marker) = extract_after_marker(&content, LOGIN_SHELL_MARKER)
         {
@@ -1211,14 +1554,18 @@ fn run_login_shell_capture(script: &str, timeout: Duration) -> Option<Vec<u8>> {
             break;
         }
     }
-    let _ = fs::remove_file(&temp_file);
+    let _ = fs::remove_dir_all(&temp_directory);
     payload
 }
 
 fn find_via_login_shell() -> Option<PathBuf> {
     #[cfg(unix)]
     {
-        let payload = run_login_shell_capture(LOGIN_SHELL_DSH_SCRIPT, LOGIN_SHELL_TIMEOUT)?;
+        let payload = run_login_shell_capture(
+            LOGIN_SHELL_DSH_SCRIPT,
+            LOGIN_SHELL_DSH_SCRIPT,
+            LOGIN_SHELL_TIMEOUT,
+        )?;
         let line = first_non_empty_line(&payload)?;
         let path = PathBuf::from(line);
         is_executable_dsh(&path).then_some(path)
@@ -1288,13 +1635,13 @@ fn is_executable_dsh(path: &Path) -> bool {
 /// 安全转义的参数直接报 InvalidInput 而非注入；因此这里保持逐参数传递、不拼接命令行即可
 /// 避免 cmd 注入。CREATE_NO_WINDOW 防止 GUI 宿主下闪现控制台窗口。
 ///
-/// 版本探测与正式启动使用同一登录 Shell 环境，避免 nvm/volta 等在 rc 文件中追加的 PATH
-/// 只对启动生效、探测时却找不到 node 的问题。成功时同时从 stdout 与 stderr 提取语义化
-/// 版本；提取不到时给出明确错误（附带输出片段便于排查）。
+/// 版本探测继承当前进程环境，避免每次 bootstrap/detect/validate 都启动登录 Shell。
+/// 成功时同时从 stdout 与 stderr 提取语义化版本；提取不到时给出明确错误
+/// （附带输出片段便于排查）。
 pub fn dsh_version(path: &Path) -> Result<String, String> {
     let mut command = Command::new(path);
-    // Windows 下该函数返回空列表，等价于继承当前环境。
-    command.envs(login_shell_environment());
+    // 版本探测不需要启动登录 Shell；正式服务启动时才采集用户 Shell 环境，
+    // 避免每次 bootstrap/detect/validate 都重复执行可能耗时的 rc 文件。
     suppress_console_window(&mut command);
     let mut child = command
         .arg("--version")
@@ -1785,7 +2132,7 @@ fn open_default_unix(url: &str) -> Result<(), String> {
         let mut argv: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
         argv.push(OsStr::new(url));
         let (outcome, detail) =
-            match spawn_with_timeout(Path::new(program), &argv, OPEN_URL_TIMEOUT) {
+            match spawn_with_timeout(Path::new(program), &argv, OPEN_URL_TIMEOUT, None) {
                 SpawnOutcome::Completed { success: true } => (OpenerOutcome::Opened, String::new()),
                 SpawnOutcome::Completed { success: false } => {
                     (OpenerOutcome::Failed, "退出码非零".to_string())
@@ -1952,22 +2299,22 @@ mod tests {
         let raw = b"A=1\0PATH=/usr/bin:/bin\0EMPTY=\0BROKEN\0=NO_KEY\0";
         let entries = parse_env_output(raw);
         assert_eq!(entries.len(), 3, "无键或缺失 = 的片段应被丢弃");
-        assert_eq!(entries[0], ("A".to_string(), "1".to_string()));
+        assert_eq!(entries[0], (OsString::from("A"), OsString::from("1")));
         assert_eq!(
             entries[1],
-            ("PATH".to_string(), "/usr/bin:/bin".to_string())
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin"))
         );
-        assert_eq!(entries[2], ("EMPTY".to_string(), String::new()));
+        assert_eq!(entries[2], (OsString::from("EMPTY"), OsString::new()));
     }
 
     #[cfg(unix)]
     #[test]
     fn env_output_keeps_equals_and_newlines_in_nul_mode() {
         let entries = parse_env_output(b"PATH=/a=b\0MULTI=line1\nline2\0");
-        assert_eq!(entries[0], ("PATH".to_string(), "/a=b".to_string()));
+        assert_eq!(entries[0], (OsString::from("PATH"), OsString::from("/a=b")));
         assert_eq!(
             entries[1],
-            ("MULTI".to_string(), "line1\nline2".to_string())
+            (OsString::from("MULTI"), OsString::from("line1\nline2"))
         );
     }
 
@@ -1978,9 +2325,9 @@ mod tests {
         assert_eq!(
             entries,
             vec![
-                ("A".to_string(), "1".to_string()),
-                ("PATH".to_string(), "/bin".to_string()),
-                ("C".to_string(), "3".to_string()),
+                (OsString::from("A"), OsString::from("1")),
+                (OsString::from("PATH"), OsString::from("/bin")),
+                (OsString::from("C"), OsString::from("3")),
             ]
         );
     }
@@ -1989,6 +2336,91 @@ mod tests {
     #[test]
     fn env_output_empty_input_yields_no_entries() {
         assert!(parse_env_output(b"").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_shell_environment_keeps_user_variables_and_uses_default_path() {
+        let original = std::env::vars_os().collect::<Vec<_>>();
+        let environment = login_shell_base_environment(
+            Path::new("/bin/sh"),
+            Path::new("/tmp/dsh-launcher-test-env"),
+        );
+        for (key, value) in original {
+            if !environment_key_eq(&key, OsStr::new("PATH"))
+                && !environment_key_eq(&key, OsStr::new("SHELL"))
+                && !environment_key_eq(&key, OsStr::new("DSH_LAUNCHER_ENV_FILE"))
+            {
+                assert_eq!(
+                    environment_value(&environment, &key.to_string_lossy()),
+                    Some(&value)
+                );
+            }
+        }
+        assert_eq!(
+            environment_value(&environment, "SHELL"),
+            Some(&OsString::from("/bin/sh"))
+        );
+        assert_eq!(
+            environment_value(&environment, "DSH_LAUNCHER_ENV_FILE"),
+            Some(&OsString::from("/tmp/dsh-launcher-test-env"))
+        );
+        assert_eq!(
+            environment_value(&environment, "PATH"),
+            Some(&default_login_shell_path())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlay_keys_cover_toolchain_not_launcher_secrets() {
+        assert!(should_overlay_shell_environment_key(OsStr::new("PATH")));
+        assert!(should_overlay_shell_environment_key(OsStr::new(
+            "PNPM_HOME"
+        )));
+        assert!(should_overlay_shell_environment_key(OsStr::new("NVM_DIR")));
+        assert!(!should_overlay_shell_environment_key(OsStr::new("HOME")));
+        assert!(!should_overlay_shell_environment_key(OsStr::new(
+            "DSH_HOME"
+        )));
+        assert!(!should_overlay_shell_environment_key(OsStr::new(
+            "DSH_LAUNCHER_ENV_FILE"
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_environment_overlays_base_without_dropping_launcher_variables() {
+        let mut base = vec![
+            (OsString::from("PATH"), OsString::from("/gui/bin")),
+            (OsString::from("DSH_HOME"), OsString::from("/dsh")),
+            (OsString::from("LAUNCHER_ONLY"), OsString::from("kept")),
+        ];
+        merge_environment(
+            &mut base,
+            vec![
+                (OsString::from("PATH"), OsString::from("/shell/bin")),
+                (OsString::from("SHELL_ONLY"), OsString::from("added")),
+            ],
+        );
+        assert_eq!(
+            base,
+            vec![
+                (OsString::from("PATH"), OsString::from("/shell/bin")),
+                (OsString::from("DSH_HOME"), OsString::from("/dsh")),
+                (OsString::from("LAUNCHER_ONLY"), OsString::from("kept")),
+                (OsString::from("SHELL_ONLY"), OsString::from("added")),
+            ]
+        );
+    }
+
+    #[test]
+    fn environment_key_matching_follows_platform_case_rules() {
+        assert!(environment_key_eq(OsStr::new("PATH"), OsStr::new("PATH")));
+        #[cfg(windows)]
+        assert!(environment_key_eq(OsStr::new("Path"), OsStr::new("PATH")));
+        #[cfg(not(windows))]
+        assert!(!environment_key_eq(OsStr::new("Path"), OsStr::new("PATH")));
     }
 
     // ---------- 标记与输出提取 ----------

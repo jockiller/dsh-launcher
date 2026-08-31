@@ -18,7 +18,8 @@ const NODE_INDEX_URL: &str = "https://nodejs.org/dist/index.json";
 const NODE_MIRROR_INDEX_URL: &str = "https://npmmirror.com/mirrors/node/index.json";
 const NPM_LATEST_URL: &str = "https://registry.npmjs.org/@deepseek-ai%2Fdsh/latest";
 const NPM_MIRROR_LATEST_URL: &str = "https://registry.npmmirror.com/@deepseek-ai%2Fdsh/latest";
-const DSH_RELEASE_API_URL: &str = "https://api.github.com/repos/deepseek-ai/deepseek-harness/releases/tags/";
+const DSH_RELEASE_API_URL: &str =
+    "https://api.github.com/repos/deepseek-ai/deepseek-harness/releases/tags/";
 const MANAGED_SCHEMA: u8 = 1;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
@@ -835,11 +836,7 @@ fn runtime_dir(root: &Path) -> PathBuf {
 
 /// 托管 DSH 可执行入口：安装根目录下名为 `dsh` 的包装脚本（Windows 需 .cmd 后缀供 cmd 解析）。
 fn managed_dsh_path(root: &Path) -> PathBuf {
-    root.join(if cfg!(windows) {
-        "dsh.cmd"
-    } else {
-        "dsh"
-    })
+    root.join(if cfg!(windows) { "dsh.cmd" } else { "dsh" })
 }
 
 /// 旧版布局的包装脚本名（dsh-managed / dsh-managed.cmd），迁移时改写为兼容转发脚本。
@@ -872,8 +869,7 @@ pub fn migrate_layout(root: &Path) -> Result<PathBuf, String> {
                 runtime.display()
             ));
         }
-        fs::rename(&legacy_prefix, &runtime)
-            .map_err(|e| format!("迁移托管目录布局失败：{e}"))?;
+        fs::rename(&legacy_prefix, &runtime).map_err(|e| format!("迁移托管目录布局失败：{e}"))?;
         renamed = true;
     }
     // 入口创建必须先于任何收尾动作：创建失败时回滚 rename，保证迁移要么完成、
@@ -898,16 +894,40 @@ pub fn migrate_layout(root: &Path) -> Result<PathBuf, String> {
 
 /// 启动服务进程时需要前置进子进程 PATH 的目录：托管安装下是安装根目录（内有名为
 /// dsh 的入口）与托管 Node 的 bin 目录，保证服务内部 `which dsh` / `node` 可解析；
-/// 外部 dsh 仅前置其所在目录（多半已在 PATH 中，重复前置无害）。
-pub fn service_path_entries(dsh: &Path) -> Vec<PathBuf> {
+/// 外部 dsh 仅追加其所在目录（多半已在 PATH 中，重复追加无害）。
+pub fn service_path_entries(dsh: &Path, managed: bool) -> Vec<PathBuf> {
     let Some(parent) = dsh.parent() else {
         return Vec::new();
     };
     let mut entries = vec![parent.to_path_buf()];
-    if parent.join(MARKER_NAME).is_file() {
+    if managed {
         entries.push(node_bin_dir(&parent.join("node")));
     }
     entries
+}
+
+/// 只有规范托管入口、有效标记和完整 Node/DSH runtime 同时存在时，才按托管环境处理。
+/// 可选 root 来自 Launcher 配置，用于阻止 marker 目录中的其他 dsh 被误分类。
+pub fn is_managed_dsh(dsh: &Path, configured_root: Option<&Path>) -> bool {
+    let Some(root) = dsh.parent() else {
+        return false;
+    };
+    if configured_root.is_some_and(|configured| canonical_path(configured) != canonical_path(root))
+    {
+        return false;
+    }
+    if canonical_path(dsh) != canonical_path(&managed_dsh_path(root))
+        || read_marker(root).is_err()
+        || !node_executable(&root.join("node")).is_file()
+        || !dsh_entry(&runtime_dir(root)).is_file()
+    {
+        return false;
+    }
+    true
+}
+
+fn canonical_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 fn node_executable(node_root: &Path) -> PathBuf {
     node_root.join(if cfg!(windows) {
@@ -1059,6 +1079,59 @@ mod tests {
             std::env::split_paths(&joined).collect::<Vec<PathBuf>>(),
             vec![node_bin_dir(node_root)]
         );
+    }
+
+    #[test]
+    fn managed_dsh_requires_canonical_entry_and_runtime() {
+        let root =
+            std::env::temp_dir().join(format!("dsh-launcher-managed-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let wrapper = managed_dsh_path(&root);
+        fs::write(&wrapper, "echo").unwrap();
+        assert!(
+            !is_managed_dsh(&wrapper, None),
+            "仅有入口文件不足以判定托管环境"
+        );
+
+        write_marker(
+            &root,
+            &Marker {
+                schema: MANAGED_SCHEMA,
+                node_version: "22.0.0".into(),
+                dsh_version: "0.1.0".into(),
+                use_mirror: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            !is_managed_dsh(&wrapper, None),
+            "缺少 Node 与 runtime 时拒绝"
+        );
+
+        let node = node_executable(&root.join("node"));
+        fs::create_dir_all(node.parent().unwrap()).unwrap();
+        fs::write(&node, "node").unwrap();
+        assert!(!is_managed_dsh(&wrapper, None), "缺少 DSH runtime 时拒绝");
+
+        let entry = dsh_entry(&runtime_dir(&root));
+        fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        fs::write(&entry, "dsh").unwrap();
+        assert!(is_managed_dsh(&wrapper, None));
+        assert!(is_managed_dsh(&wrapper, Some(&root)));
+        assert!(!is_managed_dsh(&wrapper, Some(&root.join("other"))));
+
+        let other = root.join(if cfg!(windows) {
+            "other-dsh.cmd"
+        } else {
+            "other-dsh"
+        });
+        fs::write(&other, "echo").unwrap();
+        assert!(
+            !is_managed_dsh(&other, Some(&root)),
+            "同一目录中的非规范入口不能被当成托管 DSH"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
