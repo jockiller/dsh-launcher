@@ -18,14 +18,15 @@
 #[cfg(target_os = "macos")]
 const FRAME_PERIOD: std::time::Duration = std::time::Duration::from_millis(30);
 /// 半个周期（绿→红 或 红→绿）的渐变步数；完整周期共 2 × GRADIENT_STEPS 帧。
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const GRADIENT_STEPS: usize = 24;
 /// Dock 图标工作分辨率上限（短边）。Dock 实际显示 ≤ 128pt，256px 足够清晰，
 /// 相比原始 512px 把像素处理量降低 4 倍。
-#[cfg(any(target_os = "macos", test))]
+#[allow(dead_code)]
 const WORK_SIZE_LIMIT: usize = 256;
 
 /// 打包图标的原始 PNG 字节（运行时解码一次）。
+#[allow(dead_code)]
 const ICON_PNG: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/icons/icon.png"));
 
 /// 会话监视报告的「是否存在运行中会话」。
@@ -72,6 +73,7 @@ pub(crate) fn init(app: tauri::AppHandle) {
 }
 
 /// 渐变引擎：常驻降采样 base 像素与按钮掩码，按需即时生成单帧 PNG。
+#[allow(dead_code)]
 struct Engine {
     /// 工作分辨率（正方形边长）。
     size: usize,
@@ -81,6 +83,7 @@ struct Engine {
     indices: Vec<usize>,
 }
 
+#[allow(dead_code)]
 impl Engine {
     /// 解码打包图标 → 降采样到工作分辨率 → 定位按钮掩码；失败返回 None。
     fn load() -> Option<Self> {
@@ -100,6 +103,7 @@ impl Engine {
     }
 
     /// 生成第 `phase`（0..1，0=原始绿，1=完全红）帧的 PNG 字节。
+    #[allow(dead_code)]
     fn frame_png(&self, phase: f64) -> Vec<u8> {
         let mut rgba = self.base_rgba.clone();
         recolor(&mut rgba, &self.indices, phase);
@@ -116,11 +120,13 @@ impl Engine {
 ///
 /// 纯正弦连续脉动，无停留段——经典呼吸灯观感：余弦在两端（绿/红）自然放慢、
 /// 中段（黄）变化最快，过渡柔和连贯。
+#[allow(dead_code)]
 fn phase_for(t: f64) -> f64 {
     (1.0 - (2.0 * std::f64::consts::PI * t.fract()).cos()) / 2.0
 }
 
 /// 2×2 块降采样（RGB 按 alpha 加权平均，避免透明像素把边缘拖出暗色）。
+#[allow(dead_code)]
 fn downsample_half(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
     let (out_w, out_h) = (width / 2, height / 2);
     let mut out = vec![0_u8; out_w * out_h * 4];
@@ -151,6 +157,7 @@ fn downsample_half(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
 }
 
 /// 识别右下象限内绿色主导的电源按钮圆盘像素（返回像素索引列表）。
+#[allow(dead_code)]
 ///
 /// 掩码规则：不透明或半透明、g 通道显著高于 r/b 的像素；找不到时回退到
 /// 几何默认位置（0.73 边长处半径 0.12）的圆盘，保证指示仍可见。
@@ -188,6 +195,7 @@ fn locate_button(rgba: &[u8], width: usize, height: usize) -> Vec<usize> {
 }
 
 /// 把按钮圆盘像素重着色为「绿 → 红」渐变的第 `phase`（0..1）帧。
+#[allow(dead_code)]
 ///
 /// 颜色插值在 HSL 色相轴上进行：按钮绿 ≈ 134°，红色 = 0°；
 /// phase=0 不动，phase=1 完全转红；饱和度保持、亮度轻微下降（红更沉稳）。
@@ -210,6 +218,7 @@ fn recolor(rgba: &mut [u8], indices: &[usize], phase: f64) {
 }
 
 /// RGB(0..255) → HSL（h: 0..360）。
+#[allow(dead_code)]
 fn rgb_to_hsl(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
     let (r, g, b) = (r / 255.0, g / 255.0, b / 255.0);
     let max = r.max(g).max(b);
@@ -231,6 +240,7 @@ fn rgb_to_hsl(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
 }
 
 /// HSL → RGB(0..255 取整)。
+#[allow(dead_code)]
 fn hsl_to_rgb(hue: f64, saturation: f64, lightness: f64) -> (u8, u8, u8) {
     if saturation.abs() < f64::EPSILON {
         let value = (lightness * 255.0).round().clamp(0.0, 255.0) as u8;
@@ -260,6 +270,7 @@ fn hsl_to_rgb(hue: f64, saturation: f64, lightness: f64) -> (u8, u8, u8) {
 
 /// 最小 PNG 编码（RGBA8、filter 0、zlib 流），供 Dock 图标帧使用。
 /// flate2 已在依赖中，无需额外引入图像编码器。
+#[allow(dead_code)]
 fn encode_png(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
     use std::io::Write as _;
 
