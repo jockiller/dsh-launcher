@@ -276,7 +276,7 @@ impl ServiceManager {
 
         let pid = external_listener_pid(config.port)?;
         let command_line = external_process_command(pid)?;
-        if !looks_like_dsh_process(&command_line, config.port, &config.profile) {
+        if !looks_like_dsh_process(&command_line) {
             return Err(format!(
                 "端口 {} 的监听进程未通过 DSH 身份校验，已拒绝终止",
                 config.port
@@ -691,38 +691,17 @@ fn external_process_command(_pid: u32) -> Result<String, String> {
     Err("当前平台不支持读取外部进程信息".into())
 }
 
-fn argument_value<'a>(args: &'a [&'a str], name: &str) -> Option<&'a str> {
-    args.windows(2)
-        .find_map(|pair| (pair[0] == name).then_some(pair[1]))
-        .or_else(|| {
-            let prefix = format!("{name}=");
-            args.iter().find_map(|arg| arg.strip_prefix(&prefix))
-        })
-}
-
-fn looks_like_dsh_process(command_line: &str, port: u16, profile: &str) -> bool {
+fn looks_like_dsh_process(command_line: &str) -> bool {
     let lower = command_line.to_ascii_lowercase().replace('\\', "/");
-    let has_dsh_identity = lower.split_whitespace().any(|token| {
+    lower.split_whitespace().any(|token| {
         let token = token.trim_matches(['\'', '"']);
         token == "dsh"
             || token.ends_with("/dsh")
             || token.ends_with("/dsh.cmd")
+            || token.ends_with("/dsh.ps1")
             || token.contains("/@deepseek-ai/dsh/")
             || token.contains("/deepseek-harness/")
-    });
-    if !has_dsh_identity {
-        return false;
-    }
-
-    let parsed = shell_words::split(command_line).unwrap_or_else(|_| {
-        command_line
-            .split_whitespace()
-            .map(ToOwned::to_owned)
-            .collect()
-    });
-    let args = parsed.iter().map(String::as_str).collect::<Vec<_>>();
-    argument_value(&args, "--port").and_then(|value| value.parse::<u16>().ok()) == Some(port)
-        && argument_value(&args, "--profile") == Some(profile.trim())
+    })
 }
 
 fn external_process_still_matches(pid: u32, port: u16, expected_command: &str) -> bool {
