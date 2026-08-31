@@ -13,17 +13,18 @@
 //! 定位与 session_monitor 相同：纯外挂观察者，独立线程，所有失败最多产出一条
 //! 日志后静默退出；非 macOS 平台为 no-op，任何情况下不影响现有功能。
 
-/// 渐变帧的停留时长；帧间隔越短越接近连续动画。
-/// 48 帧 × 30ms ≈ 1.4s 完成一个绿→红→绿周期。
+/// 闪烁帧的停留时长。红绿两态各停留 300ms ≈ 0.6s 一个切换周期，
+/// 即“工作状态闪烁”节奏。
 #[cfg(target_os = "macos")]
-const FRAME_PERIOD: std::time::Duration = std::time::Duration::from_millis(30);
-/// 半个周期（绿→红 或 红→绿）的渐变步数；完整周期共 2 × GRADIENT_STEPS 帧。
-#[cfg(target_os = "macos")]
-const GRADIENT_STEPS: usize = 24;
+const FRAME_PERIOD: std::time::Duration = std::time::Duration::from_millis(300);
 /// Dock 图标工作分辨率上限（短边）。Dock 实际显示 ≤ 128pt，256px 足够清晰，
 /// 相比原始 512px 把像素处理量降低 4 倍。
 #[allow(dead_code)]
 const WORK_SIZE_LIMIT: usize = 256;
+/// 图标内容占画布的比例。Apple 图标栅格要求方形容器约 824/1024 ≈ 0.80，
+/// 系统渲染的图标都遵循这一留白；直接铺满会显得大一圈。
+#[allow(dead_code)]
+const CONTENT_SCALE: f64 = 0.80;
 
 /// 打包图标的原始 PNG 字节（运行时解码一次）。
 #[allow(dead_code)]
@@ -98,6 +99,8 @@ impl Engine {
         if width == 0 || rgba.len() < width * height * 4 {
             return None;
         }
+        // 按系统图标栅格补足留白：直接铺满的 artwork 会比邻居图标大一圈。
+        rgba = embed_scaled(&rgba, width, CONTENT_SCALE);
         let indices = locate_button(&rgba, width, height);
         Some(Engine { size: width, base_rgba: rgba, indices })
     }
@@ -116,13 +119,49 @@ impl Engine {
     }
 }
 
-/// 呼吸相位曲线：周期参数 `t`（0..1，fract 归一）→ 渐变相位（0=绿，1=红）。
-///
-/// 纯正弦连续脉动，无停留段——经典呼吸灯观感：余弦在两端（绿/红）自然放慢、
-/// 中段（黄）变化最快，过渡柔和连贯。
-#[allow(dead_code)]
-fn phase_for(t: f64) -> f64 {
-    (1.0 - (2.0 * std::f64::consts::PI * t.fract()).cos()) / 2.0
+/// 把正方形图像（内容铺满）按 `ratio` 等比缩小后居中置入同尺寸画布。
+/// 用于给 artwork 补充系统图标栅格的标准留白；双线性采样避免缩放锯齿。
+fn embed_scaled(rgba: &[u8], size: usize, ratio: f64) -> Vec<u8> {
+    let content = ((size as f64 * ratio).round() as usize).clamp(1, size);
+    if content >= size {
+        return rgba.to_vec();
+    }
+    let scaled = resize_bilinear(rgba, size, size, content, content);
+    let offset = (size - content) / 2;
+    let mut out = vec![0_u8; size * size * 4];
+    for y in 0..content {
+        let dst = ((y + offset) * size + offset) * 4;
+        out[dst..dst + content * 4].copy_from_slice(&scaled[y * content * 4..(y + 1) * content * 4]);
+    }
+    out
+}
+
+/// 双线性缩放 RGBA 图像（含 alpha）。
+fn resize_bilinear(rgba: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
+    let mut out = vec![0_u8; dw * dh * 4];
+    for y in 0..dh {
+        let gy = (y as f64 + 0.5) * sh as f64 / dh as f64 - 0.5;
+        let y0 = gy.floor().max(0.0) as usize;
+        let y1 = (y0 + 1).min(sh - 1);
+        let fy = (gy - y0 as f64).clamp(0.0, 1.0);
+        for x in 0..dw {
+            let gx = (x as f64 + 0.5) * sw as f64 / dw as f64 - 0.5;
+            let x0 = gx.floor().max(0.0) as usize;
+            let x1 = (x0 + 1).min(sw - 1);
+            let fx = (gx - x0 as f64).clamp(0.0, 1.0);
+            for c in 0..4 {
+                let p00 = rgba[(y0 * sw + x0) * 4 + c] as f64;
+                let p10 = rgba[(y0 * sw + x1) * 4 + c] as f64;
+                let p01 = rgba[(y1 * sw + x0) * 4 + c] as f64;
+                let p11 = rgba[(y1 * sw + x1) * 4 + c] as f64;
+                let top = p00 * (1.0 - fx) + p10 * fx;
+                let bottom = p01 * (1.0 - fx) + p11 * fx;
+                out[(y * dw + x) * 4 + c] =
+                    (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
 }
 
 /// 2×2 块降采样（RGB 按 alpha 加权平均，避免透明像素把边缘拖出暗色）。
@@ -321,11 +360,11 @@ mod imp {
     use std::sync::atomic::Ordering;
     use std::thread;
 
-    use super::{phase_for, Engine, FRAME_PERIOD, RUNNING};
+    use super::{Engine, FRAME_PERIOD, RUNNING};
 
     static ENGINE: OnceLock<Engine> = OnceLock::new();
 
-    /// 有运行会话时循环播放渐变帧；无会话时恢复原始图标（只恢复一次）。
+    /// 有运行会话时循环播放闪烁帧；无会话时恢复原始图标（只恢复一次）。
     pub(super) fn cycle_loop(app: tauri::AppHandle) {
         #[derive(PartialEq)]
         enum Shown {
@@ -333,20 +372,26 @@ mod imp {
             Animated,
         }
         let Some(engine) = ENGINE.get() else { return };
-        let total_frames = 2 * super::GRADIENT_STEPS;
+        // TODO(临时测试)：忽略会话状态，启动即闪烁；确认后改回 false。—— 已确认，恢复正常联动
+        const FORCE_BLINK: bool = false;
+        // 工作状态闪烁：绿色（空闲底色）与红色（工作色）两态直接交替，
+        // 无中间渐变帧——语义为“工作指示灯在闪烁”。
+        let green = engine.frame_png(0.0);
+        let red = engine.frame_png(1.0);
         let mut shown = Shown::Original;
-        let mut step = 0usize;
+        let mut red_active = false;
         loop {
             thread::sleep(FRAME_PERIOD);
-            if RUNNING.load(Ordering::Acquire) {
-                // 正弦呼吸相位：绿 ↔ 红 连续柔换（见 phase_for 文档）。
-                let phase = phase_for(step as f64 / total_frames as f64);
-                apply_dock_image(&app, engine.frame_png(phase));
+            if FORCE_BLINK || RUNNING.load(Ordering::Acquire) {
+                let png = if red_active { &red } else { &green };
+                apply_dock_image(&app, png.clone());
+                red_active = !red_active;
                 shown = Shown::Animated;
-                step = (step + 1) % total_frames;
             } else if shown == Shown::Animated {
                 // 恢复原始图标。
-                apply_dock_image(&app, engine.base_png());
+                if red_active {
+                    apply_dock_image(&app, green.clone());
+                }
                 shown = Shown::Original;
             }
         }
@@ -515,48 +560,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn phase_for_hits_extremes_and_breathes() {
-        // 端点：绿 → 红 → 闭合回绿。
-        assert_eq!(phase_for(0.0), 0.0);
-        assert_eq!(phase_for(0.5), 1.0);
-        assert_eq!(phase_for(1.0), 0.0, "fract 后闭合回绿");
-        // 正弦呼吸：无停留段，两端附近相位接近极值但不完全持平。
-        let near_green = phase_for(0.05);
-        assert!(near_green > 0.0 && near_green < 0.2, "两端应缓慢离开极值（{near_green}）");
-        let near_red = phase_for(0.45);
-        assert!(near_red > 0.8 && near_red < 1.0, "红端附近应缓慢接近极值（{near_red}）");
-        // 半程是中点颜色（浮点误差容忍）。
-        assert!((phase_for(0.25) - 0.5).abs() < 1e-9);
-    }
 
-    #[test]
-    fn phase_for_is_contiguous_sine() {
-        // 前半程单调递增、后半程单调递减，最大值出现在 0.5。
-        let steps = 48;
-        let mut previous = 0.0_f64;
-        for i in 1..=steps {
-            let t = i as f64 / steps as f64;
-            let phase = phase_for(t);
-            assert!((0.0..=1.0).contains(&phase));
-            if (t - 0.5).abs() < f64::EPSILON {
-                previous = phase;
-                continue;
-            }
-            if t < 0.5 {
-                assert!(phase > previous, "前半程应递增（t={t}）");
-            } else {
-                assert!(phase < previous, "后半程应递减（t={t}）");
-            }
-            previous = phase;
-        }
-        assert_eq!(previous, 0.0, "周期结束应回到绿");
-    }
 
+
+    /// 临时诊断：输出补留白后的红帧 PNG。
+    /// `cargo test --lib dump_padded -- --ignored --nocapture`
     #[test]
-    fn phase_for_survives_out_of_range_input() {
-        // 超出 0..1 的输入按 fract 归一，不 panic、不发散。
-        assert!((phase_for(2.5) - phase_for(0.5)).abs() < 1e-9);
-        assert!((phase_for(-0.25) - phase_for(0.75)).abs() < 1e-9);
+    #[ignore]
+    fn dump_padded() {
+        let Some(engine) = Engine::load() else { panic!("解码失败") };
+        std::fs::write("/tmp/dsh-dock-padded-red.png", engine.frame_png(1.0)).unwrap();
+        println!("written /tmp/dsh-dock-padded-red.png ({} 字节)", engine.indices.len());
     }
 }
