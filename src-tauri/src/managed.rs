@@ -18,6 +18,7 @@ const NODE_INDEX_URL: &str = "https://nodejs.org/dist/index.json";
 const NODE_MIRROR_INDEX_URL: &str = "https://npmmirror.com/mirrors/node/index.json";
 const NPM_LATEST_URL: &str = "https://registry.npmjs.org/@deepseek-ai%2Fdsh/latest";
 const NPM_MIRROR_LATEST_URL: &str = "https://registry.npmmirror.com/@deepseek-ai%2Fdsh/latest";
+const DSH_RELEASE_API_URL: &str = "https://api.github.com/repos/deepseek-ai/deepseek-harness/releases/tags/";
 const MANAGED_SCHEMA: u8 = 1;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
@@ -66,6 +67,18 @@ struct NodeRelease {
 #[derive(Debug, Deserialize)]
 struct NpmLatest {
     version: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalDshUpdate {
+    pub latest_version: String,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseNotes {
+    body: Option<String>,
 }
 
 struct OperationGuard;
@@ -264,6 +277,20 @@ pub fn check_latest_dsh(root: Option<&str>) -> Result<String, String> {
     fetch_latest_dsh(marker_mirror(root))
 }
 
+/// 检测外部 DSH 是否有新版本。网络请求和版本比较均在调用方的阻塞线程中执行；
+/// 只有严格高于当前版本时才返回更新信息，更新说明获取失败不会影响升级提示。
+pub fn check_external_dsh_update(current_version: &str) -> Option<ExternalDshUpdate> {
+    let current = semver::Version::parse(current_version.trim()).ok()?;
+    let latest = semver::Version::parse(fetch_latest_dsh(false).ok()?.trim()).ok()?;
+    if latest <= current {
+        return None;
+    }
+    Some(ExternalDshUpdate {
+        latest_version: latest.to_string(),
+        notes: fetch_release_notes(&latest.to_string()),
+    })
+}
+
 fn fetch_latest_dsh(use_mirror: bool) -> Result<String, String> {
     let url = if use_mirror {
         NPM_MIRROR_LATEST_URL
@@ -276,6 +303,25 @@ fn fetch_latest_dsh(use_mirror: bool) -> Result<String, String> {
     semver::Version::parse(latest.version.trim())
         .map_err(|e| format!("DSH 最新版本格式无效：{e}"))?;
     Ok(latest.version)
+}
+
+fn fetch_release_notes(version: &str) -> Option<String> {
+    let url = format!("{DSH_RELEASE_API_URL}v{version}");
+    let payload = ureq::AgentBuilder::new()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .get(&url)
+        .set("User-Agent", "dsh-launcher")
+        .set("Accept", "application/vnd.github+json")
+        .call()
+        .ok()?
+        .into_string()
+        .ok()?;
+    let release: ReleaseNotes = serde_json::from_str(&payload).ok()?;
+    release
+        .body
+        .map(|body| body.trim().to_string())
+        .filter(|body| !body.is_empty())
 }
 
 fn fetch_node_release(use_mirror: bool) -> Result<NodeRelease, String> {

@@ -89,6 +89,15 @@ const zhDict = {
   appUpdateRestartNow: "立即重启",
   appUpdateFailed: "应用内更新失败，可改用 GitHub 手动下载。",
   appUpdateLoading: "正在获取更新信息...",
+  dshVersionUpdateAvailable: "发现 DSH v{0}，点击查看更新内容",
+  dshUpdateTitle: "发现 DSH 新版本 v{0}",
+  dshUpdateNotesLabel: "更新内容",
+  dshUpdateNotesEmpty: "本次更新没有发布说明。",
+  dshUpdateCommandLabel: "npm 升级命令",
+  dshUpdateCopyCommand: "复制命令",
+  dshUpdateCopied: "已复制",
+  dshUpdateCopyFailed: "复制失败，请手动复制命令。",
+  dshUpdateWarning: "升级 DSH 可能导致已安装的插件不兼容，请谨慎操作。",
 } as const;
 
 export type Dict = Record<keyof typeof zhDict, string>;
@@ -172,6 +181,15 @@ const enDict: Dict = {
   appUpdateRestartNow: "Restart now",
   appUpdateFailed: "In-place update failed; you can download manually from GitHub instead.",
   appUpdateLoading: "Fetching update info...",
+  dshVersionUpdateAvailable: "DSH v{0} is available; click to view the update details",
+  dshUpdateTitle: "New DSH version v{0} available",
+  dshUpdateNotesLabel: "Release notes",
+  dshUpdateNotesEmpty: "No release notes were published for this version.",
+  dshUpdateCommandLabel: "npm upgrade command",
+  dshUpdateCopyCommand: "Copy command",
+  dshUpdateCopied: "Copied",
+  dshUpdateCopyFailed: "Copy failed; please copy the command manually.",
+  dshUpdateWarning: "Upgrading DSH may break compatibility with installed plugins. Please proceed with caution.",
 };
 
 export const translations: Record<Lang, Dict> = { zh: zhDict, en: enDict };

@@ -69,6 +69,9 @@ h1, h2, p { margin: 0; }
 .mini-field label { color: #7b7d84; font-size: 9px; font-weight: 590; }
 .field-label-row { display: flex; align-items: center; justify-content: space-between; }
 .field-label-row span { color: #999ba1; font: 8px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.dsh-version-update { position: relative; padding: 0 7px 0 0; border: 0; background: transparent; color: #a15b5b; font: 8px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.dsh-version-update:hover { color: #bd4d4d; }
+.dsh-version-update .update-dot { top: -2px; right: -3px; }
 input, select { width: 100%; height: 28px; padding: 0 8px; border: 1px solid #dadadd; border-radius: 4px; outline: none; background: #fff; color: #33353a; font-size: 10px; }
 input:focus, select:focus { border-color: #8178c7; box-shadow: 0 0 0 2px rgb(94 85 179 / 11%); }
 input:disabled, select:disabled { background: #f3f3f4; color: #85878d; }
@@ -116,6 +119,9 @@ input:disabled, select:disabled { background: #f3f3f4; color: #85878d; }
 .install-dialog .command-input button { width: 34px; height: 32px; }
 .install-dialog-error { margin: 0; color: #b13e47; font-size: 9px; line-height: 1.45; }
 .app-update-notes { max-height: 220px; overflow: auto; border: 1px solid #e4e4e7; border-radius: 6px; padding: 10px 12px; background: #f7f7f8; color: #494b51; font-size: 10px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+.update-command-input input { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 9px; }
+.update-command-input button { display: grid; place-items: center; }
+.dsh-update-warning { margin: 0; padding: 7px 9px; border: 1px solid #ecd9a8; border-radius: 5px; background: #fdf6e3; color: #8a6d1f; font-size: 9px; line-height: 1.5; }
 .app-update-success { margin: 0; color: #3d7a4f; font-size: 10px; font-weight: 600; }
 .mirror-option { display: flex; align-items: flex-start; gap: 9px; padding-top: 8px; color: #494b51; }
 .mirror-option input { width: 13px; height: 13px; margin: 2px 0 0; accent-color: #6d66ad; }
@@ -166,6 +172,7 @@ input:disabled, select:disabled { background: #f3f3f4; color: #85878d; }
 [data-theme="dark"] .install-dialog footer button.primary { border-color: #7770bb; background: #6d66ad; color: #fff; }
 [data-theme="dark"] .app-update-notes { border-color: #3d3f45; background: #26272b; color: #c9cad0; }
 [data-theme="dark"] .app-update-success { color: #7fc394; }
+[data-theme="dark"] .dsh-update-warning { border-color: #5a4a24; background: #332b16; color: #d9b45c; }
 [data-theme="dark"] .quick-actions button:hover:not(:disabled),
 [data-theme="dark"] .runtime-tools button:hover:not(:disabled),
 [data-theme="dark"] .command-input button:hover:not(:disabled),

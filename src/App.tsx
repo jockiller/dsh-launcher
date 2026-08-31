@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { confirm as confirmDialog, open } from "@tauri-apps/plugin-dialog";
 import {
+  Copy,
   Download,
   ExternalLink,
   FileSearch,
@@ -76,6 +77,11 @@ interface ManagedStatus {
   dshVersion: string;
 }
 
+interface ExternalDshUpdate {
+  latestVersion: string;
+  notes: string | null;
+}
+
 interface ManagedProgress {
   phase: string;
   message: string;
@@ -145,6 +151,9 @@ export default function App() {
   const [releaseUpdate, setReleaseUpdate] = useState<ReleaseUpdate | null>(null);
   const [profiles, setProfiles] = useState<string[]>(["web"]);
   const [version, setVersion] = useState<string | null>(null);
+  const [externalDshUpdate, setExternalDshUpdate] = useState<ExternalDshUpdate | null>(null);
+  const [externalDshUpdateDialogOpen, setExternalDshUpdateDialogOpen] = useState(false);
+  const [externalDshCopyState, setExternalDshCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const [status, setStatus] = useState<ServiceStatus>(emptyStatus);
   const [embeddedWebviewOpen, setEmbeddedWebviewOpen] = useState(false);
   const [logs, setLogs] = useState<LogLine[]>([]);
@@ -168,9 +177,11 @@ export default function App() {
   const pageContentRef = useRef<HTMLDivElement>(null);
   const installDialogRef = useRef<HTMLElement>(null);
   const appUpdateDialogRef = useRef<HTMLElement>(null);
+  const externalDshUpdateDialogRef = useRef<HTMLElement>(null);
   const installDialogTriggerRef = useRef<HTMLElement | null>(null);
   const appUpdateDialogTriggerRef = useRef<HTMLElement | null>(null);
-  const previousDialogRef = useRef<"install" | "update" | null>(null);
+  const externalDshUpdateTriggerRef = useRef<HTMLElement | null>(null);
+  const previousDialogRef = useRef<"install" | "update" | "external-dsh" | null>(null);
 
   const phaseLabels: Record<Phase, string> = {
     stopped: t.phaseStopped,
@@ -187,9 +198,16 @@ export default function App() {
         setAppVersion(data.appVersion);
         setConfig({ ...data.config, dshPath: data.config.dshPath || data.detectedDsh || "" });
         setVersion(data.dshVersion);
+        setExternalDshUpdate(null);
         setProfiles(data.profiles);
         setStatus(data.status);
+        if (!data.config.managedRuntimeDir && data.dshVersion) {
+          void invoke<ExternalDshUpdate | null>("check_external_dsh_update", { currentVersion: data.dshVersion })
+            .then((update) => setExternalDshUpdate(update ?? null))
+            .catch(() => undefined);
+        }
         if (data.config.managedRuntimeDir) {
+          // Managed runtimes keep their existing update check; external runtimes use the separate async check below.
           void invoke<ManagedStatus>("managed_runtime_status", { root: data.config.managedRuntimeDir })
             .then(setManaged)
             .catch(() => undefined);
@@ -266,8 +284,18 @@ export default function App() {
   }, [logs, config?.autoScrollLogs]);
 
   useEffect(() => {
-    const activeDialog = installDialogOpen ? "install" : appUpdateDialogOpen ? "update" : null;
-    const dialogRef = activeDialog === "install" ? installDialogRef : appUpdateDialogRef;
+    const activeDialog = installDialogOpen
+      ? "install"
+      : appUpdateDialogOpen
+        ? "update"
+        : externalDshUpdateDialogOpen
+          ? "external-dsh"
+          : null;
+    const dialogRef = activeDialog === "install"
+      ? installDialogRef
+      : activeDialog === "update"
+        ? appUpdateDialogRef
+        : externalDshUpdateDialogRef;
     const dialog = dialogRef.current;
     const pageContent = pageContentRef.current;
 
@@ -276,7 +304,9 @@ export default function App() {
         ? installDialogTriggerRef.current
         : previousDialogRef.current === "update"
           ? appUpdateDialogTriggerRef.current
-          : null;
+          : previousDialogRef.current === "external-dsh"
+            ? externalDshUpdateTriggerRef.current
+            : null;
       previousDialogRef.current = null;
       trigger?.focus();
       return;
@@ -295,7 +325,8 @@ export default function App() {
       if (event.key === "Escape") {
         event.preventDefault();
         if (activeDialog === "install") setInstallDialogOpen(false);
-        else setAppUpdateDialogOpen(false);
+        else if (activeDialog === "update") setAppUpdateDialogOpen(false);
+        else setExternalDshUpdateDialogOpen(false);
         return;
       }
       if (event.key !== "Tab") return;
@@ -325,7 +356,7 @@ export default function App() {
       pageContent?.removeAttribute("inert");
       pageContent?.removeAttribute("aria-hidden");
     };
-  }, [installDialogOpen, appUpdateDialogOpen]);
+  }, [installDialogOpen, appUpdateDialogOpen, externalDshUpdateDialogOpen]);
 
   const locked = ["running", "starting", "stopping"].includes(status.phase);
   const serviceUrl = useMemo(
@@ -343,12 +374,20 @@ export default function App() {
     setLang((current) => (current === "zh" ? "en" : "zh"));
   }
 
+  function checkExternalDshUpdate(dshVersion: string) {
+    setExternalDshUpdate(null);
+    void invoke<ExternalDshUpdate | null>("check_external_dsh_update", { currentVersion: dshVersion })
+      .then((update) => setExternalDshUpdate(update ?? null))
+      .catch(() => undefined);
+  }
+
   async function detectDsh() {
     setError(null);
     try {
       const [path, detectedVersion] = await invoke<[string, string]>("detect_dsh");
       patch("dshPath", path);
       setVersion(detectedVersion);
+      if (!config?.managedRuntimeDir) checkExternalDshUpdate(detectedVersion);
     } catch (reason) {
       setError(errorMessage(reason));
     }
@@ -361,6 +400,7 @@ export default function App() {
       const detectedVersion = await invoke<string>("validate_dsh", { path: selected });
       patch("dshPath", selected);
       setVersion(detectedVersion);
+      if (!config?.managedRuntimeDir) checkExternalDshUpdate(detectedVersion);
       setError(null);
     } catch (reason) {
       setError(errorMessage(reason));
@@ -394,6 +434,7 @@ export default function App() {
       });
       setManaged(result);
       setVersion(result.dshVersion);
+      setExternalDshUpdate(null);
       setConfig((current) => current ? {
         ...current,
         managedRuntimeDir: result.managedRoot,
@@ -507,6 +548,25 @@ export default function App() {
     }
   }
 
+  async function copyExternalDshCommand() {
+    if (!externalDshUpdate) return;
+    const command = `npm install -g @deepseek-ai/dsh@${externalDshUpdate.latestVersion}`;
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard API unavailable");
+      await navigator.clipboard.writeText(command);
+      setExternalDshCopyState("copied");
+    } catch {
+      setExternalDshCopyState("failed");
+    }
+  }
+
+  function openExternalDshUpdate(button: HTMLButtonElement) {
+    button.blur();
+    setExternalDshCopyState("idle");
+    externalDshUpdateTriggerRef.current = button;
+    setExternalDshUpdateDialogOpen(true);
+  }
+
   async function runCommand(command: "start_service" | "stop_service" | "restart_service") {
     if (!config) return;
     setBusy(true);
@@ -534,7 +594,16 @@ export default function App() {
         <section className="compact-settings expanded">
           <div className="settings-body">
             <div className="mini-field wide">
-              <div className="field-label-row"><label htmlFor="dsh-path">{t.dshCommand}</label><span>{version ? `DSH ${version}` : t.notVerified}</span></div>
+              <div className="field-label-row"><label htmlFor="dsh-path">{t.dshCommand}</label>{version && !managed && externalDshUpdate ? (
+                 <button
+                   type="button"
+                   className="dsh-version-update"
+                   title={t.dshVersionUpdateAvailable.replace("{0}", externalDshUpdate.latestVersion)}
+                   onClick={(event) => openExternalDshUpdate(event.currentTarget)}
+                 >
+                   DSH {version}<span className="update-dot" aria-hidden="true" />
+                 </button>
+               ) : <span>{version ? `DSH ${version}` : t.notVerified}</span>}</div>
               <div className="command-input">
                 <input id="dsh-path" value={config.dshPath} disabled={locked} onChange={(event) => patch("dshPath", event.target.value)} />
                 <button disabled={locked} onClick={() => void detectDsh()} title={t.autoDetect}><FileSearch size={14} /></button>
@@ -657,6 +726,30 @@ export default function App() {
             <footer>
               <button type="button" onClick={() => setInstallDialogOpen(false)}>{t.cancel}</button>
               <button type="button" className="primary" disabled={!installDirectory} onClick={() => void installManaged()}><Download size={13} />{t.installNow}</button>
+            </footer>
+          </section>
+        </div>
+      )}
+      {externalDshUpdateDialogOpen && externalDshUpdate && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setExternalDshUpdateDialogOpen(false)}>
+          <section className="install-dialog" role="dialog" aria-modal="true" aria-labelledby="dsh-update-title" tabIndex={-1} ref={externalDshUpdateDialogRef} onMouseDown={(event) => event.stopPropagation()}>
+            <header><h2 id="dsh-update-title">{t.dshUpdateTitle.replace("{0}", externalDshUpdate.latestVersion)}</h2></header>
+            <div className="install-dialog-body">
+              <label>{t.dshUpdateNotesLabel}</label>
+              <div className="app-update-notes">{externalDshUpdate.notes || t.dshUpdateNotesEmpty}</div>
+              <label htmlFor="dsh-update-command">{t.dshUpdateCommandLabel}</label>
+              <div className="command-input update-command-input">
+                <input id="dsh-update-command" readOnly value={`npm install -g @deepseek-ai/dsh@${externalDshUpdate.latestVersion}`} />
+                <button type="button" onClick={() => void copyExternalDshCommand()} title={t.dshUpdateCopyCommand} aria-label={t.dshUpdateCopyCommand}>
+                  <Copy size={14} />
+                </button>
+              </div>
+              <p className="dsh-update-warning" role="note">{t.dshUpdateWarning}</p>
+              {externalDshCopyState === "copied" && <p className="app-update-success" role="status">{t.dshUpdateCopied}</p>}
+              {externalDshCopyState === "failed" && <p className="install-dialog-error" role="alert">{t.dshUpdateCopyFailed}</p>}
+            </div>
+            <footer>
+              <button type="button" onClick={() => setExternalDshUpdateDialogOpen(false)}>{t.cancel}</button>
             </footer>
           </section>
         </div>

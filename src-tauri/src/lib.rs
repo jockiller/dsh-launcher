@@ -248,6 +248,14 @@ async fn check_latest_dsh(root: Option<String>) -> Result<String, String> {
         .map_err(|error| format!("检查 DSH 更新异常结束：{error}"))?
 }
 
+#[tauri::command]
+async fn check_external_dsh_update(current_version: String) -> Option<managed::ExternalDshUpdate> {
+    tauri::async_runtime::spawn_blocking(move || managed::check_external_dsh_update(&current_version))
+        .await
+        .ok()
+        .flatten()
+}
+
 pub fn shutdown_service(handle: &AppHandle) {
     if let Some(state) = handle.try_state::<AppState>()
         && let Ok(mut service) = state.service.lock()
@@ -295,6 +303,7 @@ pub fn run() {
             upgrade_managed_dsh,
             managed_runtime_status,
             check_latest_dsh,
+            check_external_dsh_update,
             app_update::app_update_check,
             app_update::app_update_install,
             app_update::app_update_restart,
