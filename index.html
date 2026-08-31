@@ -4,6 +4,23 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>DSH Launcher</title>
+    <script>
+      // 首帧前同步主题，避免 React 挂载后设置 data-theme 造成的白底闪烁。
+      // 与 App.tsx 的偏好键保持一致；后续主脚本会覆盖为最终值。
+      (() => {
+        let theme = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        try {
+          const saved = localStorage.getItem("dsh-launcher-theme-preference");
+          if (saved === "light" || saved === "dark") theme = saved;
+        } catch {}
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.style.colorScheme = theme;
+      })();
+    </script>
+    <style>
+      /* 渲染就绪前的窗口底色跟随主题，消除窗口创建到首帧之间的白闪 */
+      html:has([data-theme="dark"]) { background: #17181b; }
+    </style>
   </head>
   <body>
     <div id="root"></div>

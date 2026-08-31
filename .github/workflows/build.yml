@@ -301,7 +301,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           notes="$(awk -v tag="$GITHUB_REF_NAME" '
-            $0 == "## " tag {capture=1; next}
+            $0 ~ ("^## " tag "([ -]|$)") {capture=1; next}
             capture && /^## / {exit}
             capture {print}
           ' CHANGELOG.md | sed -e '1{/^[[:space:]]*$/d;}' -e :a -e '/^[[:space:]]*$/{ $d; N; ba;}')"
