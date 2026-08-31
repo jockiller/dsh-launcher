@@ -187,8 +187,12 @@ fn open_dsh_github_page() -> Result<(), String> {
 
 #[tauri::command]
 fn open_service_url(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    let status = state.service.lock().map_err(|e| e.to_string())?.status();
-    let url = status.url.ok_or_else(|| "DSH 服务尚未运行".to_string())?;
+    let service = state.service.lock().map_err(|e| e.to_string())?;
+    // 优先使用 dsh 启动日志捕获的带 token URL；回退到状态里的固定地址
+    let url = service
+        .authenticated_url()
+        .or_else(|| service.status().url)
+        .ok_or_else(|| "DSH 服务尚未运行".to_string())?;
     service::open_configured(&app, &LauncherConfig::load(), &url)
 }
 

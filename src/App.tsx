@@ -396,10 +396,6 @@ export default function App() {
   }, [externalStopOffered]);
 
   const locked = ["running", "starting", "stopping"].includes(status.phase);
-  const serviceUrl = useMemo(
-    () => status.url || (config ? `http://${config.host}:${config.port}` : ""),
-    [config, status.url],
-  );
   // 合并展示是派生视图：仅在日志列表变化时重算，logs 原始 state 不变
   const mergedLogs = useMemo(() => mergeLogs(logs), [logs]);
 
@@ -774,10 +770,6 @@ export default function App() {
             <p>{translateBackendMessage(status.message, lang)}</p>
             {status.phase === "running" && embeddedWebviewOpen && <p className="window-close-hint">{t.windowCloseHint}</p>}
           </div>
-
-          <button className="launch-url" disabled={!webAvailable} onClick={(event) => void openServiceUrl(event.currentTarget)}>
-            {serviceUrl}<ExternalLink size={13} />
-          </button>
 
           <div className="quick-actions">
             <button disabled={status.phase !== "running" || busy} onClick={() => void runCommand("restart_service")}><RotateCw size={14} />{t.restartService}</button>

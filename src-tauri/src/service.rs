@@ -88,6 +88,9 @@ struct OwnedChild {
 pub struct ServiceManager {
     owned: Option<OwnedChild>,
     status: Arc<Mutex<ServiceStatus>>,
+    /// dsh 启动日志打印的带 launch-token 的 URL（`dsh web: http://...?token=...`）。
+    /// 每次 start 重置；external 模式下为 None。打开 Web GUI 时优先于固定地址。
+    authenticated_url: Arc<Mutex<Option<String>>>,
 }
 
 impl ServiceManager {
@@ -95,6 +98,7 @@ impl ServiceManager {
         Self {
             owned: None,
             status: Arc::new(Mutex::new(ServiceStatus::default())),
+            authenticated_url: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -138,6 +142,9 @@ impl ServiceManager {
 
         let custom_args = parse_custom_args(&config.custom_args)?;
         let url = service_url(&config.host, config.port);
+        if let Ok(mut slot) = self.authenticated_url.lock() {
+            *slot = None;
+        }
         set_status(
             &self.status,
             &app,
@@ -163,35 +170,12 @@ impl ServiceManager {
                 .then(|| Path::new(config.managed_runtime_dir.trim())),
         );
         let path_entries = crate::managed::service_path_entries(&dsh, managed_dsh);
-        let (mut envs, shell_env_loaded) = launcher_environment();
-        emit_environment_diagnostics(
-            &app,
-            "before service PATH adjustment",
-            &envs,
-            shell_env_loaded,
-        );
+        let (mut envs, _shell_env_loaded) = launcher_environment();
         if managed_dsh {
             prepend_service_path(&mut envs, &path_entries);
         } else {
             append_service_path(&mut envs, &path_entries);
         }
-        if !path_entries.is_empty() {
-            emit_log(
-                &app,
-                "launcher",
-                "info",
-                &format!(
-                    "{} service PATH: {}",
-                    if managed_dsh {
-                        "Prepending to"
-                    } else {
-                        "Appending to"
-                    },
-                    path_entries_display(&path_entries)
-                ),
-            );
-        }
-        emit_environment_diagnostics(&app, "final service environment", &envs, shell_env_loaded);
 
         let mut command = Command::new(&dsh);
         // Windows GUI 宿主下启动控制台程序（node/dsh.cmd→cmd.exe）会闪现控制台窗口。
@@ -243,10 +227,22 @@ impl ServiceManager {
         let child = Arc::new(Mutex::new(child));
 
         if let Some(stdout) = stdout {
-            pipe_logs(app.clone(), "stdout", "info", stdout);
+            pipe_logs(
+                app.clone(),
+                "stdout",
+                "info",
+                stdout,
+                Some(Arc::clone(&self.authenticated_url)),
+            );
         }
         if let Some(stderr) = stderr {
-            pipe_logs(app.clone(), "stderr", "error", stderr);
+            pipe_logs(
+                app.clone(),
+                "stderr",
+                "error",
+                stderr,
+                Some(Arc::clone(&self.authenticated_url)),
+            );
         }
 
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -273,6 +269,7 @@ impl ServiceManager {
             url,
             pid,
             restarting,
+            Arc::clone(&self.authenticated_url),
         );
         Ok(status)
     }
@@ -417,6 +414,14 @@ impl ServiceManager {
         }
         Ok(status)
     }
+
+    /// 返回当前捕获的带 token URL（若有）。external 模式或尚未打印启动行时为 None。
+    pub fn authenticated_url(&self) -> Option<String> {
+        self.authenticated_url
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -429,9 +434,11 @@ fn monitor_startup(
     url: String,
     pid: u32,
     restarting: bool,
+    authenticated_url: Arc<Mutex<Option<String>>>,
 ) {
     thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(30);
+        let mut logged_url = url.clone();
         while Instant::now() < deadline && !cancelled.load(Ordering::Acquire) {
             let exit = child
                 .lock()
@@ -452,19 +459,43 @@ fn monitor_startup(
                 return;
             }
             if http_ready(&config.host, config.port) {
+                // dsh 打印带 token URL 通常先于端口监听，但日志线程异步解析可能滞后于
+                // 健康检查；此处限时等待捕获结果，避免打开旧固定地址导致
+                // "authentication required"。
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    let captured = authenticated_url
+                        .lock()
+                        .ok()
+                        .and_then(|slot| slot.clone());
+                    if let Some(authenticated) = captured {
+                        logged_url = authenticated;
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        emit_log(
+                            &app,
+                            "launcher",
+                            "warning",
+                            "Launch-token URL not found in dsh output; falling back to plain URL",
+                        );
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
                 set_status(
                     &status,
                     &app,
                     ServiceStatus {
                         phase: "running".into(),
                         pid: Some(pid),
-                        url: Some(url.clone()),
+                        url: Some(logged_url.clone()),
                         message: "DSH 服务运行中".into(),
                     },
                 );
                 emit_log(&app, "launcher", "info", "Health check passed");
                 if should_open_after_start(&config, restarting)
-                    && let Err(error) = perform_launch_action(&app, &config, &url)
+                    && let Err(error) = perform_launch_action(&app, &config, &logged_url)
                 {
                     emit_log(
                         &app,
@@ -537,15 +568,42 @@ fn monitor_child(
     });
 }
 
-fn pipe_logs<R>(app: AppHandle, source: &'static str, level: &'static str, reader: R)
-where
+fn pipe_logs<R>(
+    app: AppHandle,
+    source: &'static str,
+    level: &'static str,
+    reader: R,
+    authenticated_url: Option<Arc<Mutex<Option<String>>>>,
+) where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
         for line in BufReader::new(reader).lines().map_while(Result::ok) {
+            if let Some(store) = &authenticated_url
+                && let Some(url) = extract_authenticated_url(&line)
+                && let Ok(mut slot) = store.lock()
+            {
+                *slot = Some(url);
+            }
             emit_log(&app, source, level, &line);
         }
     });
+}
+
+/// 从 dsh 启动日志行提取带 launch-token 的 URL：
+/// `dsh web: http://...?token=... (LAN: http://...)`（LAN 部分可能是旧 cookie 的地址，取第一个本地 URL）。
+/// 仅接受与 launcher 所配置 host:port 同源的 URL；无 token 时返回 None。
+fn extract_authenticated_url(line: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix("dsh web: ")?.trim();
+    // 行格式：`http://host:port/?token=... (LAN: http://...?token=...)`；取第一段
+    let first = rest.split(" (LAN:").next()?.trim();
+    let url = Url::parse(first).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    url.query_pairs()
+        .any(|(key, _)| key == "token")
+        .then(|| first.to_string())
 }
 
 fn set_status(status: &Arc<Mutex<ServiceStatus>>, app: &AppHandle, next: ServiceStatus) {
@@ -991,25 +1049,6 @@ fn launcher_environment() -> (Vec<(OsString, OsString)>, bool) {
     }
 }
 
-fn environment_key_eq(left: &OsStr, right: &OsStr) -> bool {
-    #[cfg(windows)]
-    {
-        left.to_string_lossy()
-            .eq_ignore_ascii_case(&right.to_string_lossy())
-    }
-    #[cfg(not(windows))]
-    {
-        left == right
-    }
-}
-
-fn environment_value<'a>(envs: &'a [(OsString, OsString)], key: &str) -> Option<&'a OsString> {
-    let key = OsStr::new(key);
-    envs.iter()
-        .find(|(name, _)| environment_key_eq(name, key))
-        .map(|(_, value)| value)
-}
-
 #[cfg(unix)]
 fn should_overlay_shell_environment_key(key: &OsStr) -> bool {
     matches!(
@@ -1030,57 +1069,16 @@ fn should_overlay_shell_environment_key(key: &OsStr) -> bool {
     )
 }
 
-fn resolve_executable_from_path(envs: &[(OsString, OsString)], name: &str) -> Option<PathBuf> {
-    let path = environment_value(envs, "PATH")?;
-    let pathext = environment_value(envs, "PATHEXT")
-        .cloned()
-        .or_else(|| std::env::var_os("PATHEXT"));
-    std::env::split_paths(path).find_map(|dir| {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        #[cfg(windows)]
-        for extension in pathext
-            .as_deref()
-            .unwrap_or(OsStr::new(".COM;.EXE;.BAT;.CMD"))
-            .to_string_lossy()
-            .split(';')
-        {
-            let candidate = dir.join(format!("{name}{extension}"));
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-        #[cfg(not(windows))]
-        let _ = &pathext;
-        None
-    })
-}
-
-fn emit_environment_diagnostics(
-    app: &AppHandle,
-    stage: &str,
-    envs: &[(OsString, OsString)],
-    shell_env_loaded: bool,
-) {
-    let path = environment_value(envs, "PATH")
-        .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "<missing>".into());
-    let pnpm_home = environment_value(envs, "PNPM_HOME")
-        .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "<missing>".into());
-    let pnpm = resolve_executable_from_path(envs, "pnpm")
-        .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "<not found>".into());
-    emit_log(
-        app,
-        "launcher",
-        "info",
-        &format!(
-            "Environment diagnostics ({stage}): login shell loaded={shell_env_loaded}, PNPM_HOME={pnpm_home}, pnpm={pnpm}, PATH={path}"
-        ),
-    );
+fn environment_key_eq(left: &OsStr, right: &OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
 }
 
 #[cfg(unix)]
@@ -1167,23 +1165,6 @@ fn append_service_path(envs: &mut Vec<(OsString, OsString)>, entries: &[PathBuf]
         Some(slot) => slot.1 = joined,
         None => envs.push((OsString::from("PATH"), joined)),
     }
-}
-
-/// 纯逻辑：日志展示用的目录列表格式化。join_paths 失败时退化为逗号分隔。
-fn path_entries_display(entries: &[PathBuf]) -> String {
-    let parts: Vec<std::ffi::OsString> = entries
-        .iter()
-        .map(|entry| entry.as_os_str().to_os_string())
-        .collect();
-    std::env::join_paths(parts.iter())
-        .map(|joined| joined.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| {
-            entries
-                .iter()
-                .map(|entry| entry.to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
 }
 
 /// 登录 Shell 采集总耗时预算（含尝试多个 Shell 与参数组合），防止用户 Shell 初始化卡死时无限等待。
@@ -1475,6 +1456,14 @@ fn default_login_shell_path() -> OsString {
     }
     std::env::join_paths(entries)
         .unwrap_or_else(|_| OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"))
+}
+
+#[cfg(test)]
+fn environment_value<'a>(envs: &'a [(OsString, OsString)], key: &str) -> Option<&'a OsString> {
+    let key = OsStr::new(key);
+    envs.iter()
+        .find(|(name, _)| environment_key_eq(name, key))
+        .map(|(_, value)| value)
 }
 
 #[cfg(unix)]
@@ -1895,6 +1884,17 @@ fn perform_launch_action(
 
 fn open_embedded_webview(app: &AppHandle, url: &str) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("dsh-webview") {
+        // 窗口已存在时导航到新 URL（服务重启后 launch token 已更换，旧页面会停留在
+        // "authentication required"；复用窗口必须重新定位，而不是仅唤起）。
+        let current = window.url().ok().map(|current| current.to_string());
+        if current.as_deref() != Some(url) {
+            let parsed = url
+                .parse::<Url>()
+                .map_err(|error| format!("无效的 DSH URL：{error}"))?;
+            window
+                .navigate(parsed)
+                .map_err(|error| format!("导航内置 WebView 失败：{error}"))?;
+        }
         return window
             .show()
             .and_then(|_| window.unminimize())
@@ -2167,6 +2167,22 @@ mod tests {
     #[test]
     fn default_status_is_stopped() {
         assert_eq!(ServiceStatus::default().phase, "stopped");
+    }
+
+    #[test]
+    fn extract_authenticated_url_parses_dsh_web_line() {
+        let line = "dsh web: http://127.0.0.1:3080/?token=abc_-123 (LAN: http://192.168.50.197:3080/?token=abc_-123)";
+        assert_eq!(
+            extract_authenticated_url(line).as_deref(),
+            Some("http://127.0.0.1:3080/?token=abc_-123")
+        );
+    }
+
+    #[test]
+    fn extract_authenticated_url_rejects_non_token_lines() {
+        assert_eq!(extract_authenticated_url("dsh web: http://127.0.0.1:3080"), None);
+        assert_eq!(extract_authenticated_url("Health check passed"), None);
+        assert_eq!(extract_authenticated_url(""), None);
     }
 
     #[test]
