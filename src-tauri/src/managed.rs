@@ -142,7 +142,7 @@ pub fn install_managed(
         if !node_executable(&extracted_node).is_file() {
             return Err("Node 压缩包缺少可执行文件".into());
         }
-        let staged_dsh = staging.join("dsh");
+        let staged_dsh = staging.join("dsh-runtime");
         emit_progress(&app, "install", "正在安装 DSH...", Some(70));
         let expected_dsh_version = fetch_latest_dsh(use_mirror)?;
         npm_install(
@@ -153,9 +153,9 @@ pub fn install_managed(
             &expected_dsh_version,
         )?;
         let final_node = root.join("node");
-        let final_dsh = root.join("dsh");
+        let final_runtime = runtime_dir(&root);
         fs::rename(&extracted_node, &final_node).map_err(|e| format!("启用 Node 失败：{e}"))?;
-        if let Err(error) = fs::rename(&staged_dsh, &final_dsh) {
+        if let Err(error) = fs::rename(&staged_dsh, &final_runtime) {
             let _ = fs::rename(&final_node, &extracted_node);
             return Err(format!("启用 DSH 失败：{error}"));
         }
@@ -179,7 +179,7 @@ pub fn install_managed(
     let _ = fs::remove_dir_all(&staging);
     if result.is_err() && !root.join(MARKER_NAME).is_file() {
         let _ = fs::remove_dir_all(root.join("node"));
-        let _ = fs::remove_dir_all(root.join("dsh"));
+        let _ = fs::remove_dir_all(runtime_dir(&root));
         let _ = fs::remove_file(managed_dsh_path(&root));
     }
     result
@@ -216,7 +216,8 @@ pub fn upgrade_managed(app: AppHandle, root: PathBuf) -> Result<ManagedStatus, S
                 "DSH 版本校验失败：期望 {expected_dsh_version}，实际 {next_version}"
             ));
         }
-        let current = root.join("dsh");
+        // 升级只替换 npm 前缀目录（dsh-runtime），名为 dsh 的入口包装脚本保持不变。
+        let current = runtime_dir(&root);
         fs::rename(&current, &backup).map_err(|error| {
             format!("切换 DSH 版本失败：{error}。如遇文件占用，请停止服务后重试")
         })?;
@@ -259,7 +260,10 @@ pub fn upgrade_managed(app: AppHandle, root: PathBuf) -> Result<ManagedStatus, S
 pub fn managed_status(root: &Path) -> Result<ManagedStatus, String> {
     let marker = read_marker(root)?;
     let wrapper = managed_dsh_path(root);
-    if !node_executable(&root.join("node")).is_file() || !wrapper.is_file() {
+    if !node_executable(&root.join("node")).is_file()
+        || !runtime_dir(root).is_dir()
+        || !wrapper.is_file()
+    {
         return Err("托管运行环境文件不完整".into());
     }
     Ok(status_from(root, marker))
@@ -702,7 +706,7 @@ fn write_marker(root: &Path, marker: &Marker) -> Result<(), String> {
 
 fn create_wrapper(root: &Path) -> Result<PathBuf, String> {
     let wrapper = managed_dsh_path(root);
-    create_wrapper_for(root, &root.join("dsh"), &wrapper)?;
+    create_wrapper_for(root, &runtime_dir(root), &wrapper)?;
     Ok(wrapper)
 }
 
@@ -807,12 +811,89 @@ fn archive_top_dir(filename: &str) -> String {
         .to_string()
 }
 
+/// 托管安装的目录布局：
+/// `<root>/dsh`（Windows 为 `dsh.cmd`）是名为 dsh 的可执行入口包装脚本，
+/// `<root>/dsh-runtime` 是 npm 前缀目录（node_modules），
+/// `<root>/node` 是托管 Node。入口必须叫 `dsh`，注入 PATH 后 `which dsh` 才能命中。
+fn runtime_dir(root: &Path) -> PathBuf {
+    root.join("dsh-runtime")
+}
+
+/// 托管 DSH 可执行入口：安装根目录下名为 `dsh` 的包装脚本（Windows 需 .cmd 后缀供 cmd 解析）。
 fn managed_dsh_path(root: &Path) -> PathBuf {
+    root.join(if cfg!(windows) {
+        "dsh.cmd"
+    } else {
+        "dsh"
+    })
+}
+
+/// 旧版布局的包装脚本名（dsh-managed / dsh-managed.cmd），迁移时改写为兼容转发脚本。
+pub fn legacy_managed_dsh_path(root: &Path) -> PathBuf {
     root.join(if cfg!(windows) {
         "dsh-managed.cmd"
     } else {
         "dsh-managed"
     })
+}
+
+/// 旧版布局一次性迁移：入口文件从 `dsh-managed` 改名为根目录下的 `dsh`，
+/// 原 npm 前缀目录 `root/dsh` 改名为 `root/dsh-runtime`。幂等，可在每次启动时调用。
+/// 返回迁移（或校验）后的托管入口完整路径。
+pub fn migrate_layout(root: &Path) -> Result<PathBuf, String> {
+    let wrapper = managed_dsh_path(root);
+    if !root.join(MARKER_NAME).is_file() {
+        return Ok(wrapper);
+    }
+    let runtime = runtime_dir(root);
+    let legacy_prefix = root.join("dsh");
+    let mut renamed = false;
+    if legacy_prefix.is_dir() {
+        if runtime.exists() {
+            // rename 是原子的，两目录并存只可能是用户手工整理的结果；此时不动任何
+            // 文件并显式报错，避免脚本化清理掩盖真实状态。
+            return Err(format!(
+                "托管目录状态异常：{} 与 {} 同时存在，请手动整理后重试",
+                legacy_prefix.display(),
+                runtime.display()
+            ));
+        }
+        fs::rename(&legacy_prefix, &runtime)
+            .map_err(|e| format!("迁移托管目录布局失败：{e}"))?;
+        renamed = true;
+    }
+    // 入口创建必须先于任何收尾动作：创建失败时回滚 rename，保证迁移要么完成、
+    // 要么完整回到旧布局，绝不出现两头都不可用的中间态。
+    if dsh_entry(&runtime).is_file()
+        && !wrapper.is_file()
+        && let Err(error) = create_wrapper(root)
+    {
+        if renamed && !wrapper.exists() {
+            let _ = fs::rename(&runtime, &legacy_prefix);
+        }
+        return Err(format!("重建 dsh 入口失败：{error}"));
+    }
+    // 旧包装脚本不删除，改写为指向同一入口的兼容转发（内容与 dsh 一致）：
+    // 用户脚本/配置中对 dsh-managed 的既有引用保持可用。
+    let legacy_wrapper = legacy_managed_dsh_path(root);
+    if legacy_wrapper != wrapper && (renamed || legacy_wrapper.is_file()) {
+        let _ = create_wrapper_for(root, &runtime, &legacy_wrapper);
+    }
+    Ok(wrapper)
+}
+
+/// 启动服务进程时需要前置进子进程 PATH 的目录：托管安装下是安装根目录（内有名为
+/// dsh 的入口）与托管 Node 的 bin 目录，保证服务内部 `which dsh` / `node` 可解析；
+/// 外部 dsh 仅前置其所在目录（多半已在 PATH 中，重复前置无害）。
+pub fn service_path_entries(dsh: &Path) -> Vec<PathBuf> {
+    let Some(parent) = dsh.parent() else {
+        return Vec::new();
+    };
+    let mut entries = vec![parent.to_path_buf()];
+    if parent.join(MARKER_NAME).is_file() {
+        entries.push(node_bin_dir(&parent.join("node")));
+    }
+    entries
 }
 fn node_executable(node_root: &Path) -> PathBuf {
     node_root.join(if cfg!(windows) {

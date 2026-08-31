@@ -4,7 +4,7 @@ mod managed;
 mod service;
 mod update;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -32,8 +32,34 @@ struct Bootstrap {
 }
 
 #[tauri::command]
-fn bootstrap(state: State<'_, AppState>) -> Result<Bootstrap, String> {
-    let config = LauncherConfig::load();
+fn bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<Bootstrap, String> {
+    let mut config = LauncherConfig::load();
+    // 托管目录旧布局迁移：入口从 dsh-managed 改名为根目录下的 dsh（详见 managed::migrate_layout）。
+    if !config.managed_runtime_dir.trim().is_empty() {
+        match managed::migrate_layout(Path::new(&config.managed_runtime_dir)) {
+            Ok(wrapper) => {
+                let wrapper = wrapper.to_string_lossy().into_owned();
+                if config.dsh_path.trim().is_empty()
+                    || config.dsh_path
+                        == managed::legacy_managed_dsh_path(Path::new(
+                            &config.managed_runtime_dir,
+                        ))
+                        .to_string_lossy()
+                {
+                    config.dsh_path = wrapper;
+                    let _ = config.save();
+                }
+            }
+            Err(error) => {
+                service::emit_log(
+                    &app,
+                    "launcher",
+                    "error",
+                    &format!("Failed to migrate managed DSH layout: {error}"),
+                );
+            }
+        }
+    }
     let detected = service::resolve_dsh(&config.dsh_path);
     let version = detected
         .as_ref()

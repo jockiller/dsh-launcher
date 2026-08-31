@@ -150,13 +150,27 @@ impl ServiceManager {
             &format!("Starting {}", dsh.display()),
         );
 
+        // 把 dsh 可执行文件所在目录（托管安装时还包括托管 Node 的 bin）前置进子进程
+        // PATH：不注入的话，启动后的服务器内部执行 `which dsh` 找不到启动器托管的 dsh。
+        let path_entries = crate::managed::service_path_entries(&dsh);
+        let mut envs = login_shell_environment();
+        prepend_service_path(&mut envs, &path_entries);
+        if !path_entries.is_empty() {
+            emit_log(
+                &app,
+                "launcher",
+                "info",
+                &format!("Prepending to service PATH: {}", path_entries_display(&path_entries)),
+            );
+        }
+
         let mut command = Command::new(&dsh);
         // Windows GUI 宿主下启动控制台程序（node/dsh.cmd→cmd.exe）会闪现控制台窗口。
         // .cmd/.bat 由 std 自动经 cmd.exe 调用并转义各参数（见 dsh_version 注释）；
         // 已知残留面：cmd 解析期会展开 %VAR%（含引号内），参数均来自受控配置而非拼接文本。
         suppress_console_window(&mut command);
         command
-            .envs(login_shell_environment())
+            .envs(envs)
             .arg("--profile")
             .arg(config.profile.trim())
             .arg("--host")
@@ -694,6 +708,62 @@ fn login_shell_environment() -> Vec<(String, String)> {
     {
         Vec::new()
     }
+}
+
+/// 纯逻辑：把待前置的目录列表拼到 envs 中已有的 PATH 值前面（原值取自登录 Shell 环境，
+/// 缺失时回退当前进程 PATH）。PATH 大小写在 Windows 上不敏感，这里统一精确匹配 "PATH"：
+/// 登录 Shell 环境输出与当前进程变量在两端平台上均为这个名字。
+fn prepend_service_path(envs: &mut Vec<(String, String)>, entries: &[PathBuf]) {
+    if entries.is_empty() {
+        return;
+    }
+    let existing = envs
+        .iter()
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, value)| value.clone())
+        .or_else(|| {
+            std::env::var_os("PATH").map(|value| value.to_string_lossy().into_owned())
+        });
+    let mut parts: Vec<std::ffi::OsString> = entries
+        .iter()
+        .map(|entry| entry.as_os_str().to_os_string())
+        .collect();
+    if let Some(existing) = existing {
+        // 原始 PATH 是平台分隔符拼接的整串，必须先 split 再合入；
+        // 直接把整串当条目交给 join_paths 会因含分隔符而失败，注入就永远不会生效。
+        parts.extend(
+            std::env::split_paths(std::ffi::OsStr::new(&existing))
+                .filter(|part| !part.as_os_str().is_empty())
+                .map(|part| part.into_os_string()),
+        );
+    }
+    let Ok(joined) = std::env::join_paths(&parts) else {
+        // join_paths 仅在条目本身含路径分隔符时失败（托管安装已拒绝此类目录）；
+        // 此时放弃注入，保持旧行为，绝不写坏 PATH。
+        return;
+    };
+    let joined = joined.to_string_lossy().into_owned();
+    match envs.iter_mut().find(|(key, _)| key == "PATH") {
+        Some(slot) => slot.1 = joined,
+        None => envs.push(("PATH".into(), joined)),
+    }
+}
+
+/// 纯逻辑：日志展示用的目录列表格式化。join_paths 失败时退化为逗号分隔。
+fn path_entries_display(entries: &[PathBuf]) -> String {
+    let parts: Vec<std::ffi::OsString> = entries
+        .iter()
+        .map(|entry| entry.as_os_str().to_os_string())
+        .collect();
+    std::env::join_paths(parts.iter())
+        .map(|joined| joined.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| {
+            entries
+                .iter()
+                .map(|entry| entry.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
 }
 
 /// 登录 Shell 采集总耗时预算（含尝试多个 Shell 与参数组合），防止用户 Shell 初始化卡死时无限等待。
