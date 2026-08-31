@@ -258,8 +258,8 @@ export function persistLanguage(lang: Lang): void {
 /** 精确匹配：后端完整中文原文 → 英文。 */
 const backendExact: Record<string, string> = {
   服务未运行: "Service not running",
-  "检测到端口上已有 Web 服务，启动器不会接管，您仍可以直接打开 Web GUI 使用该服务":
-    "A web service is already running on this port. The launcher will not take it over, but you can still open and use its Web GUI.",
+  "检测到端口上已有 Web 服务，启动器不会接管":
+    "A web service is already running on this port. The launcher will not take it over.",
   "正在启动 DSH...": "Starting DSH...",
   "正在等待健康检查...": "Waiting for health check...",
   "DSH 服务运行中": "DSH service is running",

@@ -126,7 +126,7 @@ impl ServiceManager {
                     phase: "external".into(),
                     pid: None,
                     url: Some(service_url(&config.host, config.port)),
-                    message: "检测到端口上已有 Web 服务，启动器不会接管，您仍可以直接打开 Web GUI 使用该服务".into(),
+                    message: "检测到端口上已有 Web 服务，启动器不会接管".into(),
                 };
                 set_status(&self.status, &app, status.clone());
                 emit_log(
@@ -494,6 +494,9 @@ fn monitor_startup(
                     },
                 );
                 emit_log(&app, "launcher", "info", "Health check passed");
+                // 会话监视：用捕获的 launch-token URL（内含 token）换取 cookie 并轮询运行中会话。
+                // 与子进程共用同一个取消标记：stop/restart 时随之终止。
+                crate::session_monitor::spawn(app.clone(), logged_url.clone(), Arc::clone(&cancelled));
                 if should_open_after_start(&config, restarting)
                     && let Err(error) = perform_launch_action(&app, &config, &logged_url)
                 {

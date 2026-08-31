@@ -1,7 +1,9 @@
 mod app_update;
 mod config;
+mod dock_blink;
 mod managed;
 mod service;
+mod session_monitor;
 mod update;
 
 use std::path::{Path, PathBuf};
@@ -335,6 +337,8 @@ pub fn run() {
                 .map_err(|error| format!("注册 updater 插件失败：{error}"))?;
 
             let config = LauncherConfig::load();
+            // Dock 图标动态指示（macOS）：纯外挂，失败只影响自身，不影响主流程。
+            dock_blink::init(app.handle().clone());
             if config.auto_start {
                 let state = app.state::<AppState>();
                 if let Ok(mut service) = state.service.lock() {
