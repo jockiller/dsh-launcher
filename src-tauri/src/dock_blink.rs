@@ -31,16 +31,59 @@ const CONTENT_SCALE: f64 = 0.87;
 #[allow(dead_code)]
 const ICON_PNG: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/icons/icon.png"));
 
-/// 会话监视报告的「是否存在运行中会话」。
+/// Dock 指示的三个状态：
+/// - `Idle`：DSH 服务未启动 → 电源按钮**红色**；
+/// - `Healthy`：服务已启动、无运行中会话 → 电源按钮**绿色**；
+/// - `Busy`：有会话执行中 → 绿⇄红交替闪烁。
 #[cfg(target_os = "macos")]
-static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DockPhase {
+    Idle,
+    Healthy,
+    Busy,
+}
 
-/// 会话监视在每次轮询后调用：报告当前是否存在运行中的会话。
-pub(crate) fn set_running(active: bool) {
+/// Dock 指示的当前阶段（默认 Idle：启动后 DSH 服务尚未就绪）。
+/// 代际计数 GEN: 每次 set_idle（服务未就绪）递增；会话监视线程持有自己
+/// 的注册代际，取消（stop/restart）后旧线程的 PHASE 写入被代际校验拦截，
+/// 避免延迟写覆盖 service 层刚设置的红色状态。
+#[cfg(target_os = "macos")]
+static PHASE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(target_os = "macos")]
+static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(target_os = "macos")]
+const PHASE_IDLE: u8 = 0;
+#[cfg(target_os = "macos")]
+const PHASE_HEALTHY: u8 = 1;
+#[cfg(target_os = "macos")]
+const PHASE_BUSY: u8 = 2;
+
+/// 服务状态方调用：报告 DSH 服务「未就绪」（启动中/已停止/启动失败）。
+/// 监视器存活期间由 session 监视接手「健康/忙碌」的切换。
+pub(crate) fn set_idle() {
     #[cfg(target_os = "macos")]
-    RUNNING.store(active, std::sync::atomic::Ordering::Release);
+    {
+        GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+        PHASE.store(PHASE_IDLE, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// 监视线程退出后的复位：cancel 已置位（stop/restart，service 层已置红色）→ 不写；
+/// 否则（监视线程自行退出，如 DSH 失联）→ 回到红色 Idle（服务失联 = 未就绪）。
+pub(crate) fn set_running_checked(active: bool, cancel: &std::sync::atomic::AtomicBool) {
+    #[cfg(target_os = "macos")]
+    {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        PHASE.store(
+            if active { PHASE_BUSY } else { PHASE_HEALTHY },
+            std::sync::atomic::Ordering::Release,
+        );
+    }
     #[cfg(not(target_os = "macos"))]
-    let _ = active;
+    let _ = (active, cancel);
 }
 
 /// 应用启动时初始化（setup 钩子调用一次）。非 macOS 平台为 no-op。
@@ -129,6 +172,11 @@ impl Engine {
     /// 闪烁帧底图（补留白的绿色 base）的 PNG 字节。
     fn base_png(&self) -> Vec<u8> {
         encode_png(&self.base_rgba, self.size, self.size)
+    }
+
+    /// 「服务未启动」帧：电源按钮圆盘完全转红的 PNG 字节。
+    fn idle_red_png(&self) -> Vec<u8> {
+        self.frame_png(1.0)
     }
 
     /// 初始图标（未补留白的系统原图）的 PNG 字节。
@@ -378,36 +426,42 @@ mod imp {
     use std::sync::atomic::Ordering;
     use std::thread;
 
-    use super::{Engine, FRAME_PERIOD, RUNNING};
+    use super::{DockPhase, Engine, FRAME_PERIOD, PHASE, PHASE_BUSY, PHASE_HEALTHY};
 
     static ENGINE: OnceLock<Engine> = OnceLock::new();
 
-    /// 有运行会话时循环播放闪烁帧；无会话时恢复原始图标（只恢复一次）。
+    /// 按 PHASE 驱动 Dock 图标：
+    /// - Idle（服务未启动）：电源按钮常亮红色；
+    /// - Healthy（服务运行、无会话）：电源按钮常亮绿色；
+    /// - Busy（有会话执行）：绿⇄红交替闪烁。
+    /// 状态未变化时不重复提交。
     pub(super) fn cycle_loop(app: tauri::AppHandle) {
-        #[derive(PartialEq)]
-        enum Shown {
-            Original,
-            Animated,
-        }
         let Some(engine) = ENGINE.get() else { return };
-        // 工作状态闪烁：绿色（空闲底色）与红色（工作色）两态直接交替，
-        // 无中间渐变帧——语义为“工作指示灯在闪烁”。
-        let green = engine.frame_png(0.0);
-        let red = engine.frame_png(1.0);
-        let mut shown = Shown::Original;
+        let green = engine.base_png();
+        let red = engine.idle_red_png();
+        let mut shown: Option<DockPhase> = None;
         let mut red_active = false;
         loop {
             thread::sleep(FRAME_PERIOD);
-            if RUNNING.load(Ordering::Acquire) {
-                let png = if red_active { &red } else { &green };
-                apply_dock_image(&app, png.clone());
-                red_active = !red_active;
-                shown = Shown::Animated;
-            } else if shown == Shown::Animated {
-                // 恢复“初始 icon 状态”：与系统包内图标完全一致的原图。
-                apply_dock_image(&app, engine.original_png());
-                shown = Shown::Original;
+            let phase = match PHASE.load(Ordering::Acquire) {
+                PHASE_BUSY => DockPhase::Busy,
+                PHASE_HEALTHY => DockPhase::Healthy,
+                _ => DockPhase::Idle,
+            };
+            if Some(phase) == shown {
+                continue;
             }
+            let png = match phase {
+                DockPhase::Idle => red.clone(),
+                DockPhase::Healthy => green.clone(),
+                DockPhase::Busy => {
+                    // 闪烁相位在本轮延续，避免进入/退出闪烁时跳变。
+                    red_active = !red_active;
+                    if red_active { red.clone() } else { green.clone() }
+                }
+            };
+            apply_dock_image(&app, png);
+            shown = Some(phase);
         }
     }
 
@@ -435,13 +489,30 @@ mod imp {
         ENGINE.set(engine).is_ok()
     }
 
-    /// 恢复系统初始图标（动画线程异常退出时防“卡在中间帧”）。
+    /// 兜底：动画线程异常退出后，按当前 PHASE 重新应用一帧动态图标
+    /// （防“卡在中间帧”）。PHASE 语义上已描述当前状态，直接复现即可。
     pub(super) fn restore_base(app: &tauri::AppHandle) {
-        if let Some(engine) = ENGINE.get() {
-            apply_dock_image(app, engine.original_png());
-        }
+        let Some(engine) = ENGINE.get() else { return };
+        let phase_value = PHASE.load(Ordering::Acquire);
+        let png = if phase_value == PHASE_BUSY {
+            engine.idle_red_png() // 卡帧恢复：红色与 Busy 相邻，视觉跳变最小
+        } else {
+            engine.base_png() // Idle/Healthy → 红色/绿色帧
+        };
+        apply_dock_image(app, png);
     }
 }
+
+
+
+/// 无取消代际的写入口：用于"无监视线程"的 external 模式（服务健康、无会话数据）。
+#[cfg(target_os = "macos")]
+pub(crate) fn set_running_healthy() {
+    PHASE.store(PHASE_HEALTHY, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn set_running_healthy() {}
 
 #[cfg(target_os = "macos")]
 fn store_engine(engine: Engine) -> bool {
