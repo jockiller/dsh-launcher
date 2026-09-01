@@ -1,17 +1,12 @@
-//! macOS Dock 图标「运行中会话」动态指示。
+//! macOS Dock 图标三态指示。
 //!
-//! 有会话正在执行回合时，图标右下角的电源按钮圆盘做缓慢的红绿渐变呼吸；
-//! 无运行会话时恢复原始图标。实现：解码打包图标 → 降采样到 Dock 实际显示
-//! 所需的中等分辨率 → 识别电源按钮的绿色像素盘 → 每帧按 HSL 色相轴即时重
-//! 着色并编码 PNG → 经 `run_on_main_thread` 调用
-//! `NSApplication.setApplicationIconImage`。
+//! - Idle：DSH 未启动 → 电源按钮红色常亮；
+//! - Healthy：服务运行、无会话 → 电源按钮绿色常亮；
+//! - Busy：有会话执行 → 绿⇄红交替闪烁（0.6s/周期）。
 //!
-//! 内存策略：不预生成整段帧序列，只常驻一份降采样后的 base RGBA（约 260KB）
-//! 与按钮像素索引；每帧在后台线程即时重着色 + PNG 编码（远低于帧间隔），
-//! 常驻内存不随帧数增长。
-//!
-//! 定位与 session_monitor 相同：纯外挂观察者，独立线程，所有失败最多产出一条
-//! 日志后静默退出；非 macOS 平台为 no-op，任何情况下不影响现有功能。
+//! 实现：解码打包图标 → 降采样 → 按系统栅格补足留白 → 识别电源按钮绿色像素盘
+//! → 按 HSL 色相轴重着色并编码 PNG → 经 `run_on_main_thread` 调用
+//! `NSApplication.setApplicationIconImage`。非 macOS 平台为 no-op。
 
 /// 闪烁帧的停留时长。红绿两态各停留 300ms ≈ 0.6s 一个切换周期，
 /// 即“工作状态闪烁”节奏。
@@ -21,11 +16,10 @@ const FRAME_PERIOD: std::time::Duration = std::time::Duration::from_millis(300);
 /// 相比原始 512px 把像素处理量降低 4 倍。
 #[allow(dead_code)]
 const WORK_SIZE_LIMIT: usize = 256;
-/// 图标内容占画布的比例：Apple 图标栅格要求方形容器约 824/1024 ≈ 0.805，
-/// 而打包 artwork 的圆角方块已达 0.922，故按 0.805/0.922 ≈ 0.87 缩放对齐
-/// 系统栅格（缩放后内容占比 ≈ 0.805，与邻居图标视觉一致）。
+/// 内容缩放系数：0.87（偏小）与 0.91（偏大）的中间值，实测观感最接近
+/// 邻居图标（Launchpad ~72.6%、Edge ~71%）。
 #[allow(dead_code)]
-const CONTENT_SCALE: f64 = 0.87;
+const CONTENT_SCALE: f64 = 0.89;
 
 /// 打包图标的原始 PNG 字节（运行时解码一次）。
 #[allow(dead_code)]
@@ -44,13 +38,9 @@ pub(crate) enum DockPhase {
 }
 
 /// Dock 指示的当前阶段（默认 Idle：启动后 DSH 服务尚未就绪）。
-/// 代际计数 GEN: 每次 set_idle（服务未就绪）递增；会话监视线程持有自己
-/// 的注册代际，取消（stop/restart）后旧线程的 PHASE 写入被代际校验拦截，
-/// 避免延迟写覆盖 service 层刚设置的红色状态。
+/// stop/restart 后旧监视线程的写入由 `cancel` 标志拦截，不会覆盖红色 Idle。
 #[cfg(target_os = "macos")]
 static PHASE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-#[cfg(target_os = "macos")]
-static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(target_os = "macos")]
 const PHASE_IDLE: u8 = 0;
@@ -63,10 +53,7 @@ const PHASE_BUSY: u8 = 2;
 /// 监视器存活期间由 session 监视接手「健康/忙碌」的切换。
 pub(crate) fn set_idle() {
     #[cfg(target_os = "macos")]
-    {
-        GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
-        PHASE.store(PHASE_IDLE, std::sync::atomic::Ordering::Release);
-    }
+    PHASE.store(PHASE_IDLE, std::sync::atomic::Ordering::Release);
 }
 
 /// 监视线程退出后的复位：cancel 已置位（stop/restart，service 层已置红色）→ 不写；
@@ -118,7 +105,6 @@ pub(crate) fn init(app: tauri::AppHandle) {
 }
 
 /// 渐变引擎：常驻降采样 base 像素与按钮掩码，按需即时生成单帧 PNG。
-/// 另保存一份**未缩放**的原图 PNG，用于闪烁结束后恢复系统初始图标。
 #[allow(dead_code)]
 struct Engine {
     /// 工作分辨率（正方形边长）。
@@ -127,16 +113,11 @@ struct Engine {
     base_rgba: Vec<u8>,
     /// 电源按钮圆盘的像素索引（右下象限内绿色主导的像素）。
     indices: Vec<usize>,
-    /// 未补留白的系统原图 PNG（恢复初始图标用）。
-    original_png: Vec<u8>,
 }
 
 #[allow(dead_code)]
 impl Engine {
     /// 解码打包图标 → 降采样 → 补足留白 → 定位按钮掩码；失败返回 None。
-    ///
-    /// 同时保留降采样后、未补留白的原图，供“恢复初始图标”使用
-    /// （与 bundle 图标 artwork 一致）。
     fn load() -> Option<Self> {
         let image = tauri::image::Image::from_bytes(ICON_PNG).ok()?;
         let (mut width, mut height, mut rgba) =
@@ -149,16 +130,10 @@ impl Engine {
         if width == 0 || rgba.len() < width * height * 4 {
             return None;
         }
-        let original_png = encode_png(&rgba, width, height);
         // 按系统图标栅格补足留白：直接铺满的 artwork 会比邻居图标大一圈。
         rgba = embed_scaled(&rgba, width, CONTENT_SCALE);
         let indices = locate_button(&rgba, width, height);
-        Some(Engine {
-            size: width,
-            base_rgba: rgba,
-            indices,
-            original_png,
-        })
+        Some(Engine { size: width, base_rgba: rgba, indices })
     }
 
     /// 生成第 `phase`（0..1，0=原始绿，1=完全红）帧的 PNG 字节。
@@ -177,11 +152,6 @@ impl Engine {
     /// 「服务未启动」帧：电源按钮圆盘完全转红的 PNG 字节。
     fn idle_red_png(&self) -> Vec<u8> {
         self.frame_png(1.0)
-    }
-
-    /// 初始图标（未补留白的系统原图）的 PNG 字节。
-    fn original_png(&self) -> Vec<u8> {
-        self.original_png.clone()
     }
 }
 
@@ -434,7 +404,7 @@ mod imp {
     /// - Idle（服务未启动）：电源按钮常亮红色；
     /// - Healthy（服务运行、无会话）：电源按钮常亮绿色；
     /// - Busy（有会话执行）：绿⇄红交替闪烁。
-    /// 状态未变化时不重复提交。
+    /// Idle/Healthy 状态不变时不重复提交；Busy 分支每 tick 翻转闪烁帧。
     pub(super) fn cycle_loop(app: tauri::AppHandle) {
         let Some(engine) = ENGINE.get() else { return };
         let green = engine.base_png();
@@ -448,15 +418,22 @@ mod imp {
                 PHASE_HEALTHY => DockPhase::Healthy,
                 _ => DockPhase::Idle,
             };
-            if Some(phase) == shown {
-                continue;
+            match phase {
+                DockPhase::Idle | DockPhase::Healthy => {
+                    // 静态态：与上一帧相同则跳过，避免重复提交。
+                    if Some(phase) == shown {
+                        continue;
+                    }
+                }
+                DockPhase::Busy => {
+                    // 闪烁：每 tick 都要翻转帧；相位在会话期间延续。
+                    red_active = !red_active;
+                }
             }
             let png = match phase {
                 DockPhase::Idle => red.clone(),
                 DockPhase::Healthy => green.clone(),
                 DockPhase::Busy => {
-                    // 闪烁相位在本轮延续，避免进入/退出闪烁时跳变。
-                    red_active = !red_active;
                     if red_active { red.clone() } else { green.clone() }
                 }
             };
@@ -494,10 +471,10 @@ mod imp {
     pub(super) fn restore_base(app: &tauri::AppHandle) {
         let Some(engine) = ENGINE.get() else { return };
         let phase_value = PHASE.load(Ordering::Acquire);
-        let png = if phase_value == PHASE_BUSY {
-            engine.idle_red_png() // 卡帧恢复：红色与 Busy 相邻，视觉跳变最小
+        let png = if phase_value == PHASE_HEALTHY {
+            engine.base_png()
         } else {
-            engine.base_png() // Idle/Healthy → 红色/绿色帧
+            engine.idle_red_png()
         };
         apply_dock_image(app, png);
     }
