@@ -13,6 +13,7 @@ import {
   Moon,
   PackageCheck,
   Power,
+  RefreshCw,
   RotateCw,
   Sun,
   Trash2,
@@ -26,6 +27,7 @@ import {
   type Lang,
 } from "./i18n";
 import { mergeLogs, type LogLine } from "./logMerge";
+import changelogMarkdown from "../CHANGELOG.md?raw";
 
 type Phase = "stopped" | "starting" | "running" | "stopping" | "restarting" | "failed" | "external";
 type LaunchAction = "none" | "default_browser" | "embedded_webview";
@@ -100,6 +102,21 @@ const STARTUP_OVERLAY_MAX_MS = 12_000;
 
 function errorMessage(error: unknown) {
   return typeof error === "string" ? error : error instanceof Error ? error.message : String(error);
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** 从 CHANGELOG.md 取出指定版本的更新说明；找不到或为空时返回 null。 */
+function changelogSection(changelog: string, version: string): string | null {
+  const heading = new RegExp(`^##\\s+v?${escapeRegExp(version)}(?:\\s|$)`, "m");
+  const match = heading.exec(changelog);
+  if (!match) return null;
+  const rest = changelog.slice(match.index + match[0].length);
+  const nextHeading = rest.search(/^##\s+/m);
+  const body = (nextHeading === -1 ? rest : rest.slice(0, nextHeading)).trim();
+  return body || null;
 }
 
 function systemLanguageIsChinese(): boolean {
@@ -186,6 +203,8 @@ export default function App() {
   const [appUpdateInstalled, setAppUpdateInstalled] = useState(false);
   const [appUpdateProgress, setAppUpdateProgress] = useState<AppUpdateProgress | null>(null);
   const [appUpdateError, setAppUpdateError] = useState<string | null>(null);
+  const [appVersionChecking, setAppVersionChecking] = useState(false);
+  const [appVersionCheckError, setAppVersionCheckError] = useState<string | null>(null);
   const logEnd = useRef<HTMLDivElement>(null);
   const pageContentRef = useRef<HTMLDivElement>(null);
   const installDialogRef = useRef<HTMLElement>(null);
@@ -196,6 +215,7 @@ export default function App() {
   const dshVersionTriggerRef = useRef<HTMLElement | null>(null);
   const previousDialogRef = useRef<"install" | "update" | "dsh-version" | null>(null);
   const versionCheckSeq = useRef(0);
+  const appVersionCheckSeq = useRef(0);
 
   const phaseLabels: Record<Phase, string> = {
     stopped: t.phaseStopped,
@@ -232,7 +252,9 @@ export default function App() {
         setStartupReady(true);
       });
     void invoke<ReleaseUpdate | null>("check_launcher_update")
-      .then((update) => setReleaseUpdate(update?.updateAvailable ? update : null))
+      .then((update) => {
+        if (update) setReleaseUpdate(update);
+      })
       .catch(() => undefined);
 
     const statusListener = listen<ServiceStatus>("service-status", ({ payload }) => setStatus(payload));
@@ -407,6 +429,10 @@ export default function App() {
   const locked = ["running", "starting", "stopping", "restarting"].includes(status.phase);
   // 合并展示是派生视图：仅在日志列表变化时重算，logs 原始 state 不变
   const mergedLogs = useMemo(() => mergeLogs(logs), [logs]);
+  const currentAppNotes = useMemo(
+    () => (appVersion ? changelogSection(changelogMarkdown, appVersion) : null),
+    [appVersion],
+  );
 
   function patch<K extends keyof Config>(key: K, value: Config[K]) {
     setConfig((current) => (current ? { ...current, [key]: value } : current));
@@ -546,24 +572,35 @@ export default function App() {
     }
   }
 
-  async function openVersionPage(button: HTMLButtonElement) {
-    button.blur();
-    await openReleaseUrl();
+  async function checkLauncherVersion(force: boolean) {
+    const requestSeq = ++appVersionCheckSeq.current;
+    setAppVersionChecking(true);
+    setAppVersionCheckError(null);
+    try {
+      const update = await invoke<ReleaseUpdate | null>("check_launcher_update", { force });
+      if (appVersionCheckSeq.current !== requestSeq) return;
+      if (update) {
+        setReleaseUpdate(update);
+      } else if (force) {
+        setAppVersionCheckError(t.appVersionCheckFailed);
+      }
+    } catch (reason) {
+      if (appVersionCheckSeq.current !== requestSeq) return;
+      setAppVersionCheckError(errorMessage(reason));
+    } finally {
+      if (appVersionCheckSeq.current === requestSeq) setAppVersionChecking(false);
+    }
   }
 
-  // 版本按钮点击：有新版本时打开"更新日志"对话框，由用户决定是否应用内更新；
-  // 无新版本时保持原有行为（打开 Release 列表页）。
+  // 点击版本号始终打开版本弹窗：展示当前版本更新内容，并可跳转 GitHub / 检查更新。
   function handleAppVersionClick(button: HTMLButtonElement) {
     button.blur();
-    if (releaseUpdate?.updateAvailable) {
-      appUpdateDialogTriggerRef.current = button;
-      setAppUpdateError(null);
-      setAppUpdateInstalled(false);
-      setAppUpdateProgress(null);
-      setAppUpdateDialogOpen(true);
-      return;
-    }
-    void openVersionPage(button);
+    appUpdateDialogTriggerRef.current = button;
+    setAppUpdateError(null);
+    setAppUpdateInstalled(false);
+    setAppUpdateProgress(null);
+    setAppVersionCheckError(null);
+    setAppUpdateDialogOpen(true);
   }
 
   // 应用内更新：调用 Rust 侧安装（内部会先停托管 DSH、校验签名并汇报进度）。
@@ -835,12 +872,12 @@ export default function App() {
 
           {appVersion && (
             <button
-              className={`app-version${releaseUpdate ? " has-update" : ""}`}
-              title={releaseUpdate?.latestVersion ? t.launcherUpdateAvailable.replace("{0}", releaseUpdate.latestVersion) : t.viewOnGitHub}
+              className={`app-version${releaseUpdate?.updateAvailable ? " has-update" : ""}`}
+              title={releaseUpdate?.updateAvailable && releaseUpdate.latestVersion ? t.launcherUpdateAvailable.replace("{0}", releaseUpdate.latestVersion) : t.appVersionClickTitle}
               onClick={(event) => handleAppVersionClick(event.currentTarget)}
             >
               v{appVersion}
-              {releaseUpdate && <span className="update-dot" aria-hidden="true" />}
+              {releaseUpdate?.updateAvailable && <span className="update-dot" aria-hidden="true" />}
             </button>
           )}
         </section>
@@ -912,18 +949,39 @@ export default function App() {
           </section>
         </div>
       )}
-      {appUpdateDialogOpen && releaseUpdate && (
+      {appUpdateDialogOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setAppUpdateDialogOpen(false)}>
           <section className="install-dialog" role="dialog" aria-modal="true" aria-labelledby="app-update-title" tabIndex={-1} ref={appUpdateDialogRef} onMouseDown={(event) => event.stopPropagation()}>
-            <header><h2 id="app-update-title">{t.appUpdateTitle.replace("{0}", releaseUpdate.latestVersion ?? "")}</h2></header>
+            <header>
+              <h2 id="app-update-title">
+                {releaseUpdate?.updateAvailable
+                  ? t.appUpdateTitle.replace("{0}", releaseUpdate.latestVersion ?? "")
+                  : t.appVersionDialogTitle}
+              </h2>
+            </header>
             <div className="install-dialog-body">
-              <div className="app-update-notes">
-                {/* Linux 不参与应用内热更新，仅提示手动下载 */}
-                {navigator.platform.startsWith("Linux") && <p className="window-close-hint">{t.appUpdateLinuxHint}</p>}
-                <div className="app-update-notes-content">
-                  {releaseUpdate.notes ? releaseUpdate.notes : t.appUpdateNotesEmpty}
-                </div>
-              </div>
+              <p className="dsh-version-line"><strong>{t.dshVersionCurrent}</strong> v{appVersion}</p>
+              {releaseUpdate?.latestVersion && (
+                <p className="dsh-version-line"><strong>{t.dshVersionLatest}</strong> v{releaseUpdate.latestVersion}</p>
+              )}
+              <label>{t.appVersionCurrentNotesLabel}</label>
+              <div className="app-update-notes">{currentAppNotes || t.appVersionChangelogEmpty}</div>
+              {releaseUpdate?.updateAvailable && (
+                <>
+                  <label>{t.appVersionLatestNotesLabel}</label>
+                  <div className="app-update-notes">
+                    {navigator.platform.startsWith("Linux") && <p className="window-close-hint">{t.appUpdateLinuxHint}</p>}
+                    {releaseUpdate.notes || t.appUpdateNotesEmpty}
+                  </div>
+                </>
+              )}
+              {appVersionChecking && <p className="dsh-update-warning" role="status">{t.appVersionChecking}</p>}
+              {!appVersionChecking && appVersionCheckError && (
+                <p className="install-dialog-error" role="alert">{translateBackendMessage(appVersionCheckError, lang)}</p>
+              )}
+              {!appVersionChecking && !appVersionCheckError && releaseUpdate && !releaseUpdate.updateAvailable && (
+                <p className="app-update-success" role="status">{t.appVersionUpToDate}</p>
+              )}
               {appUpdateProgress && !appUpdateInstalled && (
                 <div className="managed-progress" aria-live="polite">
                   <span style={{ width: appUpdateProgress.total ? `${Math.min(100, Math.round((appUpdateProgress.received / appUpdateProgress.total) * 100))}%` : "50%" }} />
@@ -943,25 +1001,23 @@ export default function App() {
               )}
             </div>
             <footer>
-              <button type="button" onClick={() => setAppUpdateDialogOpen(false)}>{t.cancel}</button>
-              {/* Linux 上"在 GitHub 查看"是唯一行动出口，升级为 primary 主按钮；隐藏热更按钮后保持行动指引清晰 */}
-              {releaseUpdate.releaseUrl && !appUpdateInstalled && (
-                <button
-                  type="button"
-                  className={`github-download${navigator.platform.startsWith("Linux") ? " primary" : ""}`}
-                  disabled={appUpdateBusy}
-                  onClick={() => void openReleaseUrl()}
-                >
-                  <ExternalLink size={13} />{t.viewOnGitHub}
-                </button>
-              )}
+              <button type="button" disabled={appUpdateBusy} onClick={() => void openReleaseUrl()}>
+                <ExternalLink size={13} />{t.openGitHub}
+              </button>
+              <button
+                type="button"
+                disabled={appVersionChecking || appUpdateBusy}
+                onClick={() => void checkLauncherVersion(true)}
+              >
+                <RefreshCw size={13} />{appVersionChecking ? t.appVersionChecking : t.checkForUpdates}
+              </button>
               {appUpdateInstalled ? (
                 <button type="button" className="primary" disabled={appUpdateBusy} onClick={() => void restartApp()}><RotateCw size={13} />{t.appUpdateRestartNow}</button>
-              ) : !navigator.platform.startsWith("Linux") && (
+              ) : releaseUpdate?.updateAvailable && !navigator.platform.startsWith("Linux") ? (
                 <button type="button" className="primary" disabled={appUpdateBusy} onClick={() => void runAppUpdate()}>
                   <Download size={13} />{appUpdateBusy && !appUpdateProgress ? t.appUpdateLoading : appUpdateProgress ? t.appUpdateInstallRunning : t.appUpdateInstallAction}
                 </button>
-              )}
+              ) : null}
             </footer>
           </section>
         </div>

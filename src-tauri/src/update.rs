@@ -1,8 +1,8 @@
 //! Launcher 自身版本更新检测。
 //!
-//! 每次进程启动最多向 GitHub 发起一次网络请求（前端启动时调用 Tauri command 触发一次）；
+//! 启动时自动向 GitHub 发起一次网络请求；用户点击「检查更新」时可强制重新请求。
 //! 请求在阻塞线程池中执行，不占用主线程。任何网络或解析失败都返回 `None`，由前端
-//! 静默处理；没有定时轮询，也没有跨启动缓存。
+//! 按场景静默或提示；没有定时轮询，也没有跨启动缓存。
 
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -46,7 +46,7 @@ struct ReleasePayload {
     body: Option<String>,
 }
 
-/// 一次进程生命周期内的检测阶段：只会从 Pending 前进到 Done 一次。
+/// 进程内检测阶段：启动后缓存结果；用户强制检查时可重新请求。
 enum CheckPhase {
     Pending,
     InFlight,
@@ -57,39 +57,44 @@ static CHECK_PHASE: Mutex<CheckPhase> = Mutex::new(CheckPhase::Pending);
 static CHECK_SIGNAL: Condvar = Condvar::new();
 
 /// Tauri command 入口：执行（或返回已缓存的）启动更新检测。
-pub async fn release_update() -> Option<ReleaseUpdate> {
-    spawn_blocking(release_update_blocking).await.ok().flatten()
+/// `force` 为 true 时忽略缓存，重新向 GitHub 请求。
+pub async fn release_update(force: bool) -> Option<ReleaseUpdate> {
+    spawn_blocking(move || release_update_blocking(force))
+        .await
+        .ok()
+        .flatten()
 }
 
-/// 至多发起一次网络请求：首个调用者负责执行，其余调用者等待其结果或读取缓存。
-fn release_update_blocking() -> Option<ReleaseUpdate> {
+/// 默认复用进程内缓存；`force` 时重新请求。并发检测会等待进行中的那一次。
+fn release_update_blocking(force: bool) -> Option<ReleaseUpdate> {
     let mut phase = CHECK_PHASE.lock().expect("版本检测状态锁中毒");
-    if let CheckPhase::Done(cached) = &*phase {
-        return cached.clone();
+    if matches!(*phase, CheckPhase::InFlight) {
+        // 已有检测在进行中：等待其结果（带兜底超时），不并发发起第二次请求。
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        while matches!(*phase, CheckPhase::InFlight) {
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            let (waited, _) = CHECK_SIGNAL
+                .wait_timeout(phase, remaining)
+                .expect("版本检测状态锁中毒");
+            phase = waited;
+        }
+        return match &*phase {
+            CheckPhase::Done(cached) => cached.clone(),
+            _ => None,
+        };
     }
-    if matches!(*phase, CheckPhase::Pending) {
-        // 该调用是本次进程的首次检测者，负责发起唯一的网络请求。
-        *phase = CheckPhase::InFlight;
-        drop(phase);
-        let outcome = fetch_latest_release();
-        let mut phase = CHECK_PHASE.lock().expect("版本检测状态锁中毒");
-        *phase = CheckPhase::Done(outcome.clone());
-        CHECK_SIGNAL.notify_all();
-        return outcome;
+    if !force {
+        if let CheckPhase::Done(cached) = &*phase {
+            return cached.clone();
+        }
     }
-    // 已有检测在进行中：等待首次检测结果（带兜底超时，不发起第二次请求）。
-    let deadline = Instant::now() + WAIT_TIMEOUT;
-    while !matches!(*phase, CheckPhase::Done(_)) {
-        let remaining = deadline.checked_duration_since(Instant::now())?;
-        let (waited, _) = CHECK_SIGNAL
-            .wait_timeout(phase, remaining)
-            .expect("版本检测状态锁中毒");
-        phase = waited;
-    }
-    let CheckPhase::Done(cached) = &*phase else {
-        return None;
-    };
-    cached.clone()
+    *phase = CheckPhase::InFlight;
+    drop(phase);
+    let outcome = fetch_latest_release();
+    let mut phase = CHECK_PHASE.lock().expect("版本检测状态锁中毒");
+    *phase = CheckPhase::Done(outcome.clone());
+    CHECK_SIGNAL.notify_all();
+    outcome
 }
 
 fn fetch_latest_release() -> Option<ReleaseUpdate> {

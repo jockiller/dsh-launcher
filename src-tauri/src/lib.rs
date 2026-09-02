@@ -198,11 +198,11 @@ fn open_service_url(app: AppHandle, state: State<'_, AppState>) -> Result<(), St
     service::open_configured(&app, &LauncherConfig::load(), &url)
 }
 
-/// 启动时的 Launcher 更新检测：每次进程生命周期至多发起一次 GitHub 请求（网络请求
-/// 在阻塞线程池执行，不阻塞主线程）。网络失败返回 `None`，由前端静默处理。
+/// Launcher 更新检测：启动时自动检查一次；`force` 为 true 时忽略缓存重新请求。
+/// 网络请求在阻塞线程池执行。网络失败返回 `None`。
 #[tauri::command]
-async fn check_launcher_update() -> Option<update::ReleaseUpdate> {
-    update::release_update().await
+async fn check_launcher_update(force: Option<bool>) -> Option<update::ReleaseUpdate> {
+    update::release_update(force.unwrap_or(false)).await
 }
 
 /// 打开版本按钮对应的 Release 页面：只放行本项目 GitHub Release 相关 URL，

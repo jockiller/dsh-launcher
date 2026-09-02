@@ -124,12 +124,15 @@ input:disabled, select:disabled { background: #f3f3f4; color: #85878d; }
 .install-dialog header { padding: 15px 18px 12px; border-bottom: 1px solid #e4e4e7; }
 .install-dialog h2 { margin: 0; color: #3f4147; font-size: 14px; font-weight: 650; letter-spacing: 0; }
 .install-dialog-body { display: grid; gap: 8px; padding: 16px 18px; }
-.install-dialog-body > label:first-child { color: #666870; font-size: 10px; font-weight: 600; }
+.install-dialog-body > label:not(.mirror-option) { color: #666870; font-size: 10px; font-weight: 600; }
 .install-dialog .command-input { grid-template-columns: minmax(0, 1fr) 34px; }
 .install-dialog .command-input input { height: 32px; }
 .install-dialog .command-input button { width: 34px; height: 32px; }
 .install-dialog-error { margin: 0; color: #b13e47; font-size: 9px; line-height: 1.45; }
 .app-update-notes { max-height: 220px; overflow: auto; border: 1px solid #e4e4e7; border-radius: 6px; padding: 10px 12px; background: #f7f7f8; color: #494b51; font-size: 10px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+.dsh-version-line { margin: 0; color: #494b51; font-size: 10px; }
+.dsh-version-line strong { margin-right: 6px; color: #666870; font-weight: 600; }
+.app-update-notes .window-close-hint { margin: 0 0 8px; }
 .update-command-input input { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 9px; }
 .update-command-input button { display: grid; place-items: center; }
 .dsh-update-warning { margin: 0; padding: 7px 9px; border: 1px solid #ecd9a8; border-radius: 5px; background: #fdf6e3; color: #8a6d1f; font-size: 9px; line-height: 1.5; }
@@ -139,8 +142,8 @@ input:disabled, select:disabled { background: #f3f3f4; color: #85878d; }
 .mirror-option span { display: grid; gap: 3px; }
 .mirror-option strong { font-size: 10px; font-weight: 600; }
 .mirror-option small { color: #82848b; font-size: 9px; line-height: 1.45; }
-.install-dialog footer { display: flex; justify-content: flex-end; gap: 8px; padding: 11px 18px; border-top: 1px solid #e4e4e7; background: #f7f7f8; }
-.install-dialog footer button { display: inline-flex; min-width: 74px; height: 29px; align-items: center; justify-content: center; gap: 5px; border: 1px solid #d7d8dc; border-radius: 4px; background: #fff; color: #595b62; font-size: 10px; }
+.install-dialog footer { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; padding: 11px 18px; border-top: 1px solid #e4e4e7; background: #f7f7f8; }
+.install-dialog footer button { display: inline-flex; min-width: 74px; height: 29px; align-items: center; justify-content: center; gap: 5px; padding: 0 10px; border: 1px solid #d7d8dc; border-radius: 4px; background: #fff; color: #595b62; font-size: 10px; }
 .install-dialog footer button.primary { border-color: #625ba3; background: #6d66ad; color: #fff; }
 .install-dialog footer button:disabled { opacity: .45; }
 
@@ -192,12 +195,14 @@ input:disabled, select:disabled { background: #f3f3f4; color: #85878d; }
 [data-theme="dark"] .install-dialog footer { border-color: #3d3f45; }
 [data-theme="dark"] .install-dialog h2,
 [data-theme="dark"] .mirror-option { color: #d9dade; }
-[data-theme="dark"] .install-dialog-body > label:first-child,
+[data-theme="dark"] .install-dialog-body > label:not(.mirror-option),
 [data-theme="dark"] .mirror-option small { color: #92949b; }
 [data-theme="dark"] .install-dialog footer { background: #1d1e22; }
 [data-theme="dark"] .install-dialog footer button { border-color: #44464c; background: #2b2c31; color: #d1d2d6; }
 [data-theme="dark"] .install-dialog footer button.primary { border-color: #7770bb; background: #6d66ad; color: #fff; }
 [data-theme="dark"] .app-update-notes { border-color: #3d3f45; background: #26272b; color: #c9cad0; }
+[data-theme="dark"] .dsh-version-line { color: #c9cad0; }
+[data-theme="dark"] .dsh-version-line strong { color: #92949b; }
 [data-theme="dark"] .app-update-success { color: #7fc394; }
 [data-theme="dark"] .dsh-update-warning { border-color: #5a4a24; background: #332b16; color: #d9b45c; }
 [data-theme="dark"] .quick-actions button:hover:not(:disabled),
