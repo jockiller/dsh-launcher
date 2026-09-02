@@ -11,7 +11,7 @@
 //! 说明：`session/list` 只统计本 DSH 进程内“已附着且正在执行回合”的会话；
 //! 主会话按 `origin != "subagent"` 区分，子代理会话单独计数展示。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -36,19 +36,46 @@ pub(crate) struct RunningSnapshot {
     pub subagents: usize,
 }
 
+/// DSH 会话鉴权凭据（在内存中保存，支持插件热重启后无缝复用）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SessionCredentials {
+    /// 服务 base origin（如 `http://127.0.0.1:3080`）。
+    pub origin: String,
+    /// 从启动日志捕获的 launch token（若有）。
+    pub token: Option<String>,
+    /// 已换取的会话 Cookie（形如 `dsh-auth-...=...`）。
+    pub cookie: Option<String>,
+}
+
+impl SessionCredentials {
+    /// 从带 token URL 构建初始凭据。
+    pub(crate) fn from_authenticated_url(url: &str) -> Option<Self> {
+        let (origin, token) = parse_authenticated(url)?;
+        Some(Self {
+            origin,
+            token: Some(token),
+            cookie: None,
+        })
+    }
+}
+
 /// 启动会话监视线程。
 ///
-/// `authenticated_url` 是 service 启动健康检查通过后捕获的带 token URL；
-/// `cancel` 与 OwnedChild 的取消标记同源，stop/restart 服务时随之终止监视。
+/// `credentials` 持有当前服务的鉴权凭据；
+/// `cancel` 与服务运行代际绑定，stop/restart/handoff 服务时随之终止当前监视线程。
 ///
 /// 本模块是纯外挂的观察者：只在独立线程内做 HTTP 只读轮询，不持有/不修改
 /// 任何服务状态；任何失败（网络、协议、甚至 panic）都最多产出一条日志后退出，
 /// 绝不影响 DSH 服务的启动、停止与状态上报。
-pub(crate) fn spawn(app: tauri::AppHandle, authenticated_url: String, cancel: Arc<AtomicBool>) {
+pub(crate) fn spawn(
+    app: tauri::AppHandle,
+    credentials: Arc<Mutex<Option<SessionCredentials>>>,
+    cancel: Arc<AtomicBool>,
+) {
     let _ = thread::Builder::new().name("session-monitor".into()).spawn(move || {
         // 兜底：任何意外 panic 只记一条日志，线程静默退出，不影响宿主。
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run(app.clone(), authenticated_url, cancel.clone());
+            run(app.clone(), credentials, cancel.clone());
         }));
         // 退出时的 Dock 指示复位（带 cancel 校验——stop/restart 时 service 层
         // 已将图标设为红色 Idle，此处不再覆盖）。
@@ -59,52 +86,77 @@ pub(crate) fn spawn(app: tauri::AppHandle, authenticated_url: String, cancel: Ar
     });
 }
 
-fn run(app: tauri::AppHandle, authenticated_url: String, cancel: Arc<AtomicBool>) {
-    let Some((origin, token)) = parse_authenticated(&authenticated_url) else {
-        emit_log(&app, "monitor", "warning", "会话监视：未捕获 launch token，未启动");
-        return;
+fn run(
+    app: tauri::AppHandle,
+    credentials: Arc<Mutex<Option<SessionCredentials>>>,
+    cancel: Arc<AtomicBool>,
+) {
+    let (origin, token, mut cookie) = {
+        let guard = credentials.lock().ok().and_then(|guard| guard.clone());
+        let Some(creds) = guard else {
+            emit_log(&app, "monitor", "warning", "会话监视：未提供有效鉴权凭据，未启动");
+            return;
+        };
+        (creds.origin, creds.token, creds.cookie)
     };
-    emit_log(&app, "monitor", "info", &format!("会话监视：已启动（{origin}），token 仅保存在内存"));
 
     let agent = ureq::AgentBuilder::new()
         .redirects(0)
         .timeout(HTTP_TIMEOUT)
         .build();
 
-    // 1) token 换 cookie：失败按 POLL_INTERVAL 重试，超过上限放弃。
-    let mut cookie = None;
-    let mut failed_attempts: u32 = 0;
-    while cookie.is_none() {
-        if cancel.load(Ordering::Acquire) {
-            return;
-        }
-        match exchange_cookie(&agent, &origin, &token) {
-            Ok(next) => {
-                cookie = Some(next);
-                emit_log(&app, "monitor", "info", "会话监视：launch token 换取 cookie 成功");
-            }
-            Err(error) => {
-                failed_attempts += 1;
-                // 只打首条与每 10 次，避免刷屏。
-                if failed_attempts == 1 || failed_attempts % 10 == 0 {
-                    emit_log(
-                        &app,
-                        "monitor",
-                        "error",
-                        &format!("会话监视：token 换取 cookie 失败（第 {failed_attempts} 次）：{error}"),
-                    );
-                }
-                if failed_attempts >= EXCHANGE_MAX_ATTEMPTS {
-                    emit_log(&app, "monitor", "error", "会话监视：多次换取 cookie 失败，已停止监视");
+    // 1) 若尚未换取 cookie，则使用 token 进行换取；若已持有 cookie 则直接复用。
+    if cookie.is_none() {
+        if let Some(token_val) = &token {
+            let mut failed_attempts: u32 = 0;
+            while cookie.is_none() {
+                if cancel.load(Ordering::Acquire) {
                     return;
                 }
-                thread::sleep(POLL_INTERVAL);
+                match exchange_cookie(&agent, &origin, token_val) {
+                    Ok(next) => {
+                        cookie = Some(next.clone());
+                        if let Ok(mut guard) = credentials.lock() {
+                            if let Some(c) = guard.as_mut() {
+                                c.cookie = Some(next);
+                            }
+                        }
+                        emit_log(&app, "monitor", "info", "会话监视：launch token 换取 cookie 成功");
+                    }
+                    Err(error) => {
+                        failed_attempts += 1;
+                        // 只打首条与每 10 次，避免刷屏。
+                        if failed_attempts == 1 || failed_attempts % 10 == 0 {
+                            emit_log(
+                                &app,
+                                "monitor",
+                                "error",
+                                &format!("会话监视：token 换取 cookie 失败（第 {failed_attempts} 次）：{error}"),
+                            );
+                        }
+                        if failed_attempts >= EXCHANGE_MAX_ATTEMPTS {
+                            emit_log(&app, "monitor", "error", "会话监视：多次换取 cookie 失败，已停止监视");
+                            return;
+                        }
+                        thread::sleep(POLL_INTERVAL);
+                    }
+                }
             }
+        } else {
+            emit_log(&app, "monitor", "warning", "会话监视：缺少 token 与 cookie，未启动");
+            return;
         }
+    } else {
+        emit_log(
+            &app,
+            "monitor",
+            "info",
+            &format!("会话监视：已启动并复用已有会话凭据（{origin}）"),
+        );
     }
-    let mut cookie = match cookie {
+
+    let mut current_cookie = match cookie {
         Some(cookie) => cookie,
-        // 循环只在拿到 cookie 或主动放弃时退出，此分支不可达；防御性处理。
         None => return,
     };
 
@@ -115,7 +167,7 @@ fn run(app: tauri::AppHandle, authenticated_url: String, cancel: Arc<AtomicBool>
         if cancel.load(Ordering::Acquire) {
             break;
         }
-        match poll_running(&agent, &origin, &cookie, &sequence) {
+        match poll_running(&agent, &origin, &current_cookie, &sequence) {
             Ok(snapshot) => {
                 failures = 0;
                 // 同步 Dock 图标指示：有运行中会话（含子代理）时点亮。
@@ -128,13 +180,24 @@ fn run(app: tauri::AppHandle, authenticated_url: String, cancel: Arc<AtomicBool>
             }
             Err(PollFailure::Unauthorized) => {
                 failures = 0;
-                emit_log(&app, "monitor", "warning", "会话监视：cookie 已失效，重新用 token 换取");
-                // cookie 可能过期（默认 30 天）；重换取失败按普通失败日志输出，下轮重试。
-                match exchange_cookie(&agent, &origin, &token) {
-                    Ok(next) => cookie = next,
-                    Err(error) => {
-                        emit_log(&app, "monitor", "error", &format!("会话监视：重新换取 cookie 失败：{error}"));
+                if let Some(token_val) = &token {
+                    emit_log(&app, "monitor", "warning", "会话监视：cookie 已失效，尝试重新用 token 换取");
+                    match exchange_cookie(&agent, &origin, token_val) {
+                        Ok(next) => {
+                            current_cookie = next.clone();
+                            if let Ok(mut guard) = credentials.lock() {
+                                if let Some(c) = guard.as_mut() {
+                                    c.cookie = Some(next);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            emit_log(&app, "monitor", "error", &format!("会话监视：重新换取 cookie 失败：{error}"));
+                        }
                     }
+                } else {
+                    emit_log(&app, "monitor", "error", "会话监视：cookie 已失效且无可用 token，已停止监视");
+                    return;
                 }
             }
             Err(PollFailure::Transport(error)) => {
@@ -281,6 +344,20 @@ pub(crate) fn parse_running_sessions(value: &serde_json::Value) -> Option<Runnin
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn session_credentials_from_authenticated_url() {
+        let creds = SessionCredentials::from_authenticated_url("http://127.0.0.1:3080/?token=AbC_123")
+            .expect("应成功解析凭据");
+        assert_eq!(creds.origin, "http://127.0.0.1:3080");
+        assert_eq!(creds.token.as_deref(), Some("AbC_123"));
+        assert_eq!(creds.cookie, None);
+
+        assert_eq!(
+            SessionCredentials::from_authenticated_url("http://127.0.0.1:3080/"),
+            None
+        );
+    }
 
     #[test]
     fn parse_authenticated_extracts_origin_and_token() {

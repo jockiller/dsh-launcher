@@ -98,7 +98,8 @@ pub struct ServiceManager {
     owned: Option<OwnedChild>,
     adopted: Arc<Mutex<Option<AdoptedProcess>>>,
     active_cancel: Option<Arc<AtomicBool>>,
-    session_cancel: Option<Arc<AtomicBool>>,
+    session_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    session_credentials: Arc<Mutex<Option<crate::session_monitor::SessionCredentials>>>,
     active_config: Option<LauncherConfig>,
     quarantine_cancel: Option<Arc<AtomicBool>>,
     quarantine_active: Arc<AtomicBool>,
@@ -117,7 +118,8 @@ impl ServiceManager {
             owned: None,
             adopted: Arc::new(Mutex::new(None)),
             active_cancel: None,
-            session_cancel: None,
+            session_cancel: Arc::new(Mutex::new(None)),
+            session_credentials: Arc::new(Mutex::new(None)),
             active_config: None,
             quarantine_cancel: None,
             quarantine_active: Arc::new(AtomicBool::new(false)),
@@ -158,7 +160,15 @@ impl ServiceManager {
         let session_cancel = Arc::new(AtomicBool::new(false));
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.active_cancel = Some(Arc::clone(&cancelled));
-        self.session_cancel = Some(Arc::clone(&session_cancel));
+        if let Ok(mut slot) = self.session_cancel.lock() {
+            if let Some(old) = slot.take() {
+                old.store(true, Ordering::Release);
+            }
+            *slot = Some(Arc::clone(&session_cancel));
+        }
+        if let Ok(mut slot) = self.session_credentials.lock() {
+            *slot = None;
+        }
         self.active_config = Some(config.clone());
         self.handoff_active.store(false, Ordering::Release);
 
@@ -352,6 +362,8 @@ impl ServiceManager {
             restarting,
             Arc::clone(&self.authenticated_url),
             session_cancel,
+            Arc::clone(&self.session_cancel),
+            Arc::clone(&self.session_credentials),
             Arc::clone(&self.adopted),
             Arc::clone(&self.handoff_active),
             Arc::clone(&self.generation),
@@ -364,7 +376,14 @@ impl ServiceManager {
     fn clear_pending_start(&mut self, cancelled: &AtomicBool) {
         cancelled.store(true, Ordering::Release);
         self.active_cancel.take();
-        self.session_cancel.take();
+        if let Ok(mut slot) = self.session_cancel.lock() {
+            if let Some(session_cancel) = slot.take() {
+                session_cancel.store(true, Ordering::Release);
+            }
+        }
+        if let Ok(mut slot) = self.session_credentials.lock() {
+            *slot = None;
+        }
         self.active_config.take();
         self.handoff_active.store(false, Ordering::Release);
     }
@@ -441,8 +460,13 @@ impl ServiceManager {
         if let Some(cancelled) = self.active_cancel.take() {
             cancelled.store(true, Ordering::Release);
         }
-        if let Some(session_cancel) = self.session_cancel.take() {
-            session_cancel.store(true, Ordering::Release);
+        if let Ok(mut slot) = self.session_cancel.lock() {
+            if let Some(session_cancel) = slot.take() {
+                session_cancel.store(true, Ordering::Release);
+            }
+        }
+        if let Ok(mut slot) = self.session_credentials.lock() {
+            *slot = None;
         }
         if let Some(quarantine_cancel) = self.quarantine_cancel.take() {
             quarantine_cancel.store(true, Ordering::Release);
@@ -597,6 +621,8 @@ fn monitor_startup(
     restarting: bool,
     authenticated_url: Arc<Mutex<Option<String>>>,
     session_cancel: Arc<AtomicBool>,
+    session_cancel_slot: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    session_credentials: Arc<Mutex<Option<crate::session_monitor::SessionCredentials>>>,
     adopted: Arc<Mutex<Option<AdoptedProcess>>>,
     handoff_active: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
@@ -614,6 +640,12 @@ fn monitor_startup(
                 .flatten();
             if let Some(exit) = exit {
                 session_cancel.store(true, Ordering::Release);
+                if let Ok(mut slot) = session_cancel_slot.lock() {
+                    *slot = None;
+                }
+                if let Ok(mut slot) = session_credentials.lock() {
+                    *slot = None;
+                }
                 if let Ok(_guard) = lifecycle.lock()
                     && lifecycle_active(&cancelled, &generation, run_generation)
                 {
@@ -668,9 +700,16 @@ fn monitor_startup(
                     },
                 );
                 emit_log(&app, "launcher", "info", "Health check passed");
+                if let Some(creds) =
+                    crate::session_monitor::SessionCredentials::from_authenticated_url(&logged_url)
+                {
+                    if let Ok(mut slot) = session_credentials.lock() {
+                        *slot = Some(creds);
+                    }
+                }
                 crate::session_monitor::spawn(
                     app.clone(),
-                    logged_url.clone(),
+                    Arc::clone(&session_credentials),
                     Arc::clone(&session_cancel),
                 );
                 if should_open_after_start(&config, restarting)
@@ -687,6 +726,8 @@ fn monitor_startup(
                     child,
                     cancelled,
                     session_cancel,
+                    session_cancel_slot,
+                    session_credentials,
                     status,
                     app,
                     config,
@@ -732,6 +773,8 @@ fn monitor_child(
     child: Arc<Mutex<Child>>,
     cancelled: Arc<AtomicBool>,
     session_cancel: Arc<AtomicBool>,
+    session_cancel_slot: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    session_credentials: Arc<Mutex<Option<crate::session_monitor::SessionCredentials>>>,
     status: Arc<Mutex<ServiceStatus>>,
     app: AppHandle,
     config: LauncherConfig,
@@ -769,10 +812,18 @@ fn monitor_child(
                 generation,
                 run_generation,
                 authenticated_url,
+                session_credentials,
+                session_cancel_slot,
                 lifecycle,
             );
         } else {
             session_cancel.store(true, Ordering::Release);
+            if let Ok(mut slot) = session_cancel_slot.lock() {
+                *slot = None;
+            }
+            if let Ok(mut slot) = session_credentials.lock() {
+                *slot = None;
+            }
             if let Ok(_guard) = lifecycle.lock()
                 && lifecycle_active(&cancelled, &generation, run_generation)
             {
@@ -812,6 +863,8 @@ fn begin_handoff(
     generation: Arc<AtomicU64>,
     run_generation: u64,
     authenticated_url: Arc<Mutex<Option<String>>>,
+    session_credentials: Arc<Mutex<Option<crate::session_monitor::SessionCredentials>>>,
+    session_cancel_slot: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     lifecycle: Arc<Mutex<()>>,
 ) {
     if !lifecycle_active(&cancelled, &generation, run_generation)
@@ -827,9 +880,6 @@ fn begin_handoff(
         if !lifecycle_active(&cancelled, &generation, run_generation) {
             handoff_active.store(false, Ordering::Release);
             return;
-        }
-        if let Ok(mut slot) = authenticated_url.lock() {
-            *slot = None;
         }
         set_status(
             &status,
@@ -881,11 +931,31 @@ fn begin_handoff(
                         command_line: command_line.clone(),
                     });
                 }
-                if let Ok(mut slot) = authenticated_url.lock() {
-                    *slot = None;
-                }
                 handoff_active.store(false, Ordering::Release);
-                crate::dock_blink::set_running_healthy();
+                let has_creds = session_credentials
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.clone())
+                    .is_some();
+                let new_session_cancel = Arc::new(AtomicBool::new(false));
+                if let Ok(mut slot) = session_cancel_slot.lock() {
+                    *slot = Some(Arc::clone(&new_session_cancel));
+                }
+                if has_creds {
+                    crate::session_monitor::spawn(
+                        app.clone(),
+                        Arc::clone(&session_credentials),
+                        Arc::clone(&new_session_cancel),
+                    );
+                    emit_log(
+                        &app,
+                        "launcher",
+                        "info",
+                        &format!("Reattached session monitor for adopted DSH process {candidate_pid}"),
+                    );
+                } else {
+                    crate::dock_blink::set_running_healthy();
+                }
                 set_status(
                     &status,
                     &app,
@@ -916,6 +986,9 @@ fn begin_handoff(
                     run_generation,
                     cancelled,
                     authenticated_url,
+                    session_credentials,
+                    session_cancel_slot,
+                    new_session_cancel,
                     lifecycle,
                 );
                 return;
@@ -928,6 +1001,15 @@ fn begin_handoff(
         };
         if !lifecycle_active(&cancelled, &generation, run_generation) {
             return;
+        }
+        if let Ok(mut slot) = session_cancel_slot.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = session_credentials.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = authenticated_url.lock() {
+            *slot = None;
         }
         close_embedded_webview(&app);
         set_status(
@@ -977,6 +1059,9 @@ fn monitor_adopted(
     run_generation: u64,
     cancelled: Arc<AtomicBool>,
     authenticated_url: Arc<Mutex<Option<String>>>,
+    session_credentials: Arc<Mutex<Option<crate::session_monitor::SessionCredentials>>>,
+    session_cancel_slot: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    current_session_cancel: Arc<AtomicBool>,
     lifecycle: Arc<Mutex<()>>,
 ) {
     thread::spawn(move || {
@@ -999,6 +1084,7 @@ fn monitor_adopted(
                     *slot = None;
                 }
             }
+            current_session_cancel.store(true, Ordering::Release);
             begin_handoff(
                 cancelled.clone(),
                 status,
@@ -1011,6 +1097,8 @@ fn monitor_adopted(
                 generation,
                 run_generation,
                 authenticated_url,
+                session_credentials,
+                session_cancel_slot,
                 lifecycle,
             );
             return;
@@ -3284,5 +3372,13 @@ mod tests {
         // 片段超长时截断
         let error = version_parse_error(&"x".repeat(400), "");
         assert!(error.chars().count() < 400, "实际：{error}");
+    }
+
+    #[test]
+    fn service_manager_initializes_session_slots() {
+        let manager = ServiceManager::new();
+        assert!(manager.session_cancel.lock().unwrap().is_none());
+        assert!(manager.session_credentials.lock().unwrap().is_none());
+        assert!(manager.authenticated_url.lock().unwrap().is_none());
     }
 }
