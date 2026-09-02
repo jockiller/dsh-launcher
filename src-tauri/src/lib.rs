@@ -13,9 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use config::LauncherConfig;
 use serde::Serialize;
 use service::{ServiceManager, ServiceStatus};
-#[cfg(windows)]
-use tauri::WindowEvent;
-use tauri::{AppHandle, Manager, RunEvent, State};
+use tauri::{AppHandle, Manager, RunEvent, State, WindowEvent};
 
 struct AppState {
     service: Mutex<ServiceManager>,
@@ -324,6 +322,13 @@ pub fn shutdown_service(handle: &AppHandle) {
     }
 }
 
+/// 关闭中的窗口仍可能报可见，所以只统计其它窗口。
+pub(crate) fn has_other_visible_window(app: &AppHandle, closing_label: &str) -> bool {
+    app.webview_windows()
+        .into_iter()
+        .any(|(label, window)| label != closing_label && window.is_visible().unwrap_or(false))
+}
+
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -376,13 +381,15 @@ pub fn run() {
         .expect("failed to build DSH Launcher");
 
     app.run(|handle, event| {
-        #[cfg(windows)]
+        // 任一窗口仍显示则保持运行。内置 WebView 关窗只隐藏不销毁，
+        // 所以两个窗口都不显示时必须显式退出，否则 macOS 会留在 Dock。
         if let RunEvent::WindowEvent {
             label,
             event: WindowEvent::CloseRequested { api, .. },
             ..
         } = &event
             && label == "main"
+            && !has_other_visible_window(handle, "main")
         {
             api.prevent_close();
             shutdown_service(handle);

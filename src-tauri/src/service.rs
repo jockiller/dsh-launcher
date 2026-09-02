@@ -2603,6 +2603,10 @@ fn register_window_state_persistence(window: &WebviewWindow) {
             save_window_state(&window);
             api.prevent_close();
             let _ = window.hide();
+            if !crate::has_other_visible_window(&app, "dsh-webview") {
+                crate::shutdown_service(&app);
+                app.exit(0);
+            }
         }
     });
 }
