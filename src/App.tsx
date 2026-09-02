@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { confirm as confirmDialog, open } from "@tauri-apps/plugin-dialog";
@@ -26,7 +27,7 @@ import {
 } from "./i18n";
 import { mergeLogs, type LogLine } from "./logMerge";
 
-type Phase = "stopped" | "starting" | "running" | "stopping" | "failed" | "external";
+type Phase = "stopped" | "starting" | "running" | "stopping" | "restarting" | "failed" | "external";
 type LaunchAction = "none" | "default_browser" | "embedded_webview";
 type Theme = "light" | "dark";
 
@@ -175,6 +176,7 @@ export default function App() {
   const [installDialogError, setInstallDialogError] = useState<string | null>(null);
   const [useMirror, setUseMirror] = useState(systemLanguageIsChinese);
   const [busy, setBusy] = useState(false);
+  const [pendingAction, setPendingAction] = useState<"start" | "stop" | "restart" | "force_stop" | null>(null);
   const [startupReady, setStartupReady] = useState(false);
   const [minStartupElapsed, setMinStartupElapsed] = useState(false);
   const [externalStopOffered, setExternalStopOffered] = useState(false);
@@ -200,6 +202,7 @@ export default function App() {
     starting: t.phaseStarting,
     running: t.phaseRunning,
     stopping: t.phaseStopping,
+    restarting: t.phaseRestarting,
     failed: t.phaseFailed,
     external: t.phaseExternal,
   };
@@ -258,6 +261,12 @@ export default function App() {
       void appUpdateListener.then((unlisten) => unlisten());
     };
   }, []);
+
+  useEffect(() => {
+    if (["running", "stopped", "failed", "external"].includes(status.phase)) {
+      setPendingAction(null);
+    }
+  }, [status.phase]);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -395,7 +404,7 @@ export default function App() {
     return () => document.removeEventListener("keydown", handleKeyDown, true);
   }, [externalStopOffered]);
 
-  const locked = ["running", "starting", "stopping"].includes(status.phase);
+  const locked = ["running", "starting", "stopping", "restarting"].includes(status.phase);
   // 合并展示是派生视图：仅在日志列表变化时重算，logs 原始 state 不变
   const mergedLogs = useMemo(() => mergeLogs(logs), [logs]);
 
@@ -626,31 +635,63 @@ export default function App() {
       cancelLabel: t.cancel,
     });
     if (!confirmed) return;
-    setBusy(true);
-    setError(null);
+    flushSync(() => {
+      setBusy(true);
+      setPendingAction("force_stop");
+      setStatus((prev) => ({ ...prev, phase: "stopping", message: "正在停止外部服务..." }));
+      setError(null);
+    });
+    await new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 50)));
     try {
-      setStatus(await invoke<ServiceStatus>("force_stop_external_service", { config }));
+      const [nextStatus] = await Promise.all([
+        invoke<ServiceStatus>("force_stop_external_service", { config }),
+        new Promise((resolve) => setTimeout(resolve, 500)),
+      ]);
+      setStatus(nextStatus);
       setExternalStopOffered(false);
     } catch (reason) {
       setError(errorMessage(reason));
+      setPendingAction(null);
     } finally {
       setBusy(false);
+      setPendingAction(null);
     }
   }
 
   async function runCommand(command: "start_service" | "stop_service" | "restart_service") {
     if (!config) return;
-    setBusy(true);
-    setError(null);
+    const action = command === "start_service" ? "start" : command === "stop_service" ? "stop" : "restart";
+    flushSync(() => {
+      setBusy(true);
+      setPendingAction(action);
+      if (command === "start_service") {
+        setStatus((prev) => ({ ...prev, phase: "starting", message: "正在启动 DSH..." }));
+      } else if (command === "stop_service") {
+        setStatus((prev) => ({ ...prev, phase: "stopping", message: "正在停止 DSH..." }));
+      } else if (command === "restart_service") {
+        setStatus((prev) => ({ ...prev, phase: "restarting", message: "正在重启 DSH..." }));
+      }
+      setError(null);
+    });
+    // 确保浏览器在发起后端 IPC 前，已经将遮罩绘制到屏幕上
+    await new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 50)));
     try {
       const payload = command === "stop_service" ? {} : { config };
-      const nextStatus = await invoke<ServiceStatus>(command, payload);
+      const minDelay = command === "stop_service" ? 500 : 0;
+      const [nextStatus] = await Promise.all([
+        invoke<ServiceStatus>(command, payload),
+        minDelay ? new Promise((resolve) => setTimeout(resolve, minDelay)) : Promise.resolve(),
+      ]);
       setStatus(nextStatus);
       setExternalStopOffered(command === "start_service" && nextStatus.phase === "external");
     } catch (reason) {
       setError(errorMessage(reason));
+      setPendingAction(null);
     } finally {
       setBusy(false);
+      if (command === "stop_service") {
+        setPendingAction(null);
+      }
     }
   }
 
@@ -668,6 +709,22 @@ export default function App() {
 
   const shouldStart = status.phase === "stopped" || status.phase === "external" || (status.phase === "failed" && !status.pid);
   const webAvailable = status.phase === "running" || status.phase === "external";
+  const isTransitioning = busy || pendingAction !== null || ["starting", "stopping", "restarting"].includes(status.phase);
+
+  let transitionTitle = t.dshStarting;
+  if (pendingAction === "restart" || status.phase === "restarting") {
+    transitionTitle = pendingAction === "restart" ? t.dshRestartAction : t.dshRestarting;
+  } else if (pendingAction === "stop" || status.phase === "stopping") {
+    transitionTitle = t.dshStopping;
+  } else if (pendingAction === "force_stop") {
+    transitionTitle = t.forceStoppingAction;
+  } else if (pendingAction === "start" || status.phase === "starting") {
+    transitionTitle = t.dshStarting;
+  } else if (busy && !shouldStart) {
+    transitionTitle = t.dshStopping;
+  }
+
+  const transitionDetail = translateBackendMessage(status.message, lang);
 
   return (
     <main className="launcher-shell">
@@ -756,17 +813,17 @@ export default function App() {
           <div className={`compact-status ${status.phase}`}><span />{phaseLabels[status.phase]}{status.pid && <small>PID {status.pid}</small>}</div>
           <button
             className={`power-button ${externalStopOffered ? "force-stop" : status.phase}`}
-            disabled={busy || status.phase === "starting" || status.phase === "stopping"}
+            disabled={busy || status.phase === "stopping"}
             onClick={(event) => externalStopOffered
               ? void forceStopExternal(event.currentTarget)
               : void runCommand(shouldStart ? "start_service" : "stop_service")}
-            title={externalStopOffered ? t.forceStopConfirmTitle : status.phase === "external" ? t.recheckWithConfig : status.phase === "running" ? t.stopService : t.startService}
+            title={externalStopOffered ? t.forceStopConfirmTitle : status.phase === "external" ? t.recheckWithConfig : ["running", "starting", "restarting"].includes(status.phase) ? t.stopService : t.startService}
           >
             <span className="power-ring">{externalStopOffered ? <Ban size={45} strokeWidth={1.7} /> : <Power size={45} strokeWidth={1.7} />}</span>
           </button>
 
           <div className="launch-copy">
-            <h1>{externalStopOffered ? t.forceStopConfirmTitle : status.phase === "running" ? t.dshRunning : status.phase === "starting" ? t.dshStarting : status.phase === "stopping" ? t.dshStopping : t.dshStart}</h1>
+            <h1>{externalStopOffered ? t.forceStopConfirmTitle : status.phase === "running" ? t.dshRunning : status.phase === "starting" ? t.dshStarting : status.phase === "stopping" ? t.dshStopping : status.phase === "restarting" ? t.dshRestarting : t.dshStart}</h1>
             <p>{translateBackendMessage(status.message, lang)}</p>
             {status.phase === "running" && embeddedWebviewOpen && <p className="window-close-hint">{t.windowCloseHint}</p>}
           </div>
@@ -906,6 +963,27 @@ export default function App() {
                 </button>
               )}
             </footer>
+          </section>
+        </div>
+      )}
+      {isTransitioning && (
+        <div className="action-overlay-backdrop" role="alert" aria-busy="true" aria-live="polite">
+          <section className="action-overlay-card" role="dialog" aria-modal="true" aria-label={transitionTitle}>
+            <span className="loading-spinner" aria-hidden="true" />
+            <div className="action-overlay-text">
+              <strong>{transitionTitle}</strong>
+              {transitionDetail && <p>{transitionDetail}</p>}
+            </div>
+            {(status.phase === "starting" || pendingAction === "start") && (
+              <button
+                type="button"
+                className="action-overlay-cancel"
+                disabled={busy && pendingAction === "stop"}
+                onClick={() => void runCommand("stop_service")}
+              >
+                {t.stopService}
+              </button>
+            )}
           </section>
         </div>
       )}

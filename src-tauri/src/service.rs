@@ -12,7 +12,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread;
 #[cfg(unix)]
@@ -85,8 +85,26 @@ struct OwnedChild {
     process_group: i32,
 }
 
+/// 插件 detached 重启后留下的 DSH 进程。它不是 Launcher 的子进程，
+/// 因此只能通过端口和命令行身份继续观察，不能使用 waitpid 获取退出状态。
+#[derive(Debug, Clone)]
+struct AdoptedProcess {
+    pid: u32,
+    port: u16,
+    command_line: String,
+}
+
 pub struct ServiceManager {
     owned: Option<OwnedChild>,
+    adopted: Arc<Mutex<Option<AdoptedProcess>>>,
+    active_cancel: Option<Arc<AtomicBool>>,
+    session_cancel: Option<Arc<AtomicBool>>,
+    active_config: Option<LauncherConfig>,
+    quarantine_cancel: Option<Arc<AtomicBool>>,
+    quarantine_active: Arc<AtomicBool>,
+    lifecycle: Arc<Mutex<()>>,
+    handoff_active: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
     status: Arc<Mutex<ServiceStatus>>,
     /// dsh 启动日志打印的带 launch-token 的 URL（`dsh web: http://...?token=...`）。
     /// 每次 start 重置；external 模式下为 None。打开 Web GUI 时优先于固定地址。
@@ -97,6 +115,15 @@ impl ServiceManager {
     pub fn new() -> Self {
         Self {
             owned: None,
+            adopted: Arc::new(Mutex::new(None)),
+            active_cancel: None,
+            session_cancel: None,
+            active_config: None,
+            quarantine_cancel: None,
+            quarantine_active: Arc::new(AtomicBool::new(false)),
+            lifecycle: Arc::new(Mutex::new(())),
+            handoff_active: Arc::new(AtomicBool::new(false)),
+            generation: Arc::new(AtomicU64::new(0)),
             status: Arc::new(Mutex::new(ServiceStatus::default())),
             authenticated_url: Arc::new(Mutex::new(None)),
         }
@@ -112,14 +139,43 @@ impl ServiceManager {
         config: LauncherConfig,
         restarting: bool,
     ) -> Result<ServiceStatus, String> {
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let _lifecycle_guard = lifecycle
+            .lock()
+            .map_err(|_| "DSH 生命周期锁已损坏".to_string())?;
         self.prune_exited_child();
-        if self.owned.is_some() {
+        if let Some(quarantine_cancel) = self.quarantine_cancel.take() {
+            quarantine_cancel.store(true, Ordering::Release);
+        }
+        self.quarantine_active.store(false, Ordering::Release);
+        if self.owned.is_some()
+            || self.adopted.lock().map(|slot| slot.is_some()).unwrap_or(true)
+            || self.handoff_active.load(Ordering::Acquire)
+        {
             return Err("DSH 服务已由启动器运行".into());
         }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let session_cancel = Arc::new(AtomicBool::new(false));
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.active_cancel = Some(Arc::clone(&cancelled));
+        self.session_cancel = Some(Arc::clone(&session_cancel));
+        self.active_config = Some(config.clone());
+        self.handoff_active.store(false, Ordering::Release);
 
-        let dsh = resolve_dsh(&config.dsh_path)
-            .ok_or_else(|| "未找到可执行的 dsh，请手动指定路径".to_string())?;
-        let addresses = resolve_addresses(&config.host, config.port)?;
+        let dsh = match resolve_dsh(&config.dsh_path) {
+            Some(path) => path,
+            None => {
+                self.clear_pending_start(&cancelled);
+                return Err("未找到可执行的 dsh，请手动指定路径".into());
+            }
+        };
+        let addresses = match resolve_addresses(&config.host, config.port) {
+            Ok(addresses) => addresses,
+            Err(error) => {
+                self.clear_pending_start(&cancelled);
+                return Err(error);
+            }
+        };
         if connect_any(&addresses, Duration::from_millis(400)) {
             if http_ready(&config.host, config.port) {
                 let status = ServiceStatus {
@@ -138,12 +194,20 @@ impl ServiceManager {
                     "warning",
                     &format!("External web service detected on port {}", config.port),
                 );
+                self.clear_pending_start(&cancelled);
                 return Ok(status);
             }
+            self.clear_pending_start(&cancelled);
             return Err(format!("端口 {} 已被其他程序占用", config.port));
         }
 
-        let custom_args = parse_custom_args(&config.custom_args)?;
+        let custom_args = match parse_custom_args(&config.custom_args) {
+            Ok(args) => args,
+            Err(error) => {
+                self.clear_pending_start(&cancelled);
+                return Err(error);
+            }
+        };
         let url = service_url(&config.host, config.port);
         if let Ok(mut slot) = self.authenticated_url.lock() {
             *slot = None;
@@ -211,19 +275,23 @@ impl ServiceManager {
             }
         }
 
-        let mut child = command.spawn().map_err(|error| {
-            set_status(
-                &self.status,
-                &app,
-                ServiceStatus {
-                    phase: "failed".into(),
-                    pid: None,
-                    url: None,
-                    message: format!("启动失败：{error}"),
-                },
-            );
-            format!("启动 dsh 失败：{error}")
-        })?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                self.clear_pending_start(&cancelled);
+                set_status(
+                    &self.status,
+                    &app,
+                    ServiceStatus {
+                        phase: "failed".into(),
+                        pid: None,
+                        url: None,
+                        message: format!("启动失败：{error}"),
+                    },
+                );
+                return Err(format!("启动 dsh 失败：{error}"));
+            }
+        };
         let pid = child.id();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -248,7 +316,17 @@ impl ServiceManager {
             );
         }
 
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let adopted_poisoned = self.adopted.lock().is_err();
+        if adopted_poisoned {
+            if let Ok(mut child) = child.lock() {
+                let _ = child.kill();
+            }
+            self.clear_pending_start(&cancelled);
+            return Err("DSH 服务状态锁已损坏".into());
+        }
+        if let Ok(mut slot) = self.adopted.lock() {
+            slot.take();
+        }
         self.owned = Some(OwnedChild {
             child: child.clone(),
             cancelled: cancelled.clone(),
@@ -273,8 +351,22 @@ impl ServiceManager {
             pid,
             restarting,
             Arc::clone(&self.authenticated_url),
+            session_cancel,
+            Arc::clone(&self.adopted),
+            Arc::clone(&self.handoff_active),
+            Arc::clone(&self.generation),
+            generation,
+            Arc::clone(&self.lifecycle),
         );
         Ok(status)
+    }
+
+    fn clear_pending_start(&mut self, cancelled: &AtomicBool) {
+        cancelled.store(true, Ordering::Release);
+        self.active_cancel.take();
+        self.session_cancel.take();
+        self.active_config.take();
+        self.handoff_active.store(false, Ordering::Release);
     }
 
     fn prune_exited_child(&mut self) {
@@ -341,74 +433,127 @@ impl ServiceManager {
     }
 
     pub fn stop(&mut self, app: Option<&AppHandle>) -> Result<ServiceStatus, String> {
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let _lifecycle_guard = lifecycle
+            .lock()
+            .map_err(|_| "DSH 生命周期锁已损坏".to_string())?;
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        if let Some(cancelled) = self.active_cancel.take() {
+            cancelled.store(true, Ordering::Release);
+        }
+        if let Some(session_cancel) = self.session_cancel.take() {
+            session_cancel.store(true, Ordering::Release);
+        }
+        if let Some(quarantine_cancel) = self.quarantine_cancel.take() {
+            quarantine_cancel.store(true, Ordering::Release);
+        }
+        self.handoff_active.store(false, Ordering::Release);
+        self.quarantine_active.store(false, Ordering::Release);
         if let Some(app) = app {
             close_embedded_webview(app);
         }
         self.prune_exited_child();
-        let Some(owned) = self.owned.take() else {
+        let owned = self.owned.take();
+        let adopted = self.adopted.lock().ok().and_then(|mut slot| slot.take());
+        let had_service = owned.is_some() || adopted.is_some() || self.active_config.is_some();
+        if !had_service {
             let status = ServiceStatus::default();
             if let Ok(mut current) = self.status.lock() {
                 *current = status.clone();
             }
             return Ok(status);
-        };
+        }
 
-        owned.cancelled.store(true, Ordering::Release);
-        if let Ok(mut current) = self.status.lock() {
+        if let Some(app) = app {
+            set_status(
+                &self.status,
+                app,
+                ServiceStatus {
+                    phase: "stopping".into(),
+                    pid: None,
+                    url: None,
+                    message: "正在停止 DSH...".into(),
+                },
+            );
+        } else if let Ok(mut current) = self.status.lock() {
             current.phase = "stopping".into();
             current.message = "正在停止 DSH...".into();
         }
 
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(-owned.process_group, libc::SIGTERM);
-        }
-        #[cfg(windows)]
-        {
-            let pid = owned
-                .child
-                .lock()
-                .map(|child| child.id())
-                .unwrap_or_default();
-            let mut taskkill = Command::new("taskkill");
-            suppress_console_window(&mut taskkill);
-            let _ = taskkill
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                .status();
-        }
-        #[cfg(all(not(unix), not(windows)))]
-        if let Ok(mut child) = owned.child.lock() {
-            let _ = child.kill();
+        if let Some(owned) = owned {
+            owned.cancelled.store(true, Ordering::Release);
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-owned.process_group, libc::SIGTERM);
+            }
+            #[cfg(windows)]
+            {
+                let pid = owned
+                    .child
+                    .lock()
+                    .map(|child| child.id())
+                    .unwrap_or_default();
+                let mut taskkill = Command::new("taskkill");
+                suppress_console_window(&mut taskkill);
+                let _ = taskkill
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .status();
+            }
+            #[cfg(all(not(unix), not(windows)))]
+            if let Ok(mut child) = owned.child.lock() {
+                let _ = child.kill();
+            }
+
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if let Ok(mut child) = owned.child.lock() {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) if Instant::now() < deadline => {}
+                        Ok(None) => {
+                            #[cfg(unix)]
+                            unsafe {
+                                libc::kill(-owned.process_group, libc::SIGKILL);
+                            }
+                            #[cfg(windows)]
+                            {
+                                let mut taskkill = Command::new("taskkill");
+                                suppress_console_window(&mut taskkill);
+                                let _ = taskkill
+                                    .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                                    .status();
+                            }
+                            #[cfg(all(not(unix), not(windows)))]
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            break;
+                        }
+                        Err(error) => return Err(format!("检查 DSH 退出状态失败：{error}")),
+                    }
+                }
+                thread::sleep(Duration::from_millis(80));
+            }
         }
 
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            if let Ok(mut child) = owned.child.lock() {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) if Instant::now() < deadline => {}
-                    Ok(None) => {
-                        #[cfg(unix)]
-                        unsafe {
-                            libc::kill(-owned.process_group, libc::SIGKILL);
-                        }
-                        #[cfg(windows)]
-                        {
-                            let mut taskkill = Command::new("taskkill");
-                            suppress_console_window(&mut taskkill);
-                            let _ = taskkill
-                                .args(["/PID", &child.id().to_string(), "/T", "/F"])
-                                .status();
-                        }
-                        #[cfg(all(not(unix), not(windows)))]
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break;
-                    }
-                    Err(error) => return Err(format!("检查 DSH 退出状态失败：{error}")),
-                }
+        if let Some(adopted) = adopted {
+            if external_process_still_matches(adopted.pid, adopted.port, &adopted.command_line) {
+                terminate_external_process(adopted.pid, adopted.port, &adopted.command_line)?;
             }
-            thread::sleep(Duration::from_millis(80));
+        }
+
+        if let Some(config) = self.active_config.clone() {
+            let quarantine_cancel = Arc::new(AtomicBool::new(false));
+            self.quarantine_cancel = Some(Arc::clone(&quarantine_cancel));
+            self.quarantine_active.store(true, Ordering::Release);
+            spawn_stop_quarantine(
+                app.cloned(),
+                config,
+                quarantine_cancel,
+                Arc::clone(&self.quarantine_active),
+                Arc::clone(&self.lifecycle),
+                Arc::clone(&self.generation),
+                self.generation.load(Ordering::Acquire),
+            );
         }
 
         let status = ServiceStatus::default();
@@ -427,6 +572,19 @@ impl ServiceManager {
     }
 }
 
+const HANDOFF_TIMEOUT: Duration = Duration::from_secs(30);
+const HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const QUARANTINE_TIMEOUT: Duration = Duration::from_secs(30);
+const ADOPTED_MISS_LIMIT: u8 = 4;
+
+fn lifecycle_active(
+    cancelled: &AtomicBool,
+    generation: &AtomicU64,
+    run_generation: u64,
+) -> bool {
+    !cancelled.load(Ordering::Acquire) && generation.load(Ordering::Acquire) == run_generation
+}
+
 #[allow(clippy::too_many_arguments)]
 fn monitor_startup(
     child: Arc<Mutex<Child>>,
@@ -438,6 +596,12 @@ fn monitor_startup(
     pid: u32,
     restarting: bool,
     authenticated_url: Arc<Mutex<Option<String>>>,
+    session_cancel: Arc<AtomicBool>,
+    adopted: Arc<Mutex<Option<AdoptedProcess>>>,
+    handoff_active: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+    run_generation: u64,
+    lifecycle: Arc<Mutex<()>>,
 ) {
     thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -449,23 +613,27 @@ fn monitor_startup(
                 .and_then(|mut child| child.try_wait().ok())
                 .flatten();
             if let Some(exit) = exit {
-                set_status(
-                    &status,
-                    &app,
-                    ServiceStatus {
-                        phase: "failed".into(),
-                        pid: None,
-                        url: None,
-                        message: format!("DSH 在启动期间退出：{exit}"),
-                    },
-                );
+                session_cancel.store(true, Ordering::Release);
+                if let Ok(_guard) = lifecycle.lock()
+                    && lifecycle_active(&cancelled, &generation, run_generation)
+                {
+                    set_status(
+                        &status,
+                        &app,
+                        ServiceStatus {
+                            phase: "failed".into(),
+                            pid: None,
+                            url: None,
+                            message: format!("DSH 在启动期间退出：{exit}"),
+                        },
+                    );
+                }
                 return;
             }
             if http_ready(&config.host, config.port) {
                 // dsh 打印带 token URL 通常先于端口监听，但日志线程异步解析可能滞后于
-                // 健康检查；此处限时等待捕获结果，避免打开旧固定地址导致
-                // "authentication required"。
-                let deadline = Instant::now() + Duration::from_secs(3);
+                // 健康检查；此处限时等待捕获结果，避免打开旧固定地址导致认证失败。
+                let token_deadline = Instant::now() + Duration::from_secs(3);
                 loop {
                     let captured = authenticated_url
                         .lock()
@@ -475,7 +643,7 @@ fn monitor_startup(
                         logged_url = authenticated;
                         break;
                     }
-                    if Instant::now() >= deadline {
+                    if Instant::now() >= token_deadline {
                         emit_log(
                             &app,
                             "launcher",
@@ -485,6 +653,9 @@ fn monitor_startup(
                         break;
                     }
                     thread::sleep(Duration::from_millis(100));
+                }
+                if !lifecycle_active(&cancelled, &generation, run_generation) {
+                    return;
                 }
                 set_status(
                     &status,
@@ -497,9 +668,11 @@ fn monitor_startup(
                     },
                 );
                 emit_log(&app, "launcher", "info", "Health check passed");
-                // 会话监视：用捕获的 launch-token URL（内含 token）换取 cookie 并轮询运行中会话。
-                // 与子进程共用同一个取消标记：stop/restart 时随之终止。
-                crate::session_monitor::spawn(app.clone(), logged_url.clone(), Arc::clone(&cancelled));
+                crate::session_monitor::spawn(
+                    app.clone(),
+                    logged_url.clone(),
+                    Arc::clone(&session_cancel),
+                );
                 if should_open_after_start(&config, restarting)
                     && let Err(error) = perform_launch_action(&app, &config, &logged_url)
                 {
@@ -510,12 +683,30 @@ fn monitor_startup(
                         &english_launch_action_error(&error),
                     );
                 }
-                monitor_child(child, cancelled, status, app);
+                monitor_child(
+                    child,
+                    cancelled,
+                    session_cancel,
+                    status,
+                    app,
+                    config,
+                    url,
+                    pid,
+                    adopted,
+                    handoff_active,
+                    generation,
+                    run_generation,
+                    Arc::clone(&lifecycle),
+                    Arc::clone(&authenticated_url),
+                );
                 return;
             }
             thread::sleep(Duration::from_millis(250));
         }
-        if !cancelled.load(Ordering::Acquire) {
+        if lifecycle_active(&cancelled, &generation, run_generation)
+            && let Ok(_guard) = lifecycle.lock()
+            && lifecycle_active(&cancelled, &generation, run_generation)
+        {
             set_status(
                 &status,
                 &app,
@@ -536,42 +727,388 @@ fn monitor_startup(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn monitor_child(
     child: Arc<Mutex<Child>>,
     cancelled: Arc<AtomicBool>,
+    session_cancel: Arc<AtomicBool>,
     status: Arc<Mutex<ServiceStatus>>,
     app: AppHandle,
+    config: LauncherConfig,
+    url: String,
+    pid: u32,
+    adopted: Arc<Mutex<Option<AdoptedProcess>>>,
+    handoff_active: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+    run_generation: u64,
+    lifecycle: Arc<Mutex<()>>,
+    authenticated_url: Arc<Mutex<Option<String>>>,
 ) {
-    thread::spawn(move || {
-        loop {
-            thread::sleep(Duration::from_millis(500));
-            let exit = child
-                .lock()
-                .ok()
-                .and_then(|mut child| child.try_wait().ok())
-                .flatten();
-            if let Some(exit) = exit {
-                if cancelled.load(Ordering::Acquire) {
-                    break;
-                }
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_millis(500));
+        let exit = child
+            .lock()
+            .ok()
+            .and_then(|mut child| child.try_wait().ok())
+            .flatten();
+        let Some(exit) = exit else { continue };
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        if exit.success() {
+            session_cancel.store(true, Ordering::Release);
+            begin_handoff(
+                cancelled,
+                status,
+                app,
+                config,
+                url,
+                pid,
+                adopted,
+                handoff_active,
+                generation,
+                run_generation,
+                authenticated_url,
+                lifecycle,
+            );
+        } else {
+            session_cancel.store(true, Ordering::Release);
+            if let Ok(_guard) = lifecycle.lock()
+                && lifecycle_active(&cancelled, &generation, run_generation)
+            {
                 close_embedded_webview(&app);
-                let next = ServiceStatus {
-                    phase: "stopped".into(),
-                    pid: None,
-                    url: None,
-                    message: format!("DSH 已退出：{exit}"),
-                };
-                set_status(&status, &app, next);
+                set_status(
+                    &status,
+                    &app,
+                    ServiceStatus {
+                        phase: "stopped".into(),
+                        pid: None,
+                        url: None,
+                        message: format!("DSH 已退出：{exit}"),
+                    },
+                );
                 emit_log(
                     &app,
                     "launcher",
                     "warning",
                     &format!("DSH process exited: {exit}"),
                 );
-                break;
             }
         }
+        return;
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn begin_handoff(
+    cancelled: Arc<AtomicBool>,
+    status: Arc<Mutex<ServiceStatus>>,
+    app: AppHandle,
+    config: LauncherConfig,
+    url: String,
+    old_pid: u32,
+    adopted: Arc<Mutex<Option<AdoptedProcess>>>,
+    handoff_active: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+    run_generation: u64,
+    authenticated_url: Arc<Mutex<Option<String>>>,
+    lifecycle: Arc<Mutex<()>>,
+) {
+    if !lifecycle_active(&cancelled, &generation, run_generation)
+        || handoff_active.swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    {
+        let Ok(_guard) = lifecycle.lock() else {
+            handoff_active.store(false, Ordering::Release);
+            return;
+        };
+        if !lifecycle_active(&cancelled, &generation, run_generation) {
+            handoff_active.store(false, Ordering::Release);
+            return;
+        }
+        if let Ok(mut slot) = authenticated_url.lock() {
+            *slot = None;
+        }
+        set_status(
+            &status,
+            &app,
+            ServiceStatus {
+                phase: "restarting".into(),
+                pid: None,
+                url: Some(url.clone()),
+                message: "DSH 正在由插件重启，等待新的服务进程...".into(),
+            },
+        );
+    }
+    emit_log(
+        &app,
+        "launcher",
+        "info",
+        &format!("DSH exited cleanly; waiting for plugin successor after PID {old_pid}"),
+    );
+    thread::spawn(move || {
+        let deadline = Instant::now() + HANDOFF_TIMEOUT;
+        while Instant::now() < deadline {
+            if !lifecycle_active(&cancelled, &generation, run_generation) {
+                handoff_active.store(false, Ordering::Release);
+                return;
+            }
+            if let Some((candidate_pid, command_line)) = find_successor(&config, old_pid)
+                && http_ready(&config.host, config.port)
+            {
+                let Ok(guard) = lifecycle.lock() else {
+                    handoff_active.store(false, Ordering::Release);
+                    return;
+                };
+                if !lifecycle_active(&cancelled, &generation, run_generation)
+                    || !external_process_still_matches(
+                        candidate_pid,
+                        config.port,
+                        &command_line,
+                    )
+                    || !http_ready(&config.host, config.port)
+                {
+                    drop(guard);
+                    thread::sleep(HANDOFF_POLL_INTERVAL);
+                    continue;
+                }
+                if let Ok(mut slot) = adopted.lock() {
+                    *slot = Some(AdoptedProcess {
+                        pid: candidate_pid,
+                        port: config.port,
+                        command_line: command_line.clone(),
+                    });
+                }
+                if let Ok(mut slot) = authenticated_url.lock() {
+                    *slot = None;
+                }
+                handoff_active.store(false, Ordering::Release);
+                crate::dock_blink::set_running_healthy();
+                set_status(
+                    &status,
+                    &app,
+                    ServiceStatus {
+                        phase: "running".into(),
+                        pid: Some(candidate_pid),
+                        url: Some(url.clone()),
+                        message: "DSH 服务运行中（插件已完成重启）".into(),
+                    },
+                );
+                drop(guard);
+                emit_log(
+                    &app,
+                    "launcher",
+                    "info",
+                    &format!("Adopted plugin-restarted DSH process {candidate_pid}"),
+                );
+                monitor_adopted(
+                    candidate_pid,
+                    command_line,
+                    status,
+                    app,
+                    config,
+                    url,
+                    adopted,
+                    handoff_active,
+                    generation,
+                    run_generation,
+                    cancelled,
+                    authenticated_url,
+                    lifecycle,
+                );
+                return;
+            }
+            thread::sleep(HANDOFF_POLL_INTERVAL);
+        }
+        handoff_active.store(false, Ordering::Release);
+        let Ok(_guard) = lifecycle.lock() else {
+            return;
+        };
+        if !lifecycle_active(&cancelled, &generation, run_generation) {
+            return;
+        }
+        close_embedded_webview(&app);
+        set_status(
+            &status,
+            &app,
+            ServiceStatus {
+                phase: "stopped".into(),
+                pid: None,
+                url: None,
+                message: "DSH 已退出，未找到插件重启的服务进程".into(),
+            },
+        );
+        emit_log(
+            &app,
+            "launcher",
+            "warning",
+            "Plugin successor was not found within 30 seconds",
+        );
+    });
+}
+
+fn find_successor(config: &LauncherConfig, old_pid: u32) -> Option<(u32, String)> {
+    let candidate_pid = external_listener_pid(config.port).ok()?;
+    if candidate_pid == old_pid {
+        return None;
+    }
+    let command_line = external_process_command(candidate_pid).ok()?;
+    if !looks_like_dsh_process(&command_line)
+        || !dsh_command_matches(&command_line, config)
+    {
+        return None;
+    }
+    Some((candidate_pid, command_line))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn monitor_adopted(
+    pid: u32,
+    command_line: String,
+    status: Arc<Mutex<ServiceStatus>>,
+    app: AppHandle,
+    config: LauncherConfig,
+    url: String,
+    adopted: Arc<Mutex<Option<AdoptedProcess>>>,
+    handoff_active: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+    run_generation: u64,
+    cancelled: Arc<AtomicBool>,
+    authenticated_url: Arc<Mutex<Option<String>>>,
+    lifecycle: Arc<Mutex<()>>,
+) {
+    thread::spawn(move || {
+        let mut misses = 0_u8;
+        loop {
+            thread::sleep(Duration::from_millis(500));
+            if !lifecycle_active(&cancelled, &generation, run_generation) {
+                return;
+            }
+            if external_process_still_matches(pid, config.port, &command_line) {
+                misses = 0;
+                continue;
+            }
+            misses = misses.saturating_add(1);
+            if process_alive(pid) && misses < ADOPTED_MISS_LIMIT {
+                continue;
+            }
+            if let Ok(mut slot) = adopted.lock() {
+                if slot.as_ref().map(|process| process.pid) == Some(pid) {
+                    *slot = None;
+                }
+            }
+            begin_handoff(
+                cancelled.clone(),
+                status,
+                app,
+                config,
+                url,
+                pid,
+                adopted,
+                handoff_active,
+                generation,
+                run_generation,
+                authenticated_url,
+                lifecycle,
+            );
+            return;
+        }
+    });
+}
+
+fn spawn_stop_quarantine(
+    app: Option<AppHandle>,
+    config: LauncherConfig,
+    cancelled: Arc<AtomicBool>,
+    quarantine_active: Arc<AtomicBool>,
+    lifecycle: Arc<Mutex<()>>,
+    generation: Arc<AtomicU64>,
+    run_generation: u64,
+) {
+    thread::spawn(move || {
+        let deadline = Instant::now() + QUARANTINE_TIMEOUT;
+        while Instant::now() < deadline {
+            if cancelled.load(Ordering::Acquire)
+                || generation.load(Ordering::Acquire) != run_generation
+            {
+                quarantine_active.store(false, Ordering::Release);
+                return;
+            }
+            if let Some((pid, command_line)) = find_successor(&config, 0)
+                && let Ok(_guard) = lifecycle.lock()
+                && !cancelled.load(Ordering::Acquire)
+                && generation.load(Ordering::Acquire) == run_generation
+                && external_process_still_matches(pid, config.port, &command_line)
+            {
+                let _ = terminate_external_process(pid, config.port, &command_line);
+                if let Some(app) = &app {
+                    emit_log(
+                        app,
+                        "launcher",
+                        "warning",
+                        &format!("Stopped late plugin successor {pid} after user stop"),
+                    );
+                }
+            }
+            thread::sleep(HANDOFF_POLL_INTERVAL);
+        }
+        quarantine_active.store(false, Ordering::Release);
+    });
+}
+
+fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(native_pid) = i32::try_from(pid) else {
+            return false;
+        };
+        if unsafe { libc::kill(native_pid, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        external_process_command(pid).is_ok()
+    }
+}
+
+fn dsh_command_matches(command_line: &str, config: &LauncherConfig) -> bool {
+    let tokens = command_tokens(command_line);
+    option_matches(&tokens, "--profile", config.profile.trim())
+        && option_matches(&tokens, "--host", config.host.trim())
+        && option_matches(&tokens, "--port", &config.port.to_string())
+        && custom_args_match(&tokens, &config.custom_args)
+}
+
+fn command_tokens(command_line: &str) -> Vec<String> {
+    shell_words::split(command_line).unwrap_or_else(|_| {
+        command_line
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    })
+}
+
+fn custom_args_match(tokens: &[String], custom_args: &str) -> bool {
+    let Ok(expected) = parse_custom_args(custom_args) else {
+        return false;
+    };
+    if expected.is_empty() {
+        return true;
+    }
+    tokens
+        .windows(expected.len())
+        .any(|window| window == expected.as_slice())
+}
+
+fn option_matches(tokens: &[String], option: &str, expected: &str) -> bool {
+    tokens.iter().enumerate().any(|(index, token)| {
+        token == option && tokens.get(index + 1).map(String::as_str) == Some(expected)
+            || token.strip_prefix(&format!("{option}=") ) == Some(expected)
+    })
 }
 
 fn pipe_logs<R>(
@@ -2194,6 +2731,33 @@ mod tests {
         assert_eq!(extract_authenticated_url("dsh web: http://127.0.0.1:3080"), None);
         assert_eq!(extract_authenticated_url("Health check passed"), None);
         assert_eq!(extract_authenticated_url(""), None);
+    }
+
+    #[test]
+    fn dsh_command_matches_plugin_restart_argv() {
+        let config = LauncherConfig {
+            profile: "web".into(),
+            host: "127.0.0.1".into(),
+            port: 3080,
+            custom_args: "--no-open".into(),
+            ..Default::default()
+        };
+        assert!(dsh_command_matches(
+            "/Users/jockiller/.nvm/versions/node/v22.19.0/bin/node /Users/jockiller/.nvm/versions/node/v22.19.0/bin/dsh --profile web --host 127.0.0.1 --port 3080 --no-open",
+            &config
+        ));
+        assert!(!dsh_command_matches(
+            "node /usr/local/bin/dsh --profile other --host 127.0.0.1 --port 3080 --no-open",
+            &config
+        ));
+        assert!(!dsh_command_matches(
+            "node /usr/local/bin/dsh --profile web --host 127.0.0.1 --port 3081 --no-open",
+            &config
+        ));
+        assert!(!dsh_command_matches(
+            "node /usr/local/bin/dsh --profile web --host 127.0.0.1 --port 3080",
+            &config
+        ));
     }
 
     #[test]
