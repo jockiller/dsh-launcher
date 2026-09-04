@@ -410,6 +410,7 @@ pub fn run() {
         }
 
         // 点击 Dock 图标或外部唤起时恢复主窗口
+        #[cfg(target_os = "macos")]
         if let RunEvent::Reopen { has_visible_windows, .. } = &event {
             if !has_visible_windows {
                 tray::show_main_window(handle);

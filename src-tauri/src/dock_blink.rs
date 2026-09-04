@@ -53,8 +53,8 @@ const PHASE_BUSY: u8 = 2;
 static CYCLE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// 退出时停止 Dock 帧循环线程，避免应用退出后残留在后台导致 Dock 图标闪变为终端图标。
+#[cfg(target_os = "macos")]
 pub(crate) fn stop() {
-    #[cfg(target_os = "macos")]
     CYCLE_RUNNING.store(false, std::sync::atomic::Ordering::Release);
 }
 
