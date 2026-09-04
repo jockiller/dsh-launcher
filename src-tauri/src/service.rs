@@ -2472,6 +2472,20 @@ pub fn discover_profiles() -> Vec<String> {
     profiles
 }
 
+pub fn profile_directory(profile: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("DSH_HOME")
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+        .or_else(|| user_home().map(|home| home.join(".dsh")))?;
+    let trimmed = profile.trim();
+    let name = if trimmed.is_empty() { "web" } else { trimmed };
+    Some(home.join("profiles").join(name))
+}
+
+pub fn open_service_gui(app: &AppHandle, config: &LauncherConfig, url: &str) -> Result<(), String> {
+    open_configured(app, config, url)
+}
+
 fn english_launch_action_error(error: &str) -> String {
     for (prefix, translated) in [
         ("无效的 DSH URL：", "Invalid DSH URL: "),
@@ -2603,10 +2617,6 @@ fn register_window_state_persistence(window: &WebviewWindow) {
             save_window_state(&window);
             api.prevent_close();
             let _ = window.hide();
-            if !crate::has_other_visible_window(&app, "dsh-webview") {
-                crate::shutdown_service(&app);
-                app.exit(0);
-            }
         }
     });
 }

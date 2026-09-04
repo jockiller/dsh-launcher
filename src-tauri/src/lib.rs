@@ -4,6 +4,7 @@ mod dock_blink;
 mod managed;
 mod service;
 mod session_monitor;
+mod tray;
 mod update;
 
 use std::path::{Path, PathBuf};
@@ -196,6 +197,14 @@ fn open_service_url(app: AppHandle, state: State<'_, AppState>) -> Result<(), St
     service::open_configured(&app, &LauncherConfig::load(), &url)
 }
 
+#[tauri::command]
+fn open_profile_dir(profile: Option<String>) -> Result<(), String> {
+    let dir = service::profile_directory(profile.as_deref().unwrap_or("web"))
+        .ok_or_else(|| "无法定位 DSH Profile 目录".to_string())?;
+    let _ = std::fs::create_dir_all(&dir);
+    service::open_default(&dir.to_string_lossy())
+}
+
 /// Launcher 更新检测：启动时自动检查一次；`force` 为 true 时忽略缓存重新请求。
 /// 网络请求在阻塞线程池执行。网络失败返回 `None`。
 #[tauri::command]
@@ -315,18 +324,12 @@ async fn check_dsh_version(current_version: String) -> Result<managed::DshVersio
 }
 
 pub fn shutdown_service(handle: &AppHandle) {
+    dock_blink::stop();
     if let Some(state) = handle.try_state::<AppState>()
         && let Ok(mut service) = state.service.lock()
     {
         let _ = service.stop(Some(handle));
     }
-}
-
-/// 关闭中的窗口仍可能报可见，所以只统计其它窗口。
-pub(crate) fn has_other_visible_window(app: &AppHandle, closing_label: &str) -> bool {
-    app.webview_windows()
-        .into_iter()
-        .any(|(label, window)| label != closing_label && window.is_visible().unwrap_or(false))
 }
 
 pub fn run() {
@@ -342,6 +345,15 @@ pub fn run() {
                 .map_err(|error| format!("注册 updater 插件失败：{error}"))?;
 
             let config = LauncherConfig::load();
+            // 系统托盘初始化
+            if let Err(error) = tray::init(app.handle()) {
+                service::emit_log(
+                    app.handle(),
+                    "launcher",
+                    "warning",
+                    &format!("初始化系统托盘失败：{error}"),
+                );
+            }
             // Dock 图标动态指示（macOS）：纯外挂，失败只影响自身，不影响主流程。
             dock_blink::init(app.handle().clone());
             if config.auto_start {
@@ -366,6 +378,7 @@ pub fn run() {
             open_project_page,
             open_dsh_github_page,
             open_service_url,
+            open_profile_dir,
             check_launcher_update,
             open_release_page,
             install_managed_runtime,
@@ -381,20 +394,26 @@ pub fn run() {
         .expect("failed to build DSH Launcher");
 
     app.run(|handle, event| {
-        // 任一窗口仍显示则保持运行。内置 WebView 关窗只隐藏不销毁，
-        // 所以两个窗口都不显示时必须显式退出，否则 macOS 会留在 Dock。
+        // macOS 平台关闭窗口仅隐藏，不退出应用，应用与 DSH 继续常驻在状态栏托盘/Dock 中。
         if let RunEvent::WindowEvent {
             label,
             event: WindowEvent::CloseRequested { api, .. },
             ..
         } = &event
             && label == "main"
-            && !has_other_visible_window(handle, "main")
         {
             api.prevent_close();
-            shutdown_service(handle);
-            handle.exit(0);
+            if let Some(window) = handle.get_webview_window("main") {
+                let _ = window.hide();
+            }
             return;
+        }
+
+        // 点击 Dock 图标或外部唤起时恢复主窗口
+        if let RunEvent::Reopen { has_visible_windows, .. } = &event {
+            if !has_visible_windows {
+                tray::show_main_window(handle);
+            }
         }
 
         if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {

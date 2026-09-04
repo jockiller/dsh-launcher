@@ -237,6 +237,9 @@ export default function App() {
         setDshVersionInfo(null);
         setProfiles(data.profiles);
         setStatus(data.status);
+        if (data.status.phase === "external") {
+          setExternalStopOffered(true);
+        }
         if (data.config.managedRuntimeDir) {
           // Managed runtimes keep their existing update check; external runtimes use the separate async check below.
           void invoke<ManagedStatus>("managed_runtime_status", { root: data.config.managedRuntimeDir })
@@ -257,7 +260,12 @@ export default function App() {
       })
       .catch(() => undefined);
 
-    const statusListener = listen<ServiceStatus>("service-status", ({ payload }) => setStatus(payload));
+    const statusListener = listen<ServiceStatus>("service-status", ({ payload }) => {
+      setStatus(payload);
+      if (payload.phase === "external") {
+        setExternalStopOffered(true);
+      }
+    });
     const logListener = listen<LogLine>("service-log", ({ payload }) => {
       setLogs((current) => [...current.slice(-9998), payload]);
     });
@@ -484,6 +492,14 @@ export default function App() {
       setVersion(detectedVersion);
       setDshVersionInfo(null);
       setError(null);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  }
+
+  async function openProfileDirectory() {
+    try {
+      await invoke("open_profile_dir", { profile: config?.profile || "web" });
     } catch (reason) {
       setError(errorMessage(reason));
     }
@@ -807,7 +823,21 @@ export default function App() {
             </div>
 
             <div className="connection-row">
-              <div className="mini-field"><label htmlFor="profile">{t.profile}</label><input id="profile" list="profile-list" value={config.profile} disabled={locked} onChange={(event) => patch("profile", event.target.value)} /><datalist id="profile-list">{profiles.map((profile) => <option key={profile} value={profile} />)}</datalist></div>
+              <div className="mini-field">
+                <div className="field-label-row">
+                  <label htmlFor="profile">{t.profile}</label>
+                  <button
+                    type="button"
+                    className="profile-dir-btn"
+                    onClick={() => void openProfileDirectory()}
+                    title={t.openProfileDir}
+                  >
+                    <FolderOpen size={10} />
+                  </button>
+                </div>
+                <input id="profile" list="profile-list" value={config.profile} disabled={locked} onChange={(event) => patch("profile", event.target.value)} />
+                <datalist id="profile-list">{profiles.map((profile) => <option key={profile} value={profile} />)}</datalist>
+              </div>
               <div className="mini-field"><label htmlFor="host">{t.host}</label><input id="host" value={config.host} disabled={locked} onChange={(event) => patch("host", event.target.value)} /></div>
               <div className="mini-field port"><label htmlFor="port">{t.port}</label><input id="port" type="text" inputMode="numeric" pattern="[0-9]*" value={config.port} disabled={locked} onChange={(event) => patch("port", Number(event.target.value.replace(/\D/g, "").slice(0, 5)))} /></div>
             </div>
@@ -1030,7 +1060,7 @@ export default function App() {
               <strong>{transitionTitle}</strong>
               {transitionDetail && <p>{transitionDetail}</p>}
             </div>
-            {(status.phase === "starting" || pendingAction === "start") && (
+            {(status.phase === "starting" || pendingAction === "start" || status.phase === "restarting" || pendingAction === "restart") && (
               <button
                 type="button"
                 className="action-overlay-cancel"

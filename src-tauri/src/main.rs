@@ -3,4 +3,5 @@
 
 fn main() {
     dsh_launcher_lib::run();
+    std::process::exit(0);
 }

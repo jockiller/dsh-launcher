@@ -49,6 +49,18 @@ const PHASE_HEALTHY: u8 = 1;
 #[cfg(target_os = "macos")]
 const PHASE_BUSY: u8 = 2;
 
+#[cfg(target_os = "macos")]
+static CYCLE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// 退出时停止 Dock 帧循环线程，避免应用退出后残留在后台导致 Dock 图标闪变为终端图标。
+pub(crate) fn stop() {
+    #[cfg(target_os = "macos")]
+    CYCLE_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn stop() {}
+
 /// 服务状态方调用：报告 DSH 服务「未就绪」（启动中/已停止/启动失败）。
 /// 监视器存活期间由 session 监视接手「健康/忙碌」的切换。
 pub(crate) fn set_idle() {
@@ -92,8 +104,8 @@ pub(crate) fn init(app: tauri::AppHandle) {
             }));
             if result.is_err() {
                 crate::service::emit_log(&app, "dock", "error", "Dock 指示：意外异常退出，已恢复原始图标");
+                imp::restore_base(&app);
             }
-            imp::restore_base(&app);
         })
         .is_err()
         {
@@ -411,8 +423,11 @@ mod imp {
         let red = engine.idle_red_png();
         let mut shown: Option<DockPhase> = None;
         let mut red_active = false;
-        loop {
+        while super::CYCLE_RUNNING.load(Ordering::Acquire) {
             thread::sleep(FRAME_PERIOD);
+            if !super::CYCLE_RUNNING.load(Ordering::Acquire) {
+                break;
+            }
             let phase = match PHASE.load(Ordering::Acquire) {
                 PHASE_BUSY => DockPhase::Busy,
                 PHASE_HEALTHY => DockPhase::Healthy,

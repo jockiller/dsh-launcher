@@ -76,6 +76,8 @@ h1, h2, p { margin: 0; }
 .post-launch-row { display: grid; grid-template-columns: 112px minmax(120px, 1fr) auto; align-items: end; gap: 8px; }
 .post-launch-row .action select { width: 112px; }
 .post-launch-row .mini-toggle { height: 28px; padding-right: 2px; }
+.profile-dir-btn { display: inline-flex; align-items: center; justify-content: center; padding: 1px 2px; border: 0; background: transparent; color: #8b8d94; cursor: pointer; border-radius: 3px; }
+.profile-dir-btn:hover { color: #5e55b3; background: #f0f0f4; }
 .mini-field { display: grid; gap: 4px; }
 .mini-field label { color: #7b7d84; font-size: 9px; font-weight: 590; }
 .field-label-row { display: flex; align-items: center; justify-content: space-between; }
@@ -220,6 +222,7 @@ input:disabled, select:disabled { background: #f3f3f4; color: #85878d; }
 [data-theme="dark"] .power-button.force-stop::before { border-color: #623a3f; }
 [data-theme="dark"] .dsh-version-update { color: #7e8087; }
 [data-theme="dark"] .dsh-version-update:hover { color: #a39ce2; }
+[data-theme="dark"] .profile-dir-btn:hover { color: #a39ce2; background: #33343a; }
 [data-theme="dark"] button:focus-visible { outline-color: #9a92df; }
 [data-theme="dark"] .launch-copy h1 { color: #ececef; }
 [data-theme="dark"] .app-version { color: #696c73; }
