@@ -4,19 +4,21 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { confirm as confirmDialog, open } from "@tauri-apps/plugin-dialog";
 import {
+  AppWindow,
   Ban,
   Copy,
   Download,
   ExternalLink,
   FileSearch,
   FolderOpen,
-  Moon,
   PackageCheck,
   Power,
   RefreshCw,
   RotateCw,
-  Sun,
+  Settings,
   Trash2,
+  TriangleAlert,
+  X,
 } from "lucide-react";
 import {
   detectLanguage,
@@ -27,10 +29,10 @@ import {
   type Lang,
 } from "./i18n";
 import { mergeLogs, type LogLine } from "./logMerge";
+import { WindowControls } from "./WindowControls";
 import changelogMarkdown from "../CHANGELOG.md?raw";
 
 type Phase = "stopped" | "starting" | "running" | "stopping" | "restarting" | "failed" | "external";
-type LaunchAction = "none" | "default_browser" | "embedded_webview";
 type Theme = "light" | "dark";
 
 interface Config {
@@ -38,7 +40,6 @@ interface Config {
   profile: string;
   host: string;
   port: number;
-  launchAction: LaunchAction;
   customArgs: string;
   autoStart: boolean;
   autoScrollLogs: boolean;
@@ -54,6 +55,7 @@ interface ServiceStatus {
 
 interface Bootstrap {
   appVersion: string;
+  platform: string;
   config: Config;
   detectedDsh: string | null;
   dshVersion: string | null;
@@ -93,6 +95,11 @@ interface ManagedProgress {
   phase: string;
   message: string;
   percent: number | null;
+}
+
+interface ProfilePlugin {
+  name: string;
+  version: string;
 }
 
 // 与后端 ServiceStatus 默认值一致；展示时经 translateBackendMessage 按当前语言渲染
@@ -170,6 +177,7 @@ export default function App() {
     return saved === "light" || saved === "dark" ? saved : null;
   });
   const theme = themeOverride ?? systemTheme;
+  const [platform, setPlatform] = useState<string | null>(null);
   const [config, setConfig] = useState<Config | null>(null);
   const [appVersion, setAppVersion] = useState("");
   const [releaseUpdate, setReleaseUpdate] = useState<ReleaseUpdate | null>(null);
@@ -182,6 +190,8 @@ export default function App() {
   const [externalDshCopyState, setExternalDshCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const [status, setStatus] = useState<ServiceStatus>(emptyStatus);
   const [embeddedWebviewOpen, setEmbeddedWebviewOpen] = useState(false);
+  // 内容页是否完成加载：未就绪时保持内容隐藏，避免启动/切换时的白屏闪烁
+  const [contentPageReady, setContentPageReady] = useState(false);
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [managed, setManaged] = useState<ManagedStatus | null>(null);
   const [latestDsh, setLatestDsh] = useState<string | null>(null);
@@ -205,17 +215,32 @@ export default function App() {
   const [appUpdateError, setAppUpdateError] = useState<string | null>(null);
   const [appVersionChecking, setAppVersionChecking] = useState(false);
   const [appVersionCheckError, setAppVersionCheckError] = useState<string | null>(null);
+  // 标题栏弹层：快速操作菜单 / 错误详情 / 设置面板 / 日志抽屉
+  const [quickMenuOpen, setQuickMenuOpen] = useState(false);
+  const [errorPanelOpen, setErrorPanelOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  // 插件管理
+  const [pluginsDialogOpen, setPluginsDialogOpen] = useState(false);
+  const [plugins, setPlugins] = useState<ProfilePlugin[]>([]);
+  const [pluginsLoading, setPluginsLoading] = useState(false);
+  const [pluginsError, setPluginsError] = useState<string | null>(null);
+  const [uninstallingName, setUninstallingName] = useState<string | null>(null);
+  const [cleanBusy, setCleanBusy] = useState(false);
   const logEnd = useRef<HTMLDivElement>(null);
   const pageContentRef = useRef<HTMLDivElement>(null);
   const installDialogRef = useRef<HTMLElement>(null);
   const appUpdateDialogRef = useRef<HTMLElement>(null);
   const dshVersionDialogRef = useRef<HTMLElement>(null);
+  const pluginsDialogRef = useRef<HTMLElement>(null);
   const installDialogTriggerRef = useRef<HTMLElement | null>(null);
   const appUpdateDialogTriggerRef = useRef<HTMLElement | null>(null);
   const dshVersionTriggerRef = useRef<HTMLElement | null>(null);
-  const previousDialogRef = useRef<"install" | "update" | "dsh-version" | null>(null);
+  const pluginsTriggerRef = useRef<HTMLElement | null>(null);
+  const previousDialogRef = useRef<"install" | "update" | "dsh-version" | "plugins" | null>(null);
   const versionCheckSeq = useRef(0);
   const appVersionCheckSeq = useRef(0);
+
+  const isMac = platform === "macos";
 
   const phaseLabels: Record<Phase, string> = {
     stopped: t.phaseStopped,
@@ -231,6 +256,7 @@ export default function App() {
     const minimumTimer = window.setTimeout(() => setMinStartupElapsed(true), STARTUP_OVERLAY_MIN_MS);
     void invoke<Bootstrap>("bootstrap")
       .then((data) => {
+        setPlatform(data.platform);
         setAppVersion(data.appVersion);
         setConfig({ ...data.config, dshPath: data.config.dshPath || data.detectedDsh || "" });
         setVersion(data.dshVersion);
@@ -275,6 +301,17 @@ export default function App() {
     const appUpdateListener = listen<AppUpdateProgress>("app-update-progress", ({ payload }) => {
       setAppUpdateProgress(payload);
     });
+    const contentViewListener = listen<boolean>("content-webview-changed", ({ payload }) => {
+      setEmbeddedWebviewOpen(payload);
+    });
+    // DSH 内容页的主题侦测上报：以 DSH 实际主题为准，标题栏跟随（持久化覆盖值）
+    const contentThemeListener = listen<string>("content-theme-changed", ({ payload }) => {
+      setThemeOverride(payload === "dark" ? "dark" : "light");
+    });
+    // 内容页加载进度：Started/Finished
+    const contentPageLoadListener = listen<boolean>("content-page-load", ({ payload }) => {
+      setContentPageReady(payload);
+    });
     const syncRuntimeState = () => {
       void invoke<ServiceStatus>("service_status").then(setStatus).catch(() => undefined);
       void invoke<boolean>("embedded_webview_open").then(setEmbeddedWebviewOpen).catch(() => undefined);
@@ -289,6 +326,9 @@ export default function App() {
       void logListener.then((unlisten) => unlisten());
       void managedListener.then((unlisten) => unlisten());
       void appUpdateListener.then((unlisten) => unlisten());
+      void contentViewListener.then((unlisten) => unlisten());
+      void contentThemeListener.then((unlisten) => unlisten());
+      void contentPageLoadListener.then((unlisten) => unlisten());
     };
   }, []);
 
@@ -330,6 +370,36 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [config]);
 
+  // 标题栏层的任何交互（顶栏快速菜单/错误详情/设置面板/日志抽屉/模态框/过渡遮罩）
+  // 期间隐藏 DSH 内容 WebView（隐藏而非销毁，页面状态保留），保证弹层在应用窗口上
+  // 真实可见；全部关闭后恢复。此外内容页未加载完成（Started→Finished 之间）也保持
+  // 隐藏，配合过渡遮罩消除启动/切换时的两次闪烁。
+  const isTransitioning = busy || pendingAction !== null || ["starting", "stopping", "restarting"].includes(status.phase);
+  // 服务已运行但内容页尚未加载完成：保持遮罩直到揭示瞬间，避免中间空档
+  const contentPendingReveal = status.phase === "running" && embeddedWebviewOpen && !contentPageReady;
+  const launcherLayerActive = quickMenuOpen || errorPanelOpen || settingsOpen
+    || installDialogOpen || dshVersionDialogOpen || appUpdateDialogOpen || pluginsDialogOpen || isTransitioning
+    || contentPendingReveal;
+  useEffect(() => {
+    void invoke("set_content_hidden", { hidden: launcherLayerActive }).catch(() => undefined);
+  }, [launcherLayerActive, embeddedWebviewOpen]);
+
+  // 内容关闭时重置就绪状态；加载事件异常时 8 秒兜底揭示
+  useEffect(() => {
+    if (!embeddedWebviewOpen) setContentPageReady(false);
+  }, [embeddedWebviewOpen]);
+  useEffect(() => {
+    if (!embeddedWebviewOpen || contentPageReady) return;
+    const timer = window.setTimeout(() => setContentPageReady(true), 8000);
+    return () => clearTimeout(timer);
+  }, [embeddedWebviewOpen, contentPageReady]);
+
+  // 主题与 DSH 内容保持一致：把当前生效主题（用户切换或跟随系统）推送给内容页
+  useEffect(() => {
+    if (!embeddedWebviewOpen) return;
+    void invoke("set_content_theme", { theme }).catch(() => undefined);
+  }, [theme, embeddedWebviewOpen]);
+
   useEffect(() => {
     if (config?.autoScrollLogs) logEnd.current?.scrollIntoView({ block: "end" });
   }, [logs, config?.autoScrollLogs]);
@@ -341,12 +411,16 @@ export default function App() {
         ? "update"
         : dshVersionDialogOpen
           ? "dsh-version"
-          : null;
+          : pluginsDialogOpen
+            ? "plugins"
+            : null;
     const dialogRef = activeDialog === "install"
       ? installDialogRef
       : activeDialog === "update"
         ? appUpdateDialogRef
-        : dshVersionDialogRef;
+        : activeDialog === "dsh-version"
+          ? dshVersionDialogRef
+          : pluginsDialogRef;
     const dialog = dialogRef.current;
     const pageContent = pageContentRef.current;
 
@@ -357,7 +431,9 @@ export default function App() {
           ? appUpdateDialogTriggerRef.current
           : previousDialogRef.current === "dsh-version"
             ? dshVersionTriggerRef.current
-            : null;
+            : previousDialogRef.current === "plugins"
+              ? pluginsTriggerRef.current
+              : null;
       previousDialogRef.current = null;
       trigger?.focus();
       return;
@@ -377,7 +453,8 @@ export default function App() {
         event.preventDefault();
         if (activeDialog === "install") setInstallDialogOpen(false);
         else if (activeDialog === "update") setAppUpdateDialogOpen(false);
-        else setDshVersionDialogOpen(false);
+        else if (activeDialog === "dsh-version") setDshVersionDialogOpen(false);
+        else setPluginsDialogOpen(false);
         return;
       }
       if (event.key !== "Tab") return;
@@ -407,7 +484,20 @@ export default function App() {
       pageContent?.removeAttribute("inert");
       pageContent?.removeAttribute("aria-hidden");
     };
-  }, [installDialogOpen, appUpdateDialogOpen, dshVersionDialogOpen]);
+  }, [installDialogOpen, appUpdateDialogOpen, dshVersionDialogOpen, pluginsDialogOpen]);
+
+  // 弹层（菜单/错误/设置）的 Esc 关闭；对话框打开时交给上面对话框逻辑处理
+  useEffect(() => {
+    const anyDialogOpen = installDialogOpen || appUpdateDialogOpen || dshVersionDialogOpen || pluginsDialogOpen;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || anyDialogOpen) return;
+      if (quickMenuOpen) setQuickMenuOpen(false);
+      else if (errorPanelOpen) setErrorPanelOpen(false);
+      else if (settingsOpen) setSettingsOpen(false);
+    };
+    document.addEventListener("keydown", handleKeyDown, true);
+    return () => document.removeEventListener("keydown", handleKeyDown, true);
+  }, [quickMenuOpen, errorPanelOpen, settingsOpen, installDialogOpen, appUpdateDialogOpen, dshVersionDialogOpen, pluginsDialogOpen]);
 
   useEffect(() => {
     if (status.phase !== "external") setExternalStopOffered(false);
@@ -657,11 +747,82 @@ export default function App() {
     }
   }
 
+  async function openEmbeddedView(button: HTMLButtonElement) {
+    button.blur();
+    // 不论从哪里触发（空态页/快速菜单/设置面板），先收起所有标题栏弹层，
+    // 让 DSH 内容直接呈现；更新弹窗在安装进行中时不打断
+    setSettingsOpen(false);
+    setPluginsDialogOpen(false);
+    setQuickMenuOpen(false);
+    setErrorPanelOpen(false);
+    if (!appUpdateBusy) setAppUpdateDialogOpen(false);
+    try {
+      await invoke("open_embedded_view");
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  }
+
   async function openDshGitHub() {
     try {
       await invoke("open_dsh_github_page");
     } catch (reason) {
       setError(errorMessage(reason));
+    }
+  }
+
+  // ---------- 插件管理与 Profile 清理 ----------
+
+  async function refreshPlugins() {
+    setPluginsLoading(true);
+    try {
+      const list = await invoke<ProfilePlugin[]>("list_profile_plugins", { profile: config?.profile || "web" });
+      setPlugins(list);
+    } catch (reason) {
+      setPluginsError(errorMessage(reason));
+    } finally {
+      setPluginsLoading(false);
+    }
+  }
+
+  async function openPluginsDialog(button: HTMLButtonElement) {
+    button.blur();
+    pluginsTriggerRef.current = button;
+    setPluginsError(null);
+    setPluginsDialogOpen(true);
+    await refreshPlugins();
+  }
+
+  // 卸载前原生确认：防止误删；卸载过程按插件粒度展示忙碌状态
+  async function uninstallPlugin(name: string) {
+    const confirmed = await confirmDialog(t.uninstallConfirmMessage.replace("{0}", name), {
+      title: t.uninstallConfirmTitle,
+      kind: "warning",
+      okLabel: t.uninstallAction,
+      cancelLabel: t.cancel,
+    });
+    if (!confirmed) return;
+    setUninstallingName(name);
+    try {
+      await invoke("uninstall_profile_plugin", { profile: config?.profile || "web", name });
+      setPlugins((list) => list.filter((plugin) => plugin.name !== name));
+    } catch (reason) {
+      setPluginsError(errorMessage(reason));
+    } finally {
+      setUninstallingName(null);
+    }
+  }
+
+  async function runCleanLockfile() {
+    setCleanBusy(true);
+    // 自动打开设置面板，让命令输出在其中的日志区即时可见
+    setSettingsOpen(true);
+    try {
+      await invoke("run_profile_clean", { profile: config?.profile || "web" });
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setCleanBusy(false);
     }
   }
 
@@ -762,10 +923,11 @@ export default function App() {
 
   const shouldStart = status.phase === "stopped" || status.phase === "external" || (status.phase === "failed" && !status.pid);
   const webAvailable = status.phase === "running" || status.phase === "external";
-  const isTransitioning = busy || pendingAction !== null || ["starting", "stopping", "restarting"].includes(status.phase);
 
   let transitionTitle = t.dshStarting;
-  if (pendingAction === "restart" || status.phase === "restarting") {
+  if (contentPendingReveal) {
+    transitionTitle = t.loadingWebview;
+  } else if (pendingAction === "restart" || status.phase === "restarting") {
     transitionTitle = pendingAction === "restart" ? t.dshRestartAction : t.dshRestarting;
   } else if (pendingAction === "stop" || status.phase === "stopping") {
     transitionTitle = t.dshStopping;
@@ -778,139 +940,279 @@ export default function App() {
   }
 
   const transitionDetail = translateBackendMessage(status.message, lang);
+  const powerTitle = externalStopOffered
+    ? t.forceStopConfirmTitle
+    : status.phase === "external"
+      ? t.recheckWithConfig
+      : ["running", "starting", "restarting"].includes(status.phase)
+        ? t.stopService
+        : t.startService;
 
   return (
-    <main className="launcher-shell">
-      <div className="launcher-content" ref={pageContentRef}>
-        <div className="control-row">
-        <div className="left-workspace">
-        <section className="compact-settings expanded">
-          <div className="settings-body">
-            <div className="mini-field wide">
-              <div className="field-label-row"><label htmlFor="dsh-path">{t.dshCommand}</label>{version ? (
-                 <button
-                   type="button"
-                   className="dsh-version-update"
-                   title={dshVersionInfo?.updateAvailable ? t.dshVersionUpdateAvailable.replace("{0}", dshVersionInfo.latestVersion) : t.dshVersionCheckTitle}
-                   disabled={dshVersionChecking}
-                   onClick={(event) => void checkDshVersion(event.currentTarget)}
-                 >
-                   DSH {version}{dshVersionInfo?.updateAvailable && <span className="update-dot" aria-hidden="true" />}
-                 </button>
-               ) : <span>{t.notVerified}</span>}</div>
-              <div className="command-input">
-                <input id="dsh-path" value={config.dshPath} disabled={locked} onChange={(event) => patch("dshPath", event.target.value)} />
-                <button disabled={locked} onClick={() => void detectDsh()} title={t.autoDetect}><FileSearch size={14} /></button>
-                <button disabled={locked} onClick={() => void chooseDsh()} title={t.chooseFile}><FolderOpen size={14} /></button>
-              </div>
-              <div className="runtime-tools">
-                {managed ? (
-                  <>
-                    <span><PackageCheck size={12} />Node {managed.nodeVersion} · DSH {managed.dshVersion}{latestDsh && latestDsh !== managed.dshVersion ? ` → ${latestDsh}` : ""}</span>
-                    {/* 仅在“确认有新版”（或版本未知）时显示升级按钮；已确认最新则隐藏 */}
-                    {(!latestDsh || latestDsh !== managed.dshVersion) && (
-                      <button disabled={managedBusy} onClick={() => void upgradeManagedDsh()}><Download size={12} />{t.upgradeDsh}</button>
-                    )}
-                  </>
-                ) : (
-                  <>
-                    <span>{t.managedRuntimeHint}</span>
-                    <button disabled={managedBusy || locked} onClick={(event) => { installDialogTriggerRef.current = event.currentTarget; setInstallDialogOpen(true); }}><Download size={12} />{t.oneClickInstall}</button>
-                  </>
-                )}
-              </div>
-              {managedProgress && <div className="managed-progress" aria-live="polite"><span style={{ width: `${managedProgress.percent ?? 0}%` }} /><small>{managedProgressLabel(managedProgress, managedOperation, t)}</small></div>}
-            </div>
-
-            <div className="connection-row">
-              <div className="mini-field">
-                <div className="field-label-row">
-                  <label htmlFor="profile">{t.profile}</label>
-                  <button
-                    type="button"
-                    className="profile-dir-btn"
-                    onClick={() => void openProfileDirectory()}
-                    title={t.openProfileDir}
-                  >
-                    <FolderOpen size={10} />
-                  </button>
-                </div>
-                <input id="profile" list="profile-list" value={config.profile} disabled={locked} onChange={(event) => patch("profile", event.target.value)} />
-                <datalist id="profile-list">{profiles.map((profile) => <option key={profile} value={profile} />)}</datalist>
-              </div>
-              <div className="mini-field"><label htmlFor="host">{t.host}</label><input id="host" value={config.host} disabled={locked} onChange={(event) => patch("host", event.target.value)} /></div>
-              <div className="mini-field port"><label htmlFor="port">{t.port}</label><input id="port" type="text" inputMode="numeric" pattern="[0-9]*" value={config.port} disabled={locked} onChange={(event) => patch("port", Number(event.target.value.replace(/\D/g, "").slice(0, 5)))} /></div>
-            </div>
-
-            <div className="post-launch-row">
-              <div className="mini-field action"><label htmlFor="launch-action">{t.afterLaunch}</label><select id="launch-action" value={config.launchAction} disabled={locked} onChange={(event) => patch("launchAction", event.target.value as LaunchAction)}><option value="none">{t.launchNone}</option><option value="default_browser">{t.launchDefaultBrowser}</option><option value="embedded_webview">{t.launchEmbeddedWebview}</option></select></div>
-              <div className="mini-field custom-args"><label htmlFor="custom-args">{t.dshArgs}</label><input id="custom-args" value={config.customArgs} disabled={locked} onChange={(event) => patch("customArgs", event.target.value)} placeholder={t.customArgsPlaceholder} /></div>
-              <label className="mini-toggle"><input type="checkbox" checked={config.autoStart} disabled={locked} onChange={(event) => patch("autoStart", event.target.checked)} /><span>{t.autoStart}</span></label>
-            </div>
-
-          </div>
-        </section>
-
-        {error && <div className="error-banner launcher-error">{translateBackendMessage(error, lang)}</div>}
-
-        <section className="log-window">
-          <header>
-            <div><strong>{t.serviceLogs}</strong><span>{t.logLineCount.replace("{0}", String(mergedLogs.length))}</span></div>
-            <div className="log-tools">
-              <label><input type="checkbox" checked={config.autoScrollLogs} onChange={(event) => patch("autoScrollLogs", event.target.checked)} />{t.autoScroll}</label>
-              <button onClick={() => setLogs([])} title={t.clearLogs}><Trash2 size={13} /></button>
-            </div>
-          </header>
-          <div className="mini-console">
-            {logs.length === 0 ? <div className="console-empty">{t.logEmpty}</div> : mergedLogs.map((line) => (
-              <div className={`log-line merged ${line.level}`} key={line.firstIndex}><time>{line.timestamp}</time><span className="source">{line.sources.join("+")}</span><span>{line.sources.includes("installer") ? translateBackendMessage(line.message, lang) : line.message}{line.count > 1 && <em className="log-count">×{line.count}</em>}</span></div>
-            ))}
-            <div ref={logEnd} />
-          </div>
-        </section>
-        </div>
-
-        <section className={`launch-stage ${status.phase}`}>
-          <button className="lang-toggle" onClick={toggleLang} title={t.langToggleTitle}>
-            {lang === "zh" ? "EN" : "中"}
-          </button>
-          <button className="theme-toggle" onClick={() => setThemeOverride(theme === "light" ? "dark" : "light")} title={theme === "light" ? t.switchToDark : t.switchToLight}>
-            {theme === "light" ? <Moon size={15} /> : <Sun size={15} />}
-          </button>
-          <div className={`compact-status ${status.phase}`}><span />{phaseLabels[status.phase]}{status.pid && <small>PID {status.pid}</small>}</div>
+    <main className="app-shell">
+      <div className="shell-root" ref={pageContentRef}>
+        <header className={`titlebar ${isMac ? "is-mac" : ""}`} data-tauri-drag-region="deep">
+          {isMac && <div className="traffic-light-spacer" aria-hidden="true" />}
           <button
-            className={`power-button ${externalStopOffered ? "force-stop" : status.phase}`}
-            disabled={busy || status.phase === "stopping"}
-            onClick={(event) => externalStopOffered
-              ? void forceStopExternal(event.currentTarget)
-              : void runCommand(shouldStart ? "start_service" : "stop_service")}
-            title={externalStopOffered ? t.forceStopConfirmTitle : status.phase === "external" ? t.recheckWithConfig : ["running", "starting", "restarting"].includes(status.phase) ? t.stopService : t.startService}
+            type="button"
+            className={`tb-status ${status.phase}`}
+            onClick={() => {
+              setQuickMenuOpen((openState) => !openState);
+              setErrorPanelOpen(false);
+            }}
+            aria-haspopup="menu"
+            aria-expanded={quickMenuOpen}
+            title={status.message ? translateBackendMessage(status.message, lang) : undefined}
           >
-            <span className="power-ring">{externalStopOffered ? <Ban size={45} strokeWidth={1.7} /> : <Power size={45} strokeWidth={1.7} />}</span>
+            <span className="tb-dot" aria-hidden="true" />
+            {phaseLabels[status.phase]}
+            {status.pid != null && <small>PID {status.pid}</small>}
           </button>
-
-          <div className="launch-copy">
-            <h1>{externalStopOffered ? t.forceStopConfirmTitle : status.phase === "running" ? t.dshRunning : status.phase === "starting" ? t.dshStarting : status.phase === "stopping" ? t.dshStopping : status.phase === "restarting" ? t.dshRestarting : t.dshStart}</h1>
-            <p>{translateBackendMessage(status.message, lang)}</p>
-            {status.phase === "running" && embeddedWebviewOpen && <p className="window-close-hint">{t.windowCloseHint}</p>}
-          </div>
-
-          <div className="quick-actions">
-            <button disabled={status.phase !== "running" || busy} onClick={() => void runCommand("restart_service")}><RotateCw size={14} />{t.restartService}</button>
-            <button disabled={!webAvailable} onClick={(event) => void openServiceUrl(event.currentTarget)}><ExternalLink size={14} />{t.openWebGui}</button>
-          </div>
-
-          {appVersion && (
+          {error && (
             <button
-              className={`app-version${releaseUpdate?.updateAvailable ? " has-update" : ""}`}
-              title={releaseUpdate?.updateAvailable && releaseUpdate.latestVersion ? t.launcherUpdateAvailable.replace("{0}", releaseUpdate.latestVersion) : t.appVersionClickTitle}
-              onClick={(event) => handleAppVersionClick(event.currentTarget)}
+              type="button"
+              className={`tb-btn tb-error-btn ${errorPanelOpen ? "active" : ""}`}
+              onClick={() => {
+                setErrorPanelOpen((openState) => !openState);
+                setQuickMenuOpen(false);
+              }}
+              title={t.errorBellTitle}
             >
-              v{appVersion}
-              {releaseUpdate?.updateAvailable && <span className="update-dot" aria-hidden="true" />}
+              <TriangleAlert size={15} />
             </button>
           )}
-        </section>
+          <div className="tb-spacer" />
+          <div className="tb-actions">
+            <button
+              type="button"
+              className={`tb-btn tb-power ${externalStopOffered ? "force-stop" : status.phase}`}
+              disabled={busy || status.phase === "stopping"}
+              onClick={(event) => {
+                setQuickMenuOpen(false);
+                if (externalStopOffered) void forceStopExternal(event.currentTarget);
+                else void runCommand(shouldStart ? "start_service" : "stop_service");
+              }}
+              title={powerTitle}
+            >
+              {externalStopOffered ? <Ban size={15} /> : <Power size={15} />}
+            </button>
+            <button
+              type="button"
+              className={`tb-btn ${settingsOpen ? "active" : ""}`}
+              onClick={() => {
+                setSettingsOpen((openState) => !openState);
+                setQuickMenuOpen(false);
+              }}
+              title={t.settingsTitle}
+            >
+              <Settings size={14} />
+            </button>
+            {appVersion && (
+              <button
+                type="button"
+                className={`tb-btn tb-version${releaseUpdate?.updateAvailable ? " has-update" : ""}`}
+                title={releaseUpdate?.updateAvailable && releaseUpdate.latestVersion ? t.launcherUpdateAvailable.replace("{0}", releaseUpdate.latestVersion) : t.appVersionClickTitle}
+                onClick={(event) => handleAppVersionClick(event.currentTarget)}
+              >
+                v{appVersion}
+                {releaseUpdate?.updateAvailable && <span className="update-dot" aria-hidden="true" />}
+              </button>
+            )}
+            {!isMac && <WindowControls t={t} />}
+          </div>
+        </header>
+
+        {quickMenuOpen && (
+          <div className="top-strip quick-strip" role="menu" data-tauri-drag-region="false">
+            <span className="strip-label">{t.quickActions}</span>
+            <button
+              type="button"
+              role="menuitem"
+              disabled={status.phase !== "running" || busy}
+              onClick={() => {
+                setQuickMenuOpen(false);
+                void runCommand("restart_service");
+              }}
+            >
+              <RotateCw size={13} />{t.restartService}
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              disabled={!webAvailable}
+              onClick={(event) => {
+                setQuickMenuOpen(false);
+                void openServiceUrl(event.currentTarget);
+              }}
+            >
+              <ExternalLink size={13} />{t.openInBrowser}
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              disabled={!webAvailable}
+              onClick={(event) => {
+                setQuickMenuOpen(false);
+                void openEmbeddedView(event.currentTarget);
+              }}
+            >
+              <AppWindow size={13} />{t.openEmbedded}
+            </button>
+          </div>
+        )}
+        {errorPanelOpen && error && (
+          <div className="top-strip error-strip" role="alert" data-tauri-drag-region="false">
+            <p>{translateBackendMessage(error, lang)}</p>
+            <div className="strip-actions">
+              <button
+                type="button"
+                onClick={() => {
+                  setError(null);
+                  setErrorPanelOpen(false);
+                }}
+              >
+                {t.errorDismiss}
+              </button>
+            </div>
+          </div>
+        )}
+
+        <div className="launcher-shell">
+          <div className="launcher-content">
+            <div className="console-top">
+              <section className="console-settings">
+                {error && <div className="error-banner">{translateBackendMessage(error, lang)}</div>}
+                    <div className="mini-field wide">
+                      <div className="field-label-row">
+                        <label htmlFor="dsh-path">{t.dshCommand}</label>
+                        {version ? (
+                          <button
+                            type="button"
+                            className="dsh-version-update"
+                            title={dshVersionInfo?.updateAvailable ? t.dshVersionUpdateAvailable.replace("{0}", dshVersionInfo.latestVersion) : t.dshVersionCheckTitle}
+                            disabled={dshVersionChecking}
+                            onClick={(event) => void checkDshVersion(event.currentTarget)}
+                          >
+                            DSH {version}{dshVersionInfo?.updateAvailable && <span className="update-dot" aria-hidden="true" />}
+                          </button>
+                        ) : <span>{t.notVerified}</span>}
+                      </div>
+                      <div className="command-input">
+                        <input id="dsh-path" value={config.dshPath} disabled={locked} onChange={(event) => patch("dshPath", event.target.value)} />
+                        <button disabled={locked} onClick={() => void detectDsh()} title={t.autoDetect}><FileSearch size={14} /></button>
+                        <button disabled={locked} onClick={() => void chooseDsh()} title={t.chooseFile}><FolderOpen size={14} /></button>
+                      </div>
+                      <div className="runtime-tools">
+                        {managed ? (
+                          <>
+                            <span><PackageCheck size={12} />Node {managed.nodeVersion} · DSH {managed.dshVersion}{latestDsh && latestDsh !== managed.dshVersion ? ` → ${latestDsh}` : ""}</span>
+                            {(!latestDsh || latestDsh !== managed.dshVersion) && (
+                              <button disabled={managedBusy} onClick={() => void upgradeManagedDsh()}><Download size={12} />{t.upgradeDsh}</button>
+                            )}
+                          </>
+                        ) : (
+                          <>
+                            <span>{t.managedRuntimeHint}</span>
+                            <button disabled={managedBusy || locked} onClick={(event) => { installDialogTriggerRef.current = event.currentTarget; setInstallDialogOpen(true); }}><Download size={12} />{t.oneClickInstall}</button>
+                          </>
+                        )}
+                      </div>
+                      {managedProgress && <div className="managed-progress" aria-live="polite"><span style={{ width: `${managedProgress.percent ?? 0}%` }} /><small>{managedProgressLabel(managedProgress, managedOperation, t)}</small></div>}
+                    </div>
+
+                    <div className="connection-row">
+                      <div className="mini-field">
+                        <div className="field-label-row">
+                          <label htmlFor="profile">{t.profile}</label>
+                          <button
+                            type="button"
+                            className="profile-dir-btn"
+                            onClick={() => void openProfileDirectory()}
+                            title={t.openProfileDir}
+                          >
+                            <FolderOpen size={10} />
+                          </button>
+                        </div>
+                        <input id="profile" list="profile-list" value={config.profile} disabled={locked} onChange={(event) => patch("profile", event.target.value)} />
+                        <datalist id="profile-list">{profiles.map((profile) => <option key={profile} value={profile} />)}</datalist>
+                      </div>
+                      <div className="mini-field"><label htmlFor="host">{t.host}</label><input id="host" value={config.host} disabled={locked} onChange={(event) => patch("host", event.target.value)} /></div>
+                      <div className="mini-field port"><label htmlFor="port">{t.port}</label><input id="port" type="text" inputMode="numeric" pattern="[0-9]*" value={config.port} disabled={locked} onChange={(event) => patch("port", Number(event.target.value.replace(/\D/g, "").slice(0, 5)))} /></div>
+                    </div>
+
+                    <div className="post-launch-row">
+                      <div className="mini-field custom-args"><label htmlFor="custom-args">{t.dshArgs}</label><input id="custom-args" value={config.customArgs} disabled={locked} onChange={(event) => patch("customArgs", event.target.value)} placeholder={t.customArgsPlaceholder} /></div>
+                      <label className="mini-toggle"><input type="checkbox" checked={config.autoStart} disabled={locked} onChange={(event) => patch("autoStart", event.target.checked)} /><span>{t.autoStart}</span></label>
+                    </div>
+
+                    <div className="settings-tools-row">
+                      <button type="button" onClick={(event) => void openPluginsDialog(event.currentTarget)}>
+                        <PackageCheck size={12} />{t.managePlugins}
+                      </button>
+                      <button type="button" disabled={cleanBusy} onClick={() => void runCleanLockfile()} title="pnpm clean --lockfile && pnpm install">
+                        <Trash2 size={12} />{t.runCleanLockfile}
+                      </button>
+                    </div>
+
+                    <div className="settings-lang-row">
+                      <span>{t.languageLabel}</span>
+                      <button type="button" className="lang-switch" onClick={toggleLang} title={t.langToggleTitle}>
+                        {lang === "zh" ? "English" : "中文"}
+                      </button>
+                    </div>
+              </section>
+
+              <section className={`console-launch ${status.phase}`}>
+                <div className={`compact-status ${status.phase}`}>
+                  <span aria-hidden="true" />
+                  {phaseLabels[status.phase]}
+                  {status.pid && <small>PID {status.pid}</small>}
+                </div>
+                <button
+                  className={`power-button ${externalStopOffered ? "force-stop" : status.phase}`}
+                  disabled={busy || status.phase === "stopping"}
+                  onClick={(event) => externalStopOffered
+                    ? void forceStopExternal(event.currentTarget)
+                    : void runCommand(shouldStart ? "start_service" : "stop_service")}
+                  title={powerTitle}
+                >
+                  <span className="power-ring">{externalStopOffered ? <Ban size={45} strokeWidth={1.7} /> : <Power size={45} strokeWidth={1.7} />}</span>
+                </button>
+
+                <div className="launch-copy">
+                  <h1>{externalStopOffered ? t.forceStopConfirmTitle : status.phase === "running" ? t.dshRunning : status.phase === "starting" ? t.dshStarting : status.phase === "stopping" ? t.dshStopping : status.phase === "restarting" ? t.dshRestarting : t.dshStart}</h1>
+                  <p>{translateBackendMessage(status.message, lang)}</p>
+                  {status.phase === "running" && status.url && <p className="stage-url">{status.url}</p>}
+                  {status.phase === "running" && embeddedWebviewOpen && <p className="window-close-hint">{t.windowCloseHint}</p>}
+                </div>
+
+                <div className="quick-actions">
+                  <button disabled={status.phase !== "running" || busy} onClick={() => void runCommand("restart_service")}><RotateCw size={14} />{t.restartService}</button>
+                  <button disabled={!webAvailable} onClick={(event) => void openServiceUrl(event.currentTarget)}><ExternalLink size={14} />{t.openInBrowser}</button>
+                  <button disabled={!webAvailable} onClick={(event) => void openEmbeddedView(event.currentTarget)}><AppWindow size={14} />{t.openEmbedded}</button>
+                </div>
+              </section>
+            </div>
+
+            <section className="console-logs" aria-label={t.serviceLogs}>
+                  <header>
+                    <div><strong>{t.serviceLogs}</strong><span>{t.logLineCount.replace("{0}", String(mergedLogs.length))}</span></div>
+                    <div className="log-tools">
+                      <label className="log-autoscroll">
+                        <input type="checkbox" checked={config.autoScrollLogs} onChange={(event) => patch("autoScrollLogs", event.target.checked)} />
+                        {t.autoScroll}
+                      </label>
+                      <button onClick={() => setLogs([])} title={t.clearLogs}><Trash2 size={13} /></button>
+                    </div>
+                  </header>
+                  <div className="mini-console">
+                    {logs.length === 0 ? <div className="console-empty">{t.logEmpty}</div> : mergedLogs.map((line) => (
+                      <div className={`log-line merged ${line.level}`} key={line.firstIndex}><time>{line.timestamp}</time><span className="source">{line.sources.join("+")}</span><span>{line.sources.includes("installer") ? translateBackendMessage(line.message, lang) : line.message}{line.count > 1 && <em className="log-count">×{line.count}</em>}</span></div>
+                    ))}
+                    <div ref={logEnd} />
+                  </div>
+                </section>
+          </div>
         </div>
       </div>
       {installDialogOpen && (
@@ -1052,7 +1354,46 @@ export default function App() {
           </section>
         </div>
       )}
-      {isTransitioning && (
+      {pluginsDialogOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setPluginsDialogOpen(false)}>
+          <section className="install-dialog plugins-dialog" role="dialog" aria-modal="true" aria-labelledby="plugins-dialog-title" tabIndex={-1} ref={pluginsDialogRef} onMouseDown={(event) => event.stopPropagation()}>
+            <header><h2 id="plugins-dialog-title">{t.pluginsDialogTitle}</h2></header>
+            <div className="install-dialog-body">
+              <p className="plugins-hint">{t.pluginsDialogHint}</p>
+              {pluginsLoading && <p className="dsh-update-warning" role="status">{t.pluginsLoading}</p>}
+              {pluginsError && <p className="install-dialog-error" role="alert">{translateBackendMessage(pluginsError, lang)}</p>}
+              {!pluginsLoading && !pluginsError && plugins.length === 0 && (
+                <p className="app-update-success" role="status">{t.pluginsEmpty}</p>
+              )}
+              <div className="plugins-list">
+                {plugins.map((plugin) => (
+                  <div className="plugin-row" key={plugin.name}>
+                    <div className="plugin-meta">
+                      <strong>{plugin.name}</strong>
+                      <small>{plugin.version}</small>
+                    </div>
+                    <button
+                      type="button"
+                      className="plugin-uninstall"
+                      disabled={uninstallingName !== null}
+                      onClick={() => void uninstallPlugin(plugin.name)}
+                    >
+                      {uninstallingName === plugin.name ? t.uninstalling : t.uninstall}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <footer>
+              <button type="button" disabled={pluginsLoading} onClick={() => void refreshPlugins()}>
+                <RefreshCw size={13} />{t.pluginsRefresh}
+              </button>
+              <button type="button" onClick={() => setPluginsDialogOpen(false)}>{t.cancel}</button>
+            </footer>
+          </section>
+        </div>
+      )}
+      {(isTransitioning || contentPendingReveal) && (
         <div className="action-overlay-backdrop" role="alert" aria-busy="true" aria-live="polite">
           <section className="action-overlay-card" role="dialog" aria-modal="true" aria-label={transitionTitle}>
             <span className="loading-spinner" aria-hidden="true" />

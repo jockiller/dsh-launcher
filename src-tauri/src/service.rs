@@ -21,33 +21,136 @@ use std::time::{Duration, Instant};
 
 use chrono::Local;
 use serde::Serialize;
-use tauri::webview::NewWindowResponse;
-use tauri::{
-    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Url, WebviewUrl, WebviewWindow,
-    WebviewWindowBuilder, WindowEvent,
-};
+use tauri::webview::{NewWindowResponse, PageLoadEvent};
+use tauri::{AppHandle, Emitter, Manager, Url, WebviewUrl};
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+use tauri::{PhysicalPosition, PhysicalSize, WebviewWindowBuilder, WindowEvent};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use tauri::{LogicalPosition, LogicalSize, Rect, WebviewBuilder};
 
 use crate::config::{
-    LaunchAction, LauncherConfig, PlatformTarget, WebviewWindowState, home_dir_for, user_home,
+    LauncherConfig, PlatformTarget, WebviewWindowState, home_dir_for, user_home,
 };
 
 const SYSTEM_THEME_SCRIPT: &str = r#"
 (() => {
-  const media = window.matchMedia('(prefers-color-scheme: dark)');
+  const KEY = '__DSH_LAUNCHER_THEME__';
+  const readStored = () => {
+    try {
+      const value = localStorage.getItem(KEY);
+      return value === 'dark' || value === 'light' ? value : null;
+    } catch (error) {
+      return null;
+    }
+  };
   const apply = () => {
-    const theme = media.matches ? 'dark' : 'light';
+    // 启动器接管过主题时以存储值为准，否则跟随系统
+    const theme = readStored()
+      ?? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
     window.__DSH_SYSTEM_THEME__ = theme;
     if (document.documentElement) {
       document.documentElement.dataset.systemTheme = theme;
       document.documentElement.style.colorScheme = theme;
+      // 立即铺底色：DSH 自身样式加载完成前避免露出默认白底
+      document.documentElement.style.backgroundColor = theme === 'dark' ? '#17181b' : '#f7f7f8';
+      if (document.body) {
+        document.body.style.backgroundColor = theme === 'dark' ? '#17181b' : '#f7f7f8';
+      }
     }
     window.dispatchEvent(new CustomEvent('dsh-system-theme-change', { detail: { theme } }));
   };
   apply();
   document.addEventListener('DOMContentLoaded', apply, { once: true });
-  media.addEventListener('change', apply);
+  if (!readStored()) {
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', apply);
+  }
 })();
 "#;
+
+/// 生成把指定主题写入 DSH 页面的脚本：持久化到 localStorage（下次加载免闪）、
+/// 立即应用并派发主题变更事件（DSH 侧订阅该事件）。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) fn theme_apply_script(theme: &str) -> String {
+    format!(
+        r#"(() => {{
+  const theme = '{theme}';
+  try {{ localStorage.setItem('__DSH_LAUNCHER_THEME__', theme); }} catch (error) {{}}
+  window.__DSH_SYSTEM_THEME__ = theme;
+  if (document.documentElement) {{
+    document.documentElement.dataset.systemTheme = theme;
+    document.documentElement.style.colorScheme = theme;
+    document.documentElement.style.backgroundColor = theme === 'dark' ? '#17181b' : '#f7f7f8';
+    if (document.body) {{
+      document.body.style.backgroundColor = theme === 'dark' ? '#17181b' : '#f7f7f8';
+    }}
+  }}
+  window.dispatchEvent(new CustomEvent('dsh-system-theme-change', {{ detail: {{ theme }} }}));
+}})();"#
+    )
+}
+
+/// DSH → 启动器的主题侦测脚本：监听 DOM 变化并按页面背景亮度判断深浅色，
+/// 变化时通过 document.title 哨兵值上报（原生 title 变更回调，不依赖 IPC 权限）。
+/// 仅注入合并窗口的内容 WebView（macOS/Windows）；Linux 独立窗口不注入，
+/// 避免哨兵标题外露。
+pub(crate) const CONTENT_THEME_WATCHER_SCRIPT: &str = r#"
+(() => {
+  const SENTINEL = '__dsh_theme__:';
+  let last = null;
+  const parseColor = (color) => {
+    const match = /rgba?\(([^)]+)\)/.exec(color);
+    if (!match) return null;
+    const parts = match[1].split(',').map((part) => parseFloat(part));
+    if (parts.length < 3 || parts.some((value) => Number.isNaN(value))) return null;
+    if (parts[3] === 0) return null;
+    return parts;
+  };
+  const detect = () => {
+    try {
+      if (!document.documentElement) return;
+      let rgb = parseColor(getComputedStyle(document.body || document.documentElement).backgroundColor);
+      if (!rgb) rgb = parseColor(getComputedStyle(document.documentElement).backgroundColor);
+      if (!rgb) return;
+      const luminance = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
+      const theme = luminance < 0.5 ? 'dark' : 'light';
+      if (theme !== last) {
+        last = theme;
+        document.title = SENTINEL + theme;
+      }
+    } catch (error) {}
+  };
+  const schedule = () => setTimeout(detect, 80);
+  const observer = new MutationObserver(schedule);
+  const observe = () => {
+    try {
+      observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'style'] });
+      if (document.body) observer.observe(document.body, { attributes: true, attributeFilter: ['class', 'style'] });
+    } catch (error) {}
+  };
+  observe();
+  document.addEventListener('DOMContentLoaded', () => { observe(); detect(); });
+  window.addEventListener('load', detect);
+  window.addEventListener('dsh-system-theme-change', schedule);
+  // 兜底轮询：React 重渲染等改到深层容器背景的场景
+  setInterval(detect, 2000);
+})();
+"#;
+
+/// macOS/Windows 合并窗口中标题栏（主 WebView）占用的逻辑高度。
+/// 取 38px 使 macOS 红绿灯（traffic_light_position y=13，按钮中心 y=19）
+/// 与状态胶囊在垂直方向同心对齐；前端 `styles.css` 的 `.titlebar` 高度必须一致。
+pub(crate) const TITLEBAR_HEIGHT: f64 = 38.0;
+
+/// 由窗口逻辑尺寸计算内容子 WebView 的可用宽高：固定让出顶部标题栏，
+/// 异常小尺寸（最小化等）下保底 80px，避免计算出负值。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn content_size(window_width: f64, window_height: f64) -> (f64, f64) {
+    const MIN_CONTENT_SIZE: f64 = 80.0;
+    (
+        window_width.max(MIN_CONTENT_SIZE),
+        (window_height - TITLEBAR_HEIGHT).max(MIN_CONTENT_SIZE),
+    )
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -618,7 +721,8 @@ fn monitor_startup(
     config: LauncherConfig,
     url: String,
     pid: u32,
-    restarting: bool,
+    // 保留参数位：重启流程与首次启动未来可能有差异化的内容页处理
+    _restarting: bool,
     authenticated_url: Arc<Mutex<Option<String>>>,
     session_cancel: Arc<AtomicBool>,
     session_cancel_slot: Arc<Mutex<Option<Arc<AtomicBool>>>>,
@@ -712,9 +816,8 @@ fn monitor_startup(
                     Arc::clone(&session_credentials),
                     Arc::clone(&session_cancel),
                 );
-                if should_open_after_start(&config, restarting)
-                    && let Err(error) = perform_launch_action(&app, &config, &logged_url)
-                {
+                // 启动成功后统一打开内置 WebView（含重启场景：复用并重新导航）
+                if let Err(error) = open_content_view(&app, &logged_url, true) {
                     emit_log(
                         &app,
                         "launcher",
@@ -2482,8 +2585,196 @@ pub fn profile_directory(profile: &str) -> Option<PathBuf> {
     Some(home.join("profiles").join(name))
 }
 
-pub fn open_service_gui(app: &AppHandle, config: &LauncherConfig, url: &str) -> Result<(), String> {
-    open_configured(app, config, url)
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfilePlugin {
+    pub name: String,
+    pub version: String,
+}
+
+/// 校验插件名：允许 npm 包名（含一个 `@scope/` 前缀），拒绝路径穿越与命令元字符。
+fn validate_plugin_name(name: &str) -> Result<(), String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.len() > 214 {
+        return Err("插件名无效".into());
+    }
+    let valid = |segment: &str| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@'))
+    };
+    let ok = match trimmed.split_once('/') {
+        Some((scope, package)) => valid(scope) && valid(package),
+        None => valid(trimmed),
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err("插件名无效".into())
+    }
+}
+
+/// 读取 Profile 已安装插件（package.json dependencies，与 DSH 插件安装机制一致）。
+pub fn read_profile_plugins(profile: &str) -> Result<Vec<ProfilePlugin>, String> {
+    let dir = profile_directory(profile).ok_or_else(|| "无法定位 Profile 目录".to_string())?;
+    let text = fs::read_to_string(dir.join("package.json"))
+        .map_err(|_| "Profile 尚未初始化（未找到 package.json），请先启动一次 DSH".to_string())?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| format!("package.json 解析失败：{error}"))?;
+    let mut plugins = Vec::new();
+    if let Some(deps) = value.get("dependencies").and_then(|deps| deps.as_object()) {
+        for (name, spec) in deps {
+            plugins.push(ProfilePlugin {
+                name: name.clone(),
+                version: spec.as_str().unwrap_or_default().to_string(),
+            });
+        }
+    }
+    plugins.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(plugins)
+}
+
+fn pnpm_command(args: &[&str]) -> Command {
+    #[cfg(windows)]
+    {
+        // Windows 上 pnpm 是 pnpm.cmd，必须经 cmd 解析
+        let mut command = Command::new("cmd");
+        command.arg("/C").arg(format!("pnpm {}", args.join(" ")));
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = Command::new("pnpm");
+        command.args(args);
+        command
+    }
+}
+
+const PNPM_CLEAN_TIMEOUT: Duration = Duration::from_secs(120);
+const PNPM_INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// 等待子进程退出（带超时），返回合并后的输出；非零退出视为失败。
+fn wait_for_output(mut child: Child, display: String, timeout: Duration) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = child
+                    .wait_with_output()
+                    .ok()
+                    .map(|out| {
+                        let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        if !stderr.trim().is_empty() {
+                            if !text.trim().is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(&stderr);
+                        }
+                        text
+                    })
+                    .unwrap_or_default();
+                return if status.success() {
+                    Ok(output)
+                } else {
+                    Err(format!("{display} 失败：{output}"))
+                };
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    return Err(format!(
+                        "{display} 执行超时（{} 秒），子进程已被终止",
+                        timeout.as_secs()
+                    ));
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            Err(error) => return Err(format!("等待 {display} 退出失败：{error}")),
+        }
+    }
+}
+
+/// 在指定目录执行 pnpm 命令（带超时），返回合并后的输出。
+fn run_pnpm(dir: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+    let child = pnpm_command(args)
+        .current_dir(dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("启动 pnpm 失败：{error}"))?;
+    wait_for_output(child, format!("pnpm {}", args.join(" ")), timeout)
+}
+
+/// 执行 dsh 命令行（带超时），返回合并后的输出。
+fn run_dsh_cli(dsh_path: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+    let child = Command::new(dsh_path)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("启动 dsh 失败：{error}"))?;
+    wait_for_output(child, format!("dsh {}", args.join(" ")), timeout)
+}
+
+/// 通过 DSH 官方命令卸载插件：`dsh plugin --profile <p> uninstall <name>`。
+/// 依赖、lockfile 与 dsh.profile.bundles 清单均由 dsh 自行维护，避免手动
+/// 清理遗漏（如 bundles 残留导致启动时无法解析 bundle）。
+pub fn uninstall_profile_plugin(app: &AppHandle, profile: &str, name: &str) -> Result<(), String> {
+    validate_plugin_name(name)?;
+    let config = LauncherConfig::load();
+    let dsh_path = resolve_dsh(&config.dsh_path)
+        .ok_or_else(|| "未找到可执行的 dsh，请先在设置中指定 DSH 命令".to_string())?;
+    emit_log(app, "plugins", "info", &format!("正在通过 dsh 卸载插件 {name}..."));
+    let args = ["plugin", "--profile", profile, "uninstall", name];
+    match run_dsh_cli(&dsh_path, &args, PNPM_INSTALL_TIMEOUT) {
+        Ok(output) => {
+            if !output.trim().is_empty() {
+                emit_log(app, "plugins", "info", output.trim());
+            }
+            emit_log(app, "plugins", "info", &format!("插件 {name} 已卸载"));
+            Ok(())
+        }
+        Err(error) => {
+            emit_log(app, "plugins", "error", &error);
+            Err("通过 dsh 卸载插件失败，详见服务日志".into())
+        }
+    }
+}
+
+/// 在 Profile 目录执行 `pnpm clean --lockfile` 快捷清理，输出写入服务日志。
+pub fn run_profile_clean(app: &AppHandle, profile: &str) -> Result<(), String> {
+    let dir = profile_directory(profile).ok_or_else(|| "无法定位 Profile 目录".to_string())?;
+    if !dir.join("package.json").exists() {
+        return Err("Profile 尚未初始化（未找到 package.json）".into());
+    }
+    emit_log(app, "plugins", "info", "正在执行 pnpm clean --lockfile...");
+    if let Err(error) = run_pnpm(&dir, &["clean", "--lockfile"], PNPM_CLEAN_TIMEOUT) {
+        emit_log(app, "plugins", "error", &error);
+        return Err(error);
+    }
+    emit_log(app, "plugins", "info", "正在执行 pnpm install...");
+    match run_pnpm(&dir, &["install"], PNPM_INSTALL_TIMEOUT) {
+        Ok(output) => {
+            if !output.trim().is_empty() {
+                emit_log(app, "plugins", "info", output.trim());
+            }
+            emit_log(app, "plugins", "info", "依赖已清理并重新安装完成");
+            Ok(())
+        }
+        Err(error) => {
+            emit_log(
+                app,
+                "plugins",
+                "error",
+                "pnpm install 失败，Profile 可能不可用，请检查上方日志",
+            );
+            Err(error)
+        }
+    }
 }
 
 fn english_launch_action_error(error: &str) -> String {
@@ -2509,38 +2800,195 @@ fn parse_custom_args(value: &str) -> Result<Vec<String>, String> {
     shell_words::split(value.trim()).map_err(|error| format!("DSH 参数格式无效：{error}"))
 }
 
-fn should_open_after_start(config: &LauncherConfig, restarting: bool) -> bool {
-    !restarting || matches!(config.launch_action, LaunchAction::EmbeddedWebview)
+/// 打开内嵌 DSH 视图。macOS/Windows 上是主窗口内的子 WebView（标题栏下方）；
+/// Linux 不支持单窗口多 WebView，回退为独立 dsh-webview 窗口。
+/// `allow_navigate`：仅服务启动/重启后的自动打开为 true（需要刷新 token 重新导航）；
+/// 用户点击"打开"按钮时为 false——内容已存在时只做揭示，绝不重载页面（避免闪烁）。
+pub fn open_content_view(app: &AppHandle, url: &str, allow_navigate: bool) -> Result<(), String> {
+    let parsed: Url = url
+        .parse()
+        .map_err(|error| format!("无效的 DSH URL：{error}"))?;
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    return open_content_webview_child(app, parsed, url, allow_navigate);
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    return open_embedded_webview_window(app, parsed, url, allow_navigate);
 }
 
-pub fn open_configured(app: &AppHandle, config: &LauncherConfig, url: &str) -> Result<(), String> {
-    if matches!(config.launch_action, LaunchAction::None) {
-        return open_default(url);
-    }
-    perform_launch_action(app, config, url)
-}
-
-fn perform_launch_action(
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn open_content_webview_child(
     app: &AppHandle,
-    config: &LauncherConfig,
+    parsed: Url,
     url: &str,
+    allow_navigate: bool,
 ) -> Result<(), String> {
-    match config.launch_action {
-        LaunchAction::None => Ok(()),
-        LaunchAction::DefaultBrowser => open_default(url),
-        LaunchAction::EmbeddedWebview => open_embedded_webview(app, url),
+    let Some(main_window) = app.get_window("main") else {
+        return Err("主窗口不可用".into());
+    };
+    // 与旧 dsh-webview 窗口行为一致：打开/复用时唤起主窗口
+    let raise_window = |window: &tauri::Window| -> Result<(), String> {
+        window
+            .show()
+            .and_then(|_| window.unminimize())
+            .and_then(|_| window.set_focus())
+            .map_err(|error| format!("显示内置 WebView 失败：{error}"))
+    };
+    // 标题栏弹层/模态/过渡激活期间内容保持隐藏（点击启停时先把状态呈现给用户）
+    let content_should_hide = || -> bool {
+        app.try_state::<crate::AppState>()
+            .map(|state| state.content_hidden.load(Ordering::Acquire))
+            .unwrap_or(false)
+    };
+    if let Some(webview) = app.get_webview("content") {
+        // 已存在时按需导航：服务重启后 launch token 已更换，旧页面会停留在
+        // "authentication required"，只有自动打开（allow_navigate）才重新定位；
+        // 用户点击"打开"时只做揭示，重载会造成页面闪烁。
+        let current = webview.url().ok().map(|current| current.to_string());
+        if allow_navigate && current.as_deref() != Some(url) {
+            webview
+                .navigate(parsed)
+                .map_err(|error| format!("导航内置 WebView 失败：{error}"))?;
+        } else {
+            // 不导航的复用不会触发新的加载事件：页面已在展示，直接标记为就绪
+            let _ = app.emit("content-page-load", true);
+        }
+        if content_should_hide() {
+            let _ = webview.hide();
+        } else {
+            raise_window(&main_window)?;
+        }
+        return Ok(());
     }
+    let open_error =
+        |error: tauri::Error| format!("打开内置 WebView 失败：{error}");
+    let scale = main_window.scale_factor().map_err(open_error)?;
+    let size = main_window.inner_size().map_err(open_error)?;
+    let logical = size.to_logical::<f64>(scale);
+    let (width, height) = content_size(logical.width, logical.height);
+    // 先发未就绪标记再创建：页面加载极快时 Finished 事件可能在创建过程中
+    // 到达，若标记在其后发出会把前端就绪状态压回去，导致内容无法揭示
+    let _ = app.emit("content-page-load", false);
+    let webview = main_window
+        .add_child(
+            content_webview_builder(parsed),
+            LogicalPosition::new(0.0, TITLEBAR_HEIGHT),
+            LogicalSize::new(width, height),
+        )
+        .map_err(open_error)?;
+    // 创建后一律先隐藏：等页面加载完成（content-page-load Finished）后由前端
+    // 揭示，避免页面未渲染完成时露出 WebView 默认亮色底的闪现
+    let _ = webview.hide();
+    raise_window(&main_window)?;
+    let _ = app.emit("content-webview-changed", true);
+    Ok(())
 }
 
-fn open_embedded_webview(app: &AppHandle, url: &str) -> Result<(), String> {
+/// 构造 DSH 内容子 WebView：同源导航放行，外部 http(s) 链接转交系统浏览器，
+/// 新窗口一律拒绝，并注入系统主题脚本供 DSH 页面跟随深浅色。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn content_webview_builder(parsed: Url) -> tauri::WebviewBuilder<tauri::Wry> {
+    let allowed_scheme = parsed.scheme().to_string();
+    let allowed_host = parsed.host_str().map(str::to_string);
+    let allowed_port = parsed.port_or_known_default();
+    WebviewBuilder::new("content", WebviewUrl::External(parsed))
+        .on_navigation(move |next_url| {
+            let same_origin = next_url.scheme() == allowed_scheme
+                && next_url.host_str().map(str::to_string) == allowed_host
+                && next_url.port_or_known_default() == allowed_port;
+            if same_origin {
+                return true;
+            }
+            if matches!(next_url.scheme(), "http" | "https") {
+                let _ = open_default(next_url.as_str());
+            }
+            false
+        })
+        .on_new_window(move |next_url, _| {
+            if matches!(next_url.scheme(), "http" | "https") {
+                let _ = open_default(next_url.as_str());
+            }
+            NewWindowResponse::Deny
+        })
+        .initialization_script(SYSTEM_THEME_SCRIPT)
+        .initialization_script(CONTENT_THEME_WATCHER_SCRIPT)
+        // 主题侦测脚本通过 document.title 哨兵值上报 DSH 实际主题；
+        // 解析后转发给标题栏，并把窗口标题恢复为固定值
+        .on_document_title_changed(|webview, title| {
+            if let Some(theme) = title.strip_prefix("__dsh_theme__:") {
+                let theme = if theme == "dark" { "dark" } else { "light" };
+                let app = webview.app_handle();
+                let _ = app.emit("content-theme-changed", theme);
+                if let Some(window) = app.get_window("main") {
+                    let _ = window.set_title("DSH Launcher");
+                }
+            }
+        })
+        // 页面加载进度上报：标题栏层在 Finished 前保持内容隐藏，避免启动/切换
+        // 时 webview 未渲染完成的闪烁；Finished 同时重推启动器主题
+        .on_page_load(|webview, payload| {
+            let finished = matches!(payload.event(), PageLoadEvent::Finished);
+            let app = webview.app_handle();
+            if finished {
+                // 先应用记忆的主题，再通知前端揭示，保证揭示时主题已就位
+                if let Some(theme) = webview
+                    .app_handle()
+                    .try_state::<crate::AppState>()
+                    .and_then(|state| state.content_theme.lock().ok().and_then(|guard| guard.clone()))
+                {
+                    let _ = webview.eval(theme_apply_script(&theme));
+                }
+            }
+            let _ = app.emit("content-page-load", finished);
+        })
+}
+
+/// 按当前窗口尺寸与面板让位，重新摆放内容子 WebView；由窗口 Resized 事件
+/// 与 set_content_insets 命令共同驱动。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn sync_content_bounds(app: &AppHandle) {
+    let (Some(main_window), Some(content)) =
+        (app.get_window("main"), app.get_webview("content"))
+    else {
+        return;
+    };
+    let Ok(scale) = main_window.scale_factor() else {
+        return;
+    };
+    let Ok(size) = main_window.inner_size() else {
+        return;
+    };
+    let logical = size.to_logical::<f64>(scale);
+    if logical.width < 120.0 || logical.height < TITLEBAR_HEIGHT + 120.0 {
+        // 最小化或窗口动画过程中的异常尺寸，跳过本次同步
+        return;
+    }
+    let (width, height) = content_size(logical.width, logical.height);
+    let _ = content.set_bounds(Rect {
+        position: LogicalPosition::new(0.0, TITLEBAR_HEIGHT).into(),
+        size: LogicalSize::new(width, height).into(),
+    });
+}
+
+pub fn embedded_view_open(app: &AppHandle) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    return app.get_webview("content").is_some();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    return app
+        .get_webview_window("dsh-webview")
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false);
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn open_embedded_webview_window(
+    app: &AppHandle,
+    parsed: Url,
+    url: &str,
+    allow_navigate: bool,
+) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("dsh-webview") {
-        // 窗口已存在时导航到新 URL（服务重启后 launch token 已更换，旧页面会停留在
-        // "authentication required"；复用窗口必须重新定位，而不是仅唤起）。
+        // 窗口已存在时按需导航（同上：仅自动打开才重新定位）
         let current = window.url().ok().map(|current| current.to_string());
-        if current.as_deref() != Some(url) {
-            let parsed = url
-                .parse::<Url>()
-                .map_err(|error| format!("无效的 DSH URL：{error}"))?;
+        if allow_navigate && current.as_deref() != Some(url) {
             window
                 .navigate(parsed)
                 .map_err(|error| format!("导航内置 WebView 失败：{error}"))?;
@@ -2551,9 +2999,6 @@ fn open_embedded_webview(app: &AppHandle, url: &str) -> Result<(), String> {
             .and_then(|_| window.set_focus())
             .map_err(|error| format!("显示内置 WebView 失败：{error}"));
     }
-    let parsed: Url = url
-        .parse()
-        .map_err(|error| format!("无效的 DSH URL：{error}"))?;
     let allowed_scheme = parsed.scheme().to_string();
     let allowed_host = parsed.host_str().map(str::to_string);
     let allowed_port = parsed.port_or_known_default();
@@ -2605,9 +3050,12 @@ fn open_embedded_webview(app: &AppHandle, url: &str) -> Result<(), String> {
     window
         .show()
         .and_then(|_| window.set_focus())
-        .map_err(|error| format!("显示内置 WebView 失败：{error}"))
+        .map_err(|error| format!("显示内置 WebView 失败：{error}"))?;
+    let _ = app.emit("content-webview-changed", true);
+    Ok(())
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn register_window_state_persistence(window: &WebviewWindow) {
     let app = window.app_handle().clone();
     window.on_window_event(move |event| {
@@ -2621,7 +3069,7 @@ fn register_window_state_persistence(window: &WebviewWindow) {
     });
 }
 
-fn save_window_state(window: &WebviewWindow) {
+pub(crate) fn save_window_state(window: &tauri::Window) {
     let (Ok(position), Ok(size)) = (window.outer_position(), window.inner_size()) else {
         return;
     };
@@ -2637,7 +3085,7 @@ fn save_window_state(window: &WebviewWindow) {
     .save();
 }
 
-fn window_state_is_visible(app: &AppHandle, state: &WebviewWindowState) -> bool {
+pub(crate) fn window_state_is_visible(app: &AppHandle, state: &WebviewWindowState) -> bool {
     let Ok(monitors) = app.available_monitors() else {
         return false;
     };
@@ -2679,9 +3127,16 @@ fn rectangles_overlap(
 }
 
 fn close_embedded_webview(app: &AppHandle) {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    if let Some(webview) = app.get_webview("content") {
+        let _ = webview.close();
+        let _ = app.emit("content-webview-changed", false);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     if let Some(window) = app.get_webview_window("dsh-webview") {
         save_window_state(&window);
         let _ = window.destroy();
+        let _ = app.emit("content-webview-changed", false);
     }
 }
 
@@ -2868,23 +3323,25 @@ mod tests {
     }
 
     #[test]
-    fn embedded_webview_reopens_after_restart() {
-        let config = LauncherConfig {
-            launch_action: LaunchAction::EmbeddedWebview,
-            auto_start: false,
-            ..Default::default()
-        };
-        assert!(should_open_after_start(&config, true));
+    fn plugin_name_validation_blocks_traversal_and_metacharacters() {
+        assert!(validate_plugin_name("dsh-sound").is_ok());
+        assert!(validate_plugin_name("@dickpy/dsh-cloud-sync").is_ok());
+        assert!(validate_plugin_name("dsh-plugin-gptpro.v2_beta").is_ok());
+        assert!(validate_plugin_name("").is_err());
+        assert!(validate_plugin_name("../escape").is_err());
+        assert!(validate_plugin_name("pkg/..").is_err());
+        assert!(validate_plugin_name("pkg; rm -rf").is_err());
+        assert!(validate_plugin_name("pkg name").is_err());
+        assert!(validate_plugin_name("@scope/").is_err());
+        assert!(validate_plugin_name("/pkg").is_err());
     }
 
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
-    fn external_action_respects_restart_setting() {
-        let config = LauncherConfig {
-            launch_action: LaunchAction::DefaultBrowser,
-            auto_start: false,
-            ..Default::default()
-        };
-        assert!(!should_open_after_start(&config, true));
+    fn content_size_reserves_titlebar() {
+        assert_eq!(content_size(1180.0, 780.0), (1180.0, 742.0));
+        // 最小化等异常尺寸下保底，不出现负宽高
+        assert_eq!(content_size(10.0, 10.0), (80.0, 80.0));
     }
 
     #[test]

@@ -14,17 +14,27 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use config::LauncherConfig;
 use serde::Serialize;
 use service::{ServiceManager, ServiceStatus};
-use tauri::{AppHandle, Manager, RunEvent, State, WindowEvent};
+use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, RunEvent, State, WindowEvent};
 
 struct AppState {
     service: Mutex<ServiceManager>,
     maintenance: AtomicBool,
+    /// 内容子 WebView 是否应处于隐藏状态（标题栏弹层/模态/过渡激活期间为 true）。
+    /// 记忆在此处，创建内容 WebView 时可立即应用，避免闪现盖住弹层。
+    content_hidden: AtomicBool,
+    /// 启动器推送给 DSH 内容页的生效主题（None = 尚未接管，页面跟随系统）。
+    content_theme: Mutex<Option<String>>,
 }
+
+/// CloseRequested 回调帧内不直接 hide（与多 WebView 关闭流程互锁），
+/// 标记后延迟到 MainEventsCleared 帧执行。
+static PENDING_MAIN_HIDE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Bootstrap {
     app_version: &'static str,
+    platform: &'static str,
     config: LauncherConfig,
     detected_dsh: Option<String>,
     dsh_version: Option<String>,
@@ -70,6 +80,7 @@ fn bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<Bootstrap, St
 
     Ok(Bootstrap {
         app_version: env!("CARGO_PKG_VERSION"),
+        platform: std::env::consts::OS,
         config,
         detected_dsh: detected.map(|path| path.to_string_lossy().into_owned()),
         dsh_version: version,
@@ -171,9 +182,95 @@ fn service_status(state: State<'_, AppState>) -> Result<ServiceStatus, String> {
 
 #[tauri::command]
 fn embedded_webview_open(app: AppHandle) -> bool {
-    app.get_webview_window("dsh-webview")
-        .and_then(|window| window.is_visible().ok())
-        .unwrap_or(false)
+    service::embedded_view_open(&app)
+}
+
+/// 模态框/标题栏弹层打开期间隐藏 DSH 内容 WebView，让标题栏层的真实弹窗可见；
+/// 关闭后恢复显示。内容页状态保留（隐藏而非销毁）。
+#[tauri::command]
+fn set_content_hidden(app: AppHandle, state: State<'_, AppState>, hidden: bool) -> Result<(), String> {
+    state.content_hidden.store(hidden, Ordering::Release);
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    if let Some(content) = app.get_webview("content") {
+        let _ = if hidden { content.hide() } else { content.show() };
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = app;
+    Ok(())
+}
+
+/// 把标题栏当前生效的主题推送给 DSH 内容页，保持两端一致。
+/// 主题同时记忆在 AppState 与 DSH 页面 localStorage：页面导航/刷新后由
+/// on_page_load 钩子与初始化脚本恢复，避免跟随系统脚本把覆盖值冲掉。
+#[tauri::command]
+fn set_content_theme(app: AppHandle, state: State<'_, AppState>, theme: String) -> Result<(), String> {
+    let theme = if theme == "dark" { "dark" } else { "light" }.to_string();
+    *state.content_theme.lock().map_err(|error| error.to_string())? = Some(theme.clone());
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    if let Some(content) = app.get_webview("content") {
+        let _ = content.eval(service::theme_apply_script(&theme));
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = app;
+    Ok(())
+}
+
+/// 读取当前 Profile 已安装插件列表（package.json dependencies）。
+#[tauri::command]
+async fn list_profile_plugins(profile: Option<String>) -> Result<Vec<service::ProfilePlugin>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        service::read_profile_plugins(profile.as_deref().unwrap_or("web"))
+    })
+    .await
+    .map_err(|error| format!("读取插件列表任务异常结束：{error}"))?
+}
+
+/// 卸载 Profile 插件：优先 `pnpm remove`，失败回退手动清理；过程写入服务日志。
+#[tauri::command]
+async fn uninstall_profile_plugin(
+    app: AppHandle,
+    profile: Option<String>,
+    name: String,
+) -> Result<(), String> {
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        service::uninstall_profile_plugin(&app, profile.as_deref().unwrap_or("web"), &name)
+    })
+    .await;
+    match task {
+        Ok(result) => result,
+        Err(error) => Err(format!("卸载插件任务异常结束：{error}")),
+    }
+}
+
+/// 在 Profile 目录执行 `pnpm clean --lockfile`，输出写入服务日志。
+#[tauri::command]
+async fn run_profile_clean(app: AppHandle, profile: Option<String>) -> Result<(), String> {
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        service::run_profile_clean(&app, profile.as_deref().unwrap_or("web"))
+    })
+    .await;
+    match task {
+        Ok(result) => result,
+        Err(error) => Err(format!("清理任务异常结束：{error}")),
+    }
+}
+
+/// 空态页中的"在此窗口打开"：直接以内嵌视图打开 DSH。
+#[tauri::command]
+async fn open_embedded_view(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    // add_child 需要派发到主线程，放在异步命令/独立线程上执行，避免阻塞 IPC。
+    let url = {
+        let service = state.service.lock().map_err(|error| error.to_string())?;
+        service
+            .authenticated_url()
+            .or_else(|| service.status().url)
+            .ok_or_else(|| "DSH 服务尚未运行".to_string())?
+    };
+    let task_app = app.clone();
+    // 揭示语义：不重新导航，已加载的页面原样展示，避免闪烁
+    tauri::async_runtime::spawn_blocking(move || service::open_content_view(&task_app, &url, false))
+        .await
+        .map_err(|error| format!("打开内嵌视图任务异常结束：{error}"))?
 }
 
 #[tauri::command]
@@ -186,15 +283,21 @@ fn open_dsh_github_page() -> Result<(), String> {
     service::open_default("https://github.com/deepseek-ai/deepseek-harness")
 }
 
+/// 使用系统默认浏览器打开 DSH（带认证 token 的地址）。独立于内置 WebView 的入口。
 #[tauri::command]
-fn open_service_url(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    let service = state.service.lock().map_err(|e| e.to_string())?;
-    // 优先使用 dsh 启动日志捕获的带 token URL；回退到状态里的固定地址
-    let url = service
-        .authenticated_url()
-        .or_else(|| service.status().url)
-        .ok_or_else(|| "DSH 服务尚未运行".to_string())?;
-    service::open_configured(&app, &LauncherConfig::load(), &url)
+async fn open_service_url(state: State<'_, AppState>) -> Result<(), String> {
+    let url = {
+        let service = state.service.lock().map_err(|e| e.to_string())?;
+        // 优先使用 dsh 启动日志捕获的带 token URL；回退到状态里的固定地址
+        service
+            .authenticated_url()
+            .or_else(|| service.status().url)
+            .ok_or_else(|| "DSH 服务尚未运行".to_string())?
+    };
+    // open_default 内部等待子进程退出，放到阻塞线程池执行
+    tauri::async_runtime::spawn_blocking(move || service::open_default(&url))
+        .await
+        .map_err(|error| format!("打开浏览器任务异常结束：{error}"))?
 }
 
 #[tauri::command]
@@ -338,6 +441,8 @@ pub fn run() {
         .manage(AppState {
             service: Mutex::new(ServiceManager::new()),
             maintenance: AtomicBool::new(false),
+            content_hidden: AtomicBool::new(false),
+            content_theme: Mutex::new(None),
         })
         .setup(|app| {
             app.handle()
@@ -345,6 +450,51 @@ pub fn run() {
                 .map_err(|error| format!("注册 updater 插件失败：{error}"))?;
 
             let config = LauncherConfig::load();
+            // 主窗口：本地前端渲染自定义标题栏与空态页。macOS 保留原生红绿灯
+            // （Overlay 覆盖在标题栏上），Windows/Linux 完全无边框、由前端自绘控制按钮。
+            let mut main_builder =
+                tauri::WebviewWindowBuilder::new(app.handle(), "main", tauri::WebviewUrl::default())
+                    .title("DSH Launcher")
+                    .inner_size(1180.0, 780.0)
+                    .min_inner_size(760.0, 520.0)
+                    .resizable(true);
+            #[cfg(target_os = "macos")]
+            {
+                main_builder = main_builder
+                    .title_bar_style(tauri::TitleBarStyle::Overlay)
+                    .hidden_title(true)
+                    .traffic_light_position(tauri::LogicalPosition::new(16.0, 13.0));
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                main_builder = main_builder.decorations(false);
+            }
+            let main_window = main_builder
+                .build()
+                .map_err(|error| format!("创建主窗口失败：{error}"))?;
+            // 恢复上次窗口位置/尺寸（仅当落在可见显示器范围内时才信任）
+            let saved = config::WebviewWindowState::load()
+                .filter(|state| service::window_state_is_visible(app.handle(), state));
+            if let Some(state) = saved {
+                let _ = main_window.set_size(PhysicalSize::new(
+                    state.width.max(760),
+                    state.height.max(520),
+                ));
+                let _ = main_window.set_position(PhysicalPosition::new(state.x, state.y));
+            } else {
+                let _ = main_window.center();
+            }
+            // 窗口尺寸变化时保持内容子 WebView 铺满标题栏以下区域
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            {
+                let app_handle = app.handle().clone();
+                main_window.on_window_event(move |event| {
+                    if matches!(event, tauri::WindowEvent::Resized(_)) {
+                        service::sync_content_bounds(&app_handle);
+                    }
+                });
+            }
+
             // 系统托盘初始化
             if let Err(error) = tray::init(app.handle()) {
                 service::emit_log(
@@ -375,10 +525,16 @@ pub fn run() {
             restart_service,
             service_status,
             embedded_webview_open,
+            set_content_hidden,
+            set_content_theme,
+            open_embedded_view,
             open_project_page,
             open_dsh_github_page,
             open_service_url,
             open_profile_dir,
+            list_profile_plugins,
+            uninstall_profile_plugin,
+            run_profile_clean,
             check_launcher_update,
             open_release_page,
             install_managed_runtime,
@@ -400,13 +556,31 @@ pub fn run() {
             event: WindowEvent::CloseRequested { api, .. },
             ..
         } = &event
-            && label == "main"
         {
-            api.prevent_close();
-            if let Some(window) = handle.get_webview_window("main") {
-                let _ = window.hide();
+            eprintln!("[close-debug] CloseRequested label={label}");
+            if label == "main" {
+                api.prevent_close();
+                // 多 WebView 窗口下，hide 若在 CloseRequested 回调帧内同步执行会与
+                // 关闭流程重入互锁（红绿灯点击后无响应）。此处只登记待办，
+                // 由 MainEventsCleared 帧（事件循环泵完当前批次后）再执行 hide。
+                PENDING_MAIN_HIDE.store(true, Ordering::Release);
             }
             return;
+        }
+
+        if let RunEvent::MainEventsCleared = &event
+            && PENDING_MAIN_HIDE.swap(false, Ordering::AcqRel)
+        {
+            eprintln!("[close-debug] MainEventsCleared -> hide main");
+            if let Some(window) = handle.get_window("main") {
+                service::save_window_state(&window);
+                match window.hide() {
+                    Ok(()) => eprintln!("[close-debug] hide ok"),
+                    Err(error) => eprintln!("[close-debug] hide err: {error}"),
+                }
+            } else {
+                eprintln!("[close-debug] main window not found");
+            }
         }
 
         // 点击 Dock 图标或外部唤起时恢复主窗口
@@ -418,6 +592,10 @@ pub fn run() {
         }
 
         if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
+            // 退出前保存主窗口状态，下次启动按原位恢复
+            if let Some(window) = handle.get_window("main") {
+                service::save_window_state(&window);
+            }
             shutdown_service(handle);
         }
     });

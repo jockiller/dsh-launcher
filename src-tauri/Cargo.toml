@@ -28,7 +28,8 @@ shell-words = "1"
 tar = "0.4"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
-tauri = { version = "2", features = ["image-png", "tray-icon"] }
+# unstable：单窗口多 WebView（主窗口标题栏 + DSH 内容子 WebView），仅 macOS/Windows 实际使用。
+tauri = { version = "2", features = ["image-png", "tray-icon", "unstable"] }
 tauri-plugin-dialog = "2"
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]

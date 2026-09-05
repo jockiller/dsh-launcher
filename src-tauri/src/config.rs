@@ -11,20 +11,10 @@ pub struct LauncherConfig {
     pub profile: String,
     pub host: String,
     pub port: u16,
-    pub launch_action: LaunchAction,
     pub custom_args: String,
     pub auto_start: bool,
     pub auto_scroll_logs: bool,
     pub managed_runtime_dir: String,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum LaunchAction {
-    None,
-    DefaultBrowser,
-    #[default]
-    EmbeddedWebview,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,7 +46,6 @@ impl Default for LauncherConfig {
             profile: "web".into(),
             host: "127.0.0.1".into(),
             port: 3080,
-            launch_action: LaunchAction::EmbeddedWebview,
             custom_args: "--no-open".into(),
             auto_start: false,
             auto_scroll_logs: true,
@@ -234,14 +223,6 @@ mod tests {
         assert_eq!(config.profile, "web");
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.port, 3080);
-        assert!(matches!(
-            config.launch_action,
-            LaunchAction::EmbeddedWebview
-        ));
-        assert_eq!(
-            serde_json::to_value(config.launch_action).unwrap(),
-            "embedded_webview"
-        );
         assert_eq!(config.custom_args, "--no-open");
         assert!(!config.auto_start);
         assert!(config.managed_runtime_dir.is_empty());

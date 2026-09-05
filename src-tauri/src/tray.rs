@@ -5,7 +5,9 @@ use tauri::{AppHandle, Manager};
 use crate::config::LauncherConfig;
 
 pub fn show_main_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
+    // 多 WebView 模式下 main 不再是 WebviewWindow（is_webview_window=false），
+    // get_webview_window 会返回 None，必须用 get_window
+    if let Some(window) = app.get_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
@@ -58,13 +60,17 @@ pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                 show_main_window(app);
             }
             "open_web" => {
-                if let Some(state) = app.try_state::<crate::AppState>()
-                    && let Ok(service) = state.service.lock()
-                    && let Some(url) = service.authenticated_url().or_else(|| service.status().url)
-                {
-                    let config = LauncherConfig::load();
-                    let _ = crate::service::open_service_gui(app, &config, &url);
-                }
+                // 打开内置 DSH 视图（可能创建子 WebView，add_child 需派发主线程），
+                // 放到异步运行时执行，避免在菜单事件（主线程）里同步阻塞。
+                let app_handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(state) = app_handle.try_state::<crate::AppState>()
+                        && let Ok(service) = state.service.lock()
+                        && let Some(url) = service.authenticated_url().or_else(|| service.status().url)
+                    {
+                        let _ = crate::service::open_content_view(&app_handle, &url, false);
+                    }
+                });
             }
             "start_service" => {
                 let app_handle = app.clone();

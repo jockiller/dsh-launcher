@@ -21,10 +21,6 @@ const zhDict = {
   openProfileDir: "打开 Profile 目录",
   host: "主机",
   port: "端口",
-  afterLaunch: "启动后",
-  launchNone: "不执行",
-  launchDefaultBrowser: "默认浏览器",
-  launchEmbeddedWebview: "内置 WebView",
   dshArgs: "DSH 参数",
   customArgsPlaceholder: "例如 --no-open",
   autoStart: "自动启动",
@@ -69,8 +65,6 @@ const zhDict = {
   phaseRestarting: "重启中",
   phaseFailed: "异常",
   phaseExternal: "外部服务",
-  switchToDark: "切换到暗色",
-  switchToLight: "切换到亮色",
   recheckWithConfig: "按当前配置重新检测",
   startService: "启动服务",
   stopService: "停止服务",
@@ -81,9 +75,10 @@ const zhDict = {
   dshRestartAction: "正在重启 DSH",
   forceStoppingAction: "正在停止外部服务",
   dshStart: "启动 DSH",
+  loadingWebview: "正在加载 DSH 界面...",
   windowCloseHint: "本窗口可以关闭",
   restartService: "重启服务",
-  openWebGui: "打开 Web GUI",
+  openInBrowser: "在浏览器打开",
   viewOnGitHub: "在 GitHub 上查看项目",
   openGitHub: "跳转到 GitHub",
   checkForUpdates: "检查更新",
@@ -124,6 +119,29 @@ const zhDict = {
   forceStopConfirmTitle: "强制停止外部服务",
   forceStopConfirmMessage: "将强制终止当前端口上的外部 DSH 进程，此操作无法撤销。是否继续？",
   forceStopAction: "强制停止",
+  // 标题栏
+  settingsTitle: "设置",
+  quickActions: "快速操作",
+  openEmbedded: "打开",
+  languageLabel: "界面语言",
+  // 插件管理
+  managePlugins: "管理插件",
+  pluginsDialogTitle: "已安装插件",
+  pluginsDialogHint: "卸载不兼容插件可恢复启动；操作会写入服务日志，卸载后建议重启服务。",
+  pluginsLoading: "正在读取插件列表...",
+  pluginsEmpty: "当前 Profile 未安装插件",
+  pluginsRefresh: "刷新",
+  uninstall: "卸载",
+  uninstalling: "卸载中...",
+  uninstallConfirmTitle: "卸载插件",
+  uninstallConfirmMessage: "将从 Profile 依赖中移除 {0} 并删除其安装目录，建议先停止 DSH 服务。是否继续？",
+  uninstallAction: "卸载",
+  runCleanLockfile: "清理并重装依赖",
+  errorBellTitle: "查看错误详情",
+  errorDismiss: "知道了",
+  minimizeAria: "最小化",
+  maximizeAria: "最大化",
+  closeAria: "关闭",
 } as const;
 
 export type Dict = Record<keyof typeof zhDict, string>;
@@ -141,10 +159,6 @@ const enDict: Dict = {
   openProfileDir: "Open Profile folder",
   host: "Host",
   port: "Port",
-  afterLaunch: "After launch",
-  launchNone: "Do nothing",
-  launchDefaultBrowser: "Default browser",
-  launchEmbeddedWebview: "Embedded WebView",
   dshArgs: "DSH arguments",
   customArgsPlaceholder: "e.g. --no-open",
   autoStart: "Auto start",
@@ -187,8 +201,6 @@ const enDict: Dict = {
   phaseRestarting: "Restarting",
   phaseFailed: "Failed",
   phaseExternal: "External",
-  switchToDark: "Switch to dark theme",
-  switchToLight: "Switch to light theme",
   recheckWithConfig: "Re-detect with the current configuration",
   startService: "Start service",
   stopService: "Stop service",
@@ -199,9 +211,10 @@ const enDict: Dict = {
   dshRestartAction: "Restarting DSH",
   forceStoppingAction: "Stopping external service",
   dshStart: "Start DSH",
+  loadingWebview: "Loading the DSH interface...",
   windowCloseHint: "This window can be closed",
   restartService: "Restart",
-  openWebGui: "Open Web GUI",
+  openInBrowser: "Open in browser",
   viewOnGitHub: "View project on GitHub",
   openGitHub: "Open GitHub",
   checkForUpdates: "Check for updates",
@@ -242,6 +255,27 @@ const enDict: Dict = {
   forceStopConfirmTitle: "Force stop external service",
   forceStopConfirmMessage: "The external DSH process on the current port will be force-killed. This cannot be undone. Continue?",
   forceStopAction: "Force stop",
+  settingsTitle: "Settings",
+  quickActions: "Quick actions",
+  openEmbedded: "Open",
+  languageLabel: "Interface language",
+  managePlugins: "Manage plugins",
+  pluginsDialogTitle: "Installed plugins",
+  pluginsDialogHint: "Removing incompatible plugins can restore startup. Actions are written to the service log; restart the service afterwards.",
+  pluginsLoading: "Loading plugins...",
+  pluginsEmpty: "No plugins installed in this profile",
+  pluginsRefresh: "Refresh",
+  uninstall: "Uninstall",
+  uninstalling: "Uninstalling...",
+  uninstallConfirmTitle: "Uninstall plugin",
+  uninstallConfirmMessage: "{0} will be removed from the profile dependencies and its files deleted. Stopping the DSH service first is recommended. Continue?",
+  uninstallAction: "Uninstall",
+  runCleanLockfile: "清理并重装依赖",
+  errorBellTitle: "View error details",
+  errorDismiss: "Dismiss",
+  minimizeAria: "Minimize",
+  maximizeAria: "Maximize",
+  closeAria: "Close",
 };
 
 export const translations: Record<Lang, Dict> = { zh: zhDict, en: enDict };
@@ -312,6 +346,7 @@ const backendExact: Record<string, string> = {
   "主机不能为空": "Host cannot be empty",
   "端口必须在 1 到 65535 之间": "Port must be between 1 and 65535",
   "DSH 服务尚未运行": "DSH service is not running yet",
+  主窗口不可用: "Main window unavailable",
   打开浏览器失败: "Failed to open the browser",
   替换配置文件失败: "Failed to replace the config file",
   // ---------- 托管安装/升级日志（installer 来源） ----------
@@ -327,6 +362,15 @@ const backendExact: Record<string, string> = {
   "服务已停止，正在升级 DSH...": "The service has stopped; upgrading DSH...",
   "DSH 升级完成，将在下次启动时生效": "DSH upgrade complete; it will take effect on the next launch",
   "npm 仍在下载并安装 DSH...": "npm is still downloading and installing DSH...",
+  "正在执行 pnpm clean --lockfile...": "Running pnpm clean --lockfile...",
+  "正在执行 pnpm install...": "Running pnpm install...",
+  "依赖已清理并重新安装完成": "Dependencies cleaned and reinstalled",
+  "pnpm install 失败，Profile 可能不可用，请检查上方日志": "pnpm install failed; the profile may be unusable. Check the log above",
+  "Profile 尚未初始化（未找到 package.json），请先启动一次 DSH":
+    "Profile not initialized (package.json missing); start DSH once first",
+  "Profile 尚未初始化（未找到 package.json）": "Profile not initialized (package.json missing)",
+  "无法定位 Profile 目录": "Cannot locate the profile directory",
+  插件名无效: "Invalid plugin name",
 };
 
 /**
@@ -340,6 +384,72 @@ interface BackendTemplate {
 }
 
 const backendTemplates: readonly BackendTemplate[] = [
+  {
+    // 插件管理（plugins 来源）
+    segments: ["正在卸载插件 ", "..."],
+    en: "Uninstalling plugin {0}...",
+  },
+  {
+    segments: ["插件 ", " 已卸载"],
+    en: "Plugin {0} uninstalled",
+  },
+  {
+    segments: ["pnpm remove 失败，回退手动清理：", ""],
+    en: "pnpm remove failed; falling back to manual cleanup: {0}",
+  },
+  {
+    segments: ["插件 ", " 已手动移除；lockfile 未同步，建议稍后运行 pnpm install"],
+    en: "Plugin {0} removed manually; the lockfile was not updated, consider running pnpm install later",
+  },
+  {
+    // 优先于下方 "pnpm " 前缀模板
+    segments: ["pnpm ", " 执行超时（180 秒），子进程已被终止"],
+    en: "pnpm {0} timed out after 180 seconds; the child process was terminated",
+  },
+  {
+    segments: ["pnpm ", " 失败："],
+    en: "pnpm {0} failed: {1}",
+  },
+  {
+    segments: ["启动 pnpm 失败：", ""],
+    en: "Failed to launch pnpm: {0}",
+  },
+  {
+    segments: ["等待 pnpm 退出失败：", ""],
+    en: "Failed to wait for pnpm to exit: {0}",
+  },
+  {
+    segments: ["读取 package.json 失败：", ""],
+    en: "Failed to read package.json: {0}",
+  },
+  {
+    segments: ["写入 package.json 失败：", ""],
+    en: "Failed to write package.json: {0}",
+  },
+  {
+    segments: ["序列化 package.json 失败：", ""],
+    en: "Failed to serialize package.json: {0}",
+  },
+  {
+    segments: ["package.json 解析失败：", ""],
+    en: "Failed to parse package.json: {0}",
+  },
+  {
+    segments: ["删除插件目录失败：", ""],
+    en: "Failed to delete the plugin directory: {0}",
+  },
+  {
+    segments: ["读取插件列表任务异常结束：", ""],
+    en: "Loading the plugin list ended abnormally: {0}",
+  },
+  {
+    segments: ["卸载插件任务异常结束：", ""],
+    en: "Uninstalling the plugin ended abnormally: {0}",
+  },
+  {
+    segments: ["清理任务异常结束：", ""],
+    en: "The cleanup task ended abnormally: {0}",
+  },
   {
     // 优先于下方 "打开浏览器失败：" 前缀模板，避免被更短的模板抢先匹配
     segments: ["打开浏览器失败：", " 执行超时（", "），子进程已被终止；状态不明确，不再回退其他程序"],
@@ -363,11 +473,14 @@ const backendTemplates: readonly BackendTemplate[] = [
   { segments: ["DSH 参数格式无效：", ""], en: "Invalid DSH arguments: {0}" },
   { segments: ["无效的 DSH URL：", ""], en: "Invalid DSH URL: {0}" },
   { segments: ["打开内置 WebView 失败：", ""], en: "Failed to open the embedded WebView: {0}" },
+  { segments: ["导航内置 WebView 失败：", ""], en: "Failed to navigate the embedded WebView: {0}" },
+  { segments: ["打开内嵌视图任务异常结束：", ""], en: "The embedded view task ended abnormally: {0}" },
   { segments: ["恢复内置 WebView 大小失败：", ""], en: "Failed to restore the embedded WebView size: {0}" },
   { segments: ["恢复内置 WebView 位置失败：", ""], en: "Failed to restore the embedded WebView position: {0}" },
   { segments: ["居中内置 WebView 失败：", ""], en: "Failed to center the embedded WebView: {0}" },
   { segments: ["显示内置 WebView 失败：", ""], en: "Failed to show the embedded WebView: {0}" },
   { segments: ["打开浏览器失败：", ""], en: "Failed to open the browser: {0}" },
+  { segments: ["打开浏览器任务异常结束：", ""], en: "The browser-open task ended abnormally: {0}" },
   { segments: ["替换配置文件失败：", ""], en: "Failed to replace the config file: {0}" },
   // ---------- 托管安装/升级日志（installer 来源，动态消息） ----------
   { segments: ["正在使用 npm 源安装 DSH：", ""], en: "Installing DSH with npm registry: {0}" },
