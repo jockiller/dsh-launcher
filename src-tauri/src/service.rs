@@ -2972,6 +2972,8 @@ fn open_content_webview_child(
         // 用户点击"打开"时只做揭示，重载会造成页面闪烁。
         let current = webview.url().ok().map(|current| current.to_string());
         if allow_navigate && current.as_deref() != Some(url) {
+            let _ = app.emit("content-page-load", false);
+            let _ = webview.hide();
             webview
                 .navigate(parsed)
                 .map_err(|error| format!("导航内置 WebView 失败：{error}"))?;
@@ -3137,6 +3139,8 @@ fn open_embedded_webview_window(
         // 窗口已存在时按需导航（同上：仅自动打开才重新定位）
         let current = window.url().ok().map(|current| current.to_string());
         if allow_navigate && current.as_deref() != Some(url) {
+            let _ = app.emit("content-page-load", false);
+            let _ = window.hide();
             window
                 .navigate(parsed)
                 .map_err(|error| format!("导航内置 WebView 失败：{error}"))?;

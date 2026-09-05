@@ -106,7 +106,9 @@ interface ProfilePlugin {
 
 // 与后端 ServiceStatus 默认值一致；展示时经 translateBackendMessage 按当前语言渲染
 const emptyStatus: ServiceStatus = { phase: "stopped", pid: null, url: null, message: "服务未运行" };
-const STARTUP_OVERLAY_MIN_MS = 700;
+const STARTUP_OVERLAY_MIN_MS = 1400;
+// 内容页 Finished 后的额外揭示延时，延长 loading 呈现并确保 webview 内部 DOM/样式渲染完成
+const WEBVIEW_REVEAL_DELAY_MS = 800;
 
 function errorMessage(error: unknown) {
   return typeof error === "string" ? error : error instanceof Error ? error.message : String(error);
@@ -260,7 +262,8 @@ export default function App() {
       .then((data) => {
         setPlatform(data.platform);
         setAppVersion(data.appVersion);
-        setConfig({ ...data.config, dshPath: data.config.dshPath || data.detectedDsh || "" });
+        const resolvedConfig: Config = { ...data.config, dshPath: data.config.dshPath || data.detectedDsh || "" };
+        setConfig(resolvedConfig);
         setVersion(data.dshVersion);
         setDshVersionInfo(null);
         setProfiles(data.profiles);
@@ -274,6 +277,18 @@ export default function App() {
         }
         if (data.status.phase === "external") {
           setExternalStopOffered(true);
+        }
+        // 冷启动且配置了自动启动：立即提前触发服务启动，让服务与 webview 尽早开始加载
+        if (resolvedConfig.autoStart && !autoStartTriggered.current) {
+          autoStartTriggered.current = true;
+          if (data.status.phase === "stopped") {
+            void runCommand("start_service", resolvedConfig);
+          } else if (data.status.phase === "running") {
+            void invoke("open_embedded_view").catch(() => undefined);
+          }
+        } else if (data.status.phase === "running") {
+          // 若服务已在外部/后台运行：提前在后台触发 webview 加载
+          void invoke("open_embedded_view").catch(() => undefined);
         }
         if (data.config.managedRuntimeDir) {
           // Managed runtimes keep their existing update check; external runtimes use the separate async check below.
@@ -322,9 +337,26 @@ export default function App() {
         setThemeOverride(payload);
       }
     });
+    let revealTimer: number | undefined;
     // 内容页加载进度：Started/Finished
     const contentPageLoadListener = listen<boolean>("content-page-load", ({ payload }) => {
-      setContentPageReady(payload);
+      if (!payload) {
+        if (revealTimer !== undefined) {
+          window.clearTimeout(revealTimer);
+          revealTimer = undefined;
+        }
+        setContentPageReady(false);
+      } else {
+        // 延时揭示：收到 Finished 后保持 loading 并延时 WEBVIEW_REVEAL_DELAY_MS 毫秒揭示，
+        // 延长主窗口 loading 呈现，并给 webview 内部 DOM/样式渲染留出充足时间
+        if (revealTimer !== undefined) {
+          window.clearTimeout(revealTimer);
+        }
+        revealTimer = window.setTimeout(() => {
+          setContentPageReady(true);
+          revealTimer = undefined;
+        }, WEBVIEW_REVEAL_DELAY_MS);
+      }
     });
     // DSH 内容页真实 document.title 上报
     const contentTitleListener = listen<string>("content-title-changed", ({ payload }) => {
@@ -340,6 +372,7 @@ export default function App() {
     return () => {
       clearTimeout(minimumTimer);
       clearInterval(timer);
+      if (revealTimer !== undefined) window.clearTimeout(revealTimer);
       void statusListener.then((unlisten) => unlisten());
       void logListener.then((unlisten) => unlisten());
       void managedListener.then((unlisten) => unlisten());
@@ -394,8 +427,8 @@ export default function App() {
   // 真实可见；全部关闭后恢复。此外内容页未加载完成（Started→Finished 之间）也保持
   // 隐藏，配合过渡遮罩消除启动/切换时的两次闪烁。
   const isTransitioning = busy || pendingAction !== null || ["starting", "stopping", "restarting"].includes(status.phase);
-  // 服务已运行但内容页尚未加载完成：保持遮罩直到揭示瞬间，避免中间空档
-  const contentPendingReveal = status.phase === "running" && embeddedWebviewOpen && !contentPageReady;
+  // 服务已运行但内容页尚未加载并延时揭示完成：保持遮罩直到揭示瞬间，避免中间空档
+  const contentPendingReveal = status.phase === "running" && !contentPageReady;
   const launcherLayerActive = errorPanelOpen || settingsOpen
     || installDialogOpen || dshVersionDialogOpen || appUpdateDialogOpen || pluginsDialogOpen || isTransitioning
     || contentPendingReveal;
@@ -529,17 +562,27 @@ export default function App() {
 
   useEffect(() => {
     if (!config || !minStartupElapsed) return;
+    // 若配置了自动启动，且 webview 尚未完成加载与延时揭示：
+    // 继续保持主窗口 loading 状态（展示“正在自动启动服务...”），不提前退出暴露控制台
+    if (config.autoStart && !contentPageReady) {
+      if (status.phase === "failed" || status.phase === "external") {
+        setStartupReady(true);
+        return;
+      }
+      const fallbackTimer = window.setTimeout(() => setStartupReady(true), 8000);
+      return () => clearTimeout(fallbackTimer);
+    }
     setStartupReady(true);
-  }, [config, minStartupElapsed]);
+  }, [config, minStartupElapsed, contentPageReady, status.phase]);
 
-  // 当主窗口就绪且配置要求自动启动时，以标准的启动流程自动触发（先展示主窗口，中心带过渡卡片，等就绪后再平滑切入 webview）
+  // 当配置要求自动启动时（兜底）：以标准的启动流程自动触发
   useEffect(() => {
-    if (!startupReady || !config?.autoStart || autoStartTriggered.current) return;
+    if (!config?.autoStart || autoStartTriggered.current) return;
     if (status.phase === "stopped") {
       autoStartTriggered.current = true;
-      void runCommand("start_service");
+      void runCommand("start_service", config);
     }
-  }, [startupReady, config?.autoStart, status.phase]);
+  }, [config, status.phase]);
 
   // 强制关闭入口提供恢复路径：Esc 退回普通 external 状态（再次点击启动即为重新检测）
   useEffect(() => {
@@ -898,8 +941,12 @@ export default function App() {
     }
   }
 
-  async function runCommand(command: "start_service" | "stop_service" | "restart_service") {
-    if (!config) return;
+  async function runCommand(
+    command: "start_service" | "stop_service" | "restart_service",
+    targetConfig?: Config,
+  ) {
+    const activeConfig = targetConfig ?? config;
+    if (!activeConfig) return;
     const action = command === "start_service" ? "start" : command === "stop_service" ? "stop" : "restart";
     if (command === "start_service" || command === "restart_service") {
       // 启动或重启时自动取消设置的选中状态与弹层，确保服务就绪后直接呈现 webview
@@ -919,9 +966,9 @@ export default function App() {
       setError(null);
     });
     // 确保浏览器在发起后端 IPC 前，已经将遮罩绘制到屏幕上
-    await new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 50)));
+    await new Promise((resolve) => setTimeout(resolve, 50));
     try {
-      const payload = command === "stop_service" ? {} : { config };
+      const payload = command === "stop_service" ? {} : { config: activeConfig };
       const minDelay = command === "stop_service" ? 500 : 0;
       const [nextStatus] = await Promise.all([
         invoke<ServiceStatus>(command, payload),
