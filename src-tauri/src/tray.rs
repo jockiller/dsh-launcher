@@ -135,5 +135,15 @@ pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         })
         .build(app)?;
 
+    let visible = LauncherConfig::load().show_tray_icon;
+    apply_visibility(app, visible);
+
     Ok(())
+}
+
+/// 运行时动态切换托盘图标显隐（由 save_config 触发）
+pub fn apply_visibility(app: &AppHandle, visible: bool) {
+    if let Some(tray) = app.tray_by_id("dsh-tray") {
+        let _ = tray.set_visible(visible);
+    }
 }

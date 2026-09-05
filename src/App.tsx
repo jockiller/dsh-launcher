@@ -42,6 +42,7 @@ interface Config {
   port: number;
   customArgs: string;
   autoStart: boolean;
+  showTrayIcon: boolean;
   autoScrollLogs: boolean;
   managedRuntimeDir: string;
 }
@@ -215,8 +216,8 @@ export default function App() {
   const [appUpdateError, setAppUpdateError] = useState<string | null>(null);
   const [appVersionChecking, setAppVersionChecking] = useState(false);
   const [appVersionCheckError, setAppVersionCheckError] = useState<string | null>(null);
-  // 标题栏弹层：快速操作菜单 / 错误详情 / 设置面板 / 日志抽屉
-  const [quickMenuOpen, setQuickMenuOpen] = useState(false);
+  const [contentTitle, setContentTitle] = useState<string>("");
+  // 标题栏弹层：错误详情 / 设置面板
   const [errorPanelOpen, setErrorPanelOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   // 插件管理
@@ -312,6 +313,10 @@ export default function App() {
     const contentPageLoadListener = listen<boolean>("content-page-load", ({ payload }) => {
       setContentPageReady(payload);
     });
+    // DSH 内容页真实 document.title 上报
+    const contentTitleListener = listen<string>("content-title-changed", ({ payload }) => {
+      setContentTitle(payload);
+    });
     const syncRuntimeState = () => {
       void invoke<ServiceStatus>("service_status").then(setStatus).catch(() => undefined);
       void invoke<boolean>("embedded_webview_open").then(setEmbeddedWebviewOpen).catch(() => undefined);
@@ -329,6 +334,7 @@ export default function App() {
       void contentViewListener.then((unlisten) => unlisten());
       void contentThemeListener.then((unlisten) => unlisten());
       void contentPageLoadListener.then((unlisten) => unlisten());
+      void contentTitleListener.then((unlisten) => unlisten());
     };
   }, []);
 
@@ -377,7 +383,7 @@ export default function App() {
   const isTransitioning = busy || pendingAction !== null || ["starting", "stopping", "restarting"].includes(status.phase);
   // 服务已运行但内容页尚未加载完成：保持遮罩直到揭示瞬间，避免中间空档
   const contentPendingReveal = status.phase === "running" && embeddedWebviewOpen && !contentPageReady;
-  const launcherLayerActive = quickMenuOpen || errorPanelOpen || settingsOpen
+  const launcherLayerActive = errorPanelOpen || settingsOpen
     || installDialogOpen || dshVersionDialogOpen || appUpdateDialogOpen || pluginsDialogOpen || isTransitioning
     || contentPendingReveal;
   useEffect(() => {
@@ -486,18 +492,17 @@ export default function App() {
     };
   }, [installDialogOpen, appUpdateDialogOpen, dshVersionDialogOpen, pluginsDialogOpen]);
 
-  // 弹层（菜单/错误/设置）的 Esc 关闭；对话框打开时交给上面对话框逻辑处理
+  // 弹层（错误/设置）的 Esc 关闭；对话框打开时交给上面对话框逻辑处理
   useEffect(() => {
     const anyDialogOpen = installDialogOpen || appUpdateDialogOpen || dshVersionDialogOpen || pluginsDialogOpen;
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || anyDialogOpen) return;
-      if (quickMenuOpen) setQuickMenuOpen(false);
-      else if (errorPanelOpen) setErrorPanelOpen(false);
+      if (errorPanelOpen) setErrorPanelOpen(false);
       else if (settingsOpen) setSettingsOpen(false);
     };
     document.addEventListener("keydown", handleKeyDown, true);
     return () => document.removeEventListener("keydown", handleKeyDown, true);
-  }, [quickMenuOpen, errorPanelOpen, settingsOpen, installDialogOpen, appUpdateDialogOpen, dshVersionDialogOpen, pluginsDialogOpen]);
+  }, [errorPanelOpen, settingsOpen, installDialogOpen, appUpdateDialogOpen, dshVersionDialogOpen, pluginsDialogOpen]);
 
   useEffect(() => {
     if (status.phase !== "external") setExternalStopOffered(false);
@@ -749,14 +754,13 @@ export default function App() {
 
   async function openEmbeddedView(button: HTMLButtonElement) {
     button.blur();
-    // 不论从哪里触发（空态页/快速菜单/设置面板），先收起所有标题栏弹层，
-    // 让 DSH 内容直接呈现；更新弹窗在安装进行中时不打断
+    // 不论何时点击“打开”：彻底收起设置面板和所有弹层，切换到 webview
     setSettingsOpen(false);
     setPluginsDialogOpen(false);
-    setQuickMenuOpen(false);
     setErrorPanelOpen(false);
     if (!appUpdateBusy) setAppUpdateDialogOpen(false);
     try {
+      await invoke("set_content_hidden", { hidden: false });
       await invoke("open_embedded_view");
     } catch (reason) {
       setError(errorMessage(reason));
@@ -957,11 +961,15 @@ export default function App() {
             type="button"
             className={`tb-status ${status.phase}`}
             onClick={() => {
-              setQuickMenuOpen((openState) => !openState);
-              setErrorPanelOpen(false);
+              if (status.phase === "running") {
+                // 与右上角设置按钮保持一致：在主窗控制台与 webview 之间来回切换
+                setSettingsOpen((prev) => !prev);
+                setErrorPanelOpen(false);
+              } else {
+                setSettingsOpen(true);
+                setErrorPanelOpen(false);
+              }
             }}
-            aria-haspopup="menu"
-            aria-expanded={quickMenuOpen}
             title={status.message ? translateBackendMessage(status.message, lang) : undefined}
           >
             <span className="tb-dot" aria-hidden="true" />
@@ -974,13 +982,15 @@ export default function App() {
               className={`tb-btn tb-error-btn ${errorPanelOpen ? "active" : ""}`}
               onClick={() => {
                 setErrorPanelOpen((openState) => !openState);
-                setQuickMenuOpen(false);
               }}
               title={t.errorBellTitle}
             >
               <TriangleAlert size={15} />
             </button>
           )}
+          <div className="tb-title" data-tauri-drag-region="deep">
+            {contentTitle || "DSH Launcher"}
+          </div>
           <div className="tb-spacer" />
           <div className="tb-actions">
             <button
@@ -988,7 +998,6 @@ export default function App() {
               className={`tb-btn tb-power ${externalStopOffered ? "force-stop" : status.phase}`}
               disabled={busy || status.phase === "stopping"}
               onClick={(event) => {
-                setQuickMenuOpen(false);
                 if (externalStopOffered) void forceStopExternal(event.currentTarget);
                 else void runCommand(shouldStart ? "start_service" : "stop_service");
               }}
@@ -1001,7 +1010,6 @@ export default function App() {
               className={`tb-btn ${settingsOpen ? "active" : ""}`}
               onClick={() => {
                 setSettingsOpen((openState) => !openState);
-                setQuickMenuOpen(false);
               }}
               title={t.settingsTitle}
             >
@@ -1022,44 +1030,6 @@ export default function App() {
           </div>
         </header>
 
-        {quickMenuOpen && (
-          <div className="top-strip quick-strip" role="menu" data-tauri-drag-region="false">
-            <span className="strip-label">{t.quickActions}</span>
-            <button
-              type="button"
-              role="menuitem"
-              disabled={status.phase !== "running" || busy}
-              onClick={() => {
-                setQuickMenuOpen(false);
-                void runCommand("restart_service");
-              }}
-            >
-              <RotateCw size={13} />{t.restartService}
-            </button>
-            <button
-              type="button"
-              role="menuitem"
-              disabled={!webAvailable}
-              onClick={(event) => {
-                setQuickMenuOpen(false);
-                void openServiceUrl(event.currentTarget);
-              }}
-            >
-              <ExternalLink size={13} />{t.openInBrowser}
-            </button>
-            <button
-              type="button"
-              role="menuitem"
-              disabled={!webAvailable}
-              onClick={(event) => {
-                setQuickMenuOpen(false);
-                void openEmbeddedView(event.currentTarget);
-              }}
-            >
-              <AppWindow size={13} />{t.openEmbedded}
-            </button>
-          </div>
-        )}
         {errorPanelOpen && error && (
           <div className="top-strip error-strip" role="alert" data-tauri-drag-region="false">
             <p>{translateBackendMessage(error, lang)}</p>
@@ -1143,6 +1113,7 @@ export default function App() {
                     <div className="post-launch-row">
                       <div className="mini-field custom-args"><label htmlFor="custom-args">{t.dshArgs}</label><input id="custom-args" value={config.customArgs} disabled={locked} onChange={(event) => patch("customArgs", event.target.value)} placeholder={t.customArgsPlaceholder} /></div>
                       <label className="mini-toggle"><input type="checkbox" checked={config.autoStart} disabled={locked} onChange={(event) => patch("autoStart", event.target.checked)} /><span>{t.autoStart}</span></label>
+                      <label className="mini-toggle"><input type="checkbox" checked={config.showTrayIcon} onChange={(event) => patch("showTrayIcon", event.target.checked)} /><span>{t.showTrayIcon}</span></label>
                     </div>
 
                     <div className="settings-tools-row">
@@ -1183,7 +1154,6 @@ export default function App() {
                   <h1>{externalStopOffered ? t.forceStopConfirmTitle : status.phase === "running" ? t.dshRunning : status.phase === "starting" ? t.dshStarting : status.phase === "stopping" ? t.dshStopping : status.phase === "restarting" ? t.dshRestarting : t.dshStart}</h1>
                   <p>{translateBackendMessage(status.message, lang)}</p>
                   {status.phase === "running" && status.url && <p className="stage-url">{status.url}</p>}
-                  {status.phase === "running" && embeddedWebviewOpen && <p className="window-close-hint">{t.windowCloseHint}</p>}
                 </div>
 
                 <div className="quick-actions">

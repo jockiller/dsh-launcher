@@ -90,9 +90,12 @@ fn bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<Bootstrap, St
 }
 
 #[tauri::command]
-fn save_config(config: LauncherConfig) -> Result<(), String> {
+fn save_config(app: AppHandle, config: LauncherConfig) -> Result<(), String> {
     config.validate()?;
-    config.save().map_err(|e| e.to_string())
+    let show_tray = config.show_tray_icon;
+    config.save().map_err(|e| e.to_string())?;
+    tray::apply_visibility(&app, show_tray);
+    Ok(())
 }
 
 #[tauri::command]
@@ -255,9 +258,11 @@ async fn run_profile_clean(app: AppHandle, profile: Option<String>) -> Result<()
     }
 }
 
-/// 空态页中的"在此窗口打开"：直接以内嵌视图打开 DSH。
+/// 显式以内嵌视图打开/揭示 DSH。
 #[tauri::command]
 async fn open_embedded_view(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    // 显式打开：清除隐藏标记，确保切回 webview
+    state.content_hidden.store(false, Ordering::Release);
     // add_child 需要派发到主线程，放在异步命令/独立线程上执行，避免阻塞 IPC。
     let url = {
         let service = state.service.lock().map_err(|error| error.to_string())?;
@@ -557,7 +562,6 @@ pub fn run() {
             ..
         } = &event
         {
-            eprintln!("[close-debug] CloseRequested label={label}");
             if label == "main" {
                 api.prevent_close();
                 // 多 WebView 窗口下，hide 若在 CloseRequested 回调帧内同步执行会与
@@ -571,15 +575,9 @@ pub fn run() {
         if let RunEvent::MainEventsCleared = &event
             && PENDING_MAIN_HIDE.swap(false, Ordering::AcqRel)
         {
-            eprintln!("[close-debug] MainEventsCleared -> hide main");
             if let Some(window) = handle.get_window("main") {
                 service::save_window_state(&window);
-                match window.hide() {
-                    Ok(()) => eprintln!("[close-debug] hide ok"),
-                    Err(error) => eprintln!("[close-debug] hide err: {error}"),
-                }
-            } else {
-                eprintln!("[close-debug] main window not found");
+                let _ = window.hide();
             }
         }
 

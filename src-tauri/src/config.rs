@@ -13,6 +13,7 @@ pub struct LauncherConfig {
     pub port: u16,
     pub custom_args: String,
     pub auto_start: bool,
+    pub show_tray_icon: bool,
     pub auto_scroll_logs: bool,
     pub managed_runtime_dir: String,
 }
@@ -48,6 +49,7 @@ impl Default for LauncherConfig {
             port: 3080,
             custom_args: "--no-open".into(),
             auto_start: false,
+            show_tray_icon: true,
             auto_scroll_logs: true,
             managed_runtime_dir: String::new(),
         }
@@ -225,6 +227,7 @@ mod tests {
         assert_eq!(config.port, 3080);
         assert_eq!(config.custom_args, "--no-open");
         assert!(!config.auto_start);
+        assert!(config.show_tray_icon);
         assert!(config.managed_runtime_dir.is_empty());
         assert!(config.validate().is_ok());
     }

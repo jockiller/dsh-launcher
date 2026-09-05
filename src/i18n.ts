@@ -76,7 +76,6 @@ const zhDict = {
   forceStoppingAction: "正在停止外部服务",
   dshStart: "启动 DSH",
   loadingWebview: "正在加载 DSH 界面...",
-  windowCloseHint: "本窗口可以关闭",
   restartService: "重启服务",
   openInBrowser: "在浏览器打开",
   viewOnGitHub: "在 GitHub 上查看项目",
@@ -121,9 +120,10 @@ const zhDict = {
   forceStopAction: "强制停止",
   // 标题栏
   settingsTitle: "设置",
-  quickActions: "快速操作",
+  showMainWindow: "显示主窗口",
   openEmbedded: "打开",
   languageLabel: "界面语言",
+  showTrayIcon: "显示状态栏/托盘图标",
   // 插件管理
   managePlugins: "管理插件",
   pluginsDialogTitle: "已安装插件",
@@ -212,7 +212,6 @@ const enDict: Dict = {
   forceStoppingAction: "Stopping external service",
   dshStart: "Start DSH",
   loadingWebview: "Loading the DSH interface...",
-  windowCloseHint: "This window can be closed",
   restartService: "Restart",
   openInBrowser: "Open in browser",
   viewOnGitHub: "View project on GitHub",
@@ -256,9 +255,10 @@ const enDict: Dict = {
   forceStopConfirmMessage: "The external DSH process on the current port will be force-killed. This cannot be undone. Continue?",
   forceStopAction: "Force stop",
   settingsTitle: "Settings",
-  quickActions: "Quick actions",
+  showMainWindow: "Show main window",
   openEmbedded: "Open",
   languageLabel: "Interface language",
+  showTrayIcon: "Show menu bar / system tray icon",
   managePlugins: "Manage plugins",
   pluginsDialogTitle: "Installed plugins",
   pluginsDialogHint: "Removing incompatible plugins can restore startup. Actions are written to the service log; restart the service afterwards.",
@@ -270,7 +270,7 @@ const enDict: Dict = {
   uninstallConfirmTitle: "Uninstall plugin",
   uninstallConfirmMessage: "{0} will be removed from the profile dependencies and its files deleted. Stopping the DSH service first is recommended. Continue?",
   uninstallAction: "Uninstall",
-  runCleanLockfile: "清理并重装依赖",
+  runCleanLockfile: "Clean lockfile & reinstall",
   errorBellTitle: "View error details",
   errorDismiss: "Dismiss",
   minimizeAria: "Minimize",
@@ -385,58 +385,41 @@ interface BackendTemplate {
 
 const backendTemplates: readonly BackendTemplate[] = [
   {
-    // 插件管理（plugins 来源）
-    segments: ["正在卸载插件 ", "..."],
-    en: "Uninstalling plugin {0}...",
+    // 优先于下方命令失败前缀模板
+    segments: [" 执行超时（", " 秒），子进程已被终止"],
+    en: "{0} timed out after {1} seconds; the child process was terminated",
+  },
+  {
+    segments: ["正在通过 dsh 卸载插件 ", "..."],
+    en: "Uninstalling plugin {0} via dsh...",
   },
   {
     segments: ["插件 ", " 已卸载"],
     en: "Plugin {0} uninstalled",
   },
   {
-    segments: ["pnpm remove 失败，回退手动清理：", ""],
-    en: "pnpm remove failed; falling back to manual cleanup: {0}",
-  },
-  {
-    segments: ["插件 ", " 已手动移除；lockfile 未同步，建议稍后运行 pnpm install"],
-    en: "Plugin {0} removed manually; the lockfile was not updated, consider running pnpm install later",
-  },
-  {
-    // 优先于下方 "pnpm " 前缀模板
-    segments: ["pnpm ", " 执行超时（180 秒），子进程已被终止"],
-    en: "pnpm {0} timed out after 180 seconds; the child process was terminated",
-  },
-  {
     segments: ["pnpm ", " 失败："],
     en: "pnpm {0} failed: {1}",
+  },
+  {
+    segments: ["dsh ", " 失败："],
+    en: "dsh {0} failed: {1}",
   },
   {
     segments: ["启动 pnpm 失败：", ""],
     en: "Failed to launch pnpm: {0}",
   },
   {
-    segments: ["等待 pnpm 退出失败：", ""],
-    en: "Failed to wait for pnpm to exit: {0}",
+    segments: ["等待 pnpm ", " 退出失败："],
+    en: "Failed to wait for pnpm {0} to exit: {1}",
   },
   {
-    segments: ["读取 package.json 失败：", ""],
-    en: "Failed to read package.json: {0}",
-  },
-  {
-    segments: ["写入 package.json 失败：", ""],
-    en: "Failed to write package.json: {0}",
-  },
-  {
-    segments: ["序列化 package.json 失败：", ""],
-    en: "Failed to serialize package.json: {0}",
+    segments: ["等待 dsh ", " 退出失败："],
+    en: "Failed to wait for dsh {0} to exit: {1}",
   },
   {
     segments: ["package.json 解析失败：", ""],
     en: "Failed to parse package.json: {0}",
-  },
-  {
-    segments: ["删除插件目录失败：", ""],
-    en: "Failed to delete the plugin directory: {0}",
   },
   {
     segments: ["读取插件列表任务异常结束：", ""],

@@ -51,11 +51,10 @@ const SYSTEM_THEME_SCRIPT: &str = r#"
     if (document.documentElement) {
       document.documentElement.dataset.systemTheme = theme;
       document.documentElement.style.colorScheme = theme;
-      // 立即铺底色：DSH 自身样式加载完成前避免露出默认白底
-      document.documentElement.style.backgroundColor = theme === 'dark' ? '#17181b' : '#f7f7f8';
-      if (document.body) {
-        document.body.style.backgroundColor = theme === 'dark' ? '#17181b' : '#f7f7f8';
-      }
+    }
+    if (document.body) {
+      if (theme === 'dark') document.body.setAttribute('data-ds-dark-theme', '');
+      else document.body.removeAttribute('data-ds-dark-theme');
     }
     window.dispatchEvent(new CustomEvent('dsh-system-theme-change', { detail: { theme } }));
   };
@@ -79,23 +78,23 @@ pub(crate) fn theme_apply_script(theme: &str) -> String {
   if (document.documentElement) {{
     document.documentElement.dataset.systemTheme = theme;
     document.documentElement.style.colorScheme = theme;
-    document.documentElement.style.backgroundColor = theme === 'dark' ? '#17181b' : '#f7f7f8';
-    if (document.body) {{
-      document.body.style.backgroundColor = theme === 'dark' ? '#17181b' : '#f7f7f8';
-    }}
+  }}
+  if (document.body) {{
+    if (theme === 'dark') document.body.setAttribute('data-ds-dark-theme', '');
+    else document.body.removeAttribute('data-ds-dark-theme');
   }}
   window.dispatchEvent(new CustomEvent('dsh-system-theme-change', {{ detail: {{ theme }} }}));
 }})();"#
     )
 }
 
-/// DSH → 启动器的主题侦测脚本：监听 DOM 变化并按页面背景亮度判断深浅色，
-/// 变化时通过 document.title 哨兵值上报（原生 title 变更回调，不依赖 IPC 权限）。
-/// 仅注入合并窗口的内容 WebView（macOS/Windows）；Linux 独立窗口不注入，
-/// 避免哨兵标题外露。
+/// DSH → 启动器的主题与标题侦测脚本：
+/// 1. 监听 DOM 变化并根据 DSH 的 `data-ds-dark-theme` / `color-scheme` 或背景判断深浅色，
+///    通过 window.location.hash 桥接向后端汇报主题变更（hash 变化触发 on_navigation，同源放行）。
+/// 2. 保持 document.title 为 DSH 真实标题，由 on_document_title_changed 转发给主窗口。
 pub(crate) const CONTENT_THEME_WATCHER_SCRIPT: &str = r#"
 (() => {
-  const SENTINEL = '__dsh_theme__:';
+  const THEME_PREFIX = '#__dsh_theme__=';
   let last = null;
   const parseColor = (color) => {
     const match = /rgba?\(([^)]+)\)/.exec(color);
@@ -107,32 +106,51 @@ pub(crate) const CONTENT_THEME_WATCHER_SCRIPT: &str = r#"
   };
   const detect = () => {
     try {
-      if (!document.documentElement) return;
-      let rgb = parseColor(getComputedStyle(document.body || document.documentElement).backgroundColor);
-      if (!rgb) rgb = parseColor(getComputedStyle(document.documentElement).backgroundColor);
-      if (!rgb) return;
-      const luminance = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
-      const theme = luminance < 0.5 ? 'dark' : 'light';
+      let theme = null;
+      // 1. 优先读取 DSH 官方属性 data-ds-dark-theme 与 color-scheme
+      if (document.body && document.body.hasAttribute('data-ds-dark-theme')) {
+        theme = 'dark';
+      } else if (document.documentElement && document.documentElement.style.colorScheme) {
+        theme = document.documentElement.style.colorScheme === 'dark' ? 'dark' : 'light';
+      } else {
+        // 2. 回退到背景色亮度判断
+        let el = document.body || document.documentElement;
+        if (el) {
+          let bg = getComputedStyle(el).backgroundColor;
+          let rgb = parseColor(bg);
+          if (rgb) {
+            const luminance = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
+            theme = luminance < 0.5 ? 'dark' : 'light';
+          }
+        }
+      }
+      if (!theme) return;
       if (theme !== last) {
         last = theme;
-        document.title = SENTINEL + theme;
+        try {
+          window.location.hash = THEME_PREFIX + theme;
+        } catch (e) {}
       }
     } catch (error) {}
   };
-  const schedule = () => setTimeout(detect, 80);
+  const schedule = () => setTimeout(detect, 60);
   const observer = new MutationObserver(schedule);
   const observe = () => {
     try {
-      observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'style'] });
-      if (document.body) observer.observe(document.body, { attributes: true, attributeFilter: ['class', 'style'] });
+      if (document.documentElement) {
+        observer.observe(document.documentElement, { attributes: true, attributeFilter: ['style', 'class'] });
+      }
+      if (document.body) {
+        observer.observe(document.body, { attributes: true, attributeFilter: ['data-ds-dark-theme', 'style', 'class'] });
+      }
     } catch (error) {}
   };
   observe();
   document.addEventListener('DOMContentLoaded', () => { observe(); detect(); });
   window.addEventListener('load', detect);
   window.addEventListener('dsh-system-theme-change', schedule);
-  // 兜底轮询：React 重渲染等改到深层容器背景的场景
-  setInterval(detect, 2000);
+  // 轮询兜底：处理非属性驱动变更的场景
+  setInterval(detect, 1000);
 })();
 "#;
 
@@ -2582,6 +2600,9 @@ pub fn profile_directory(profile: &str) -> Option<PathBuf> {
         .or_else(|| user_home().map(|home| home.join(".dsh")))?;
     let trimmed = profile.trim();
     let name = if trimmed.is_empty() { "web" } else { trimmed };
+    if name == "." || name == ".." || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')) {
+        return None;
+    }
     Some(home.join("profiles").join(name))
 }
 
@@ -2642,6 +2663,7 @@ fn pnpm_command(args: &[&str]) -> Command {
     {
         // Windows 上 pnpm 是 pnpm.cmd，必须经 cmd 解析
         let mut command = Command::new("cmd");
+        suppress_console_window(&mut command);
         command.arg("/C").arg(format!("pnpm {}", args.join(" ")));
         command
     }
@@ -2655,6 +2677,40 @@ fn pnpm_command(args: &[&str]) -> Command {
 
 const PNPM_CLEAN_TIMEOUT: Duration = Duration::from_secs(120);
 const PNPM_INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// 为辅助命令配置独立的进程组（Unix），便于超时整组终止子孙进程。
+fn configure_command_process_group(_command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            _command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
+/// 杀死子进程及其可能派生的孙进程（Unix 组杀，Windows taskkill /T /F）。
+fn kill_child_tree(child: &mut Child) {
+    let pid = child.id();
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let mut taskkill = Command::new("taskkill");
+        suppress_console_window(&mut taskkill);
+        let _ = taskkill
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status();
+    }
+    let _ = child.kill();
+}
 
 /// 等待子进程退出（带超时），返回合并后的输出；非零退出视为失败。
 fn wait_for_output(mut child: Child, display: String, timeout: Duration) -> Result<String, String> {
@@ -2685,7 +2741,7 @@ fn wait_for_output(mut child: Child, display: String, timeout: Duration) -> Resu
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
+                    kill_child_tree(&mut child);
                     return Err(format!(
                         "{display} 执行超时（{} 秒），子进程已被终止",
                         timeout.as_secs()
@@ -2700,10 +2756,10 @@ fn wait_for_output(mut child: Child, display: String, timeout: Duration) -> Resu
 
 /// 在指定目录执行 pnpm 命令（带超时），返回合并后的输出。
 fn run_pnpm(dir: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
-    let child = pnpm_command(args)
-        .current_dir(dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    let mut command = pnpm_command(args);
+    command.current_dir(dir).stdout(Stdio::piped()).stderr(Stdio::piped());
+    configure_command_process_group(&mut command);
+    let child = command
         .spawn()
         .map_err(|error| format!("启动 pnpm 失败：{error}"))?;
     wait_for_output(child, format!("pnpm {}", args.join(" ")), timeout)
@@ -2711,10 +2767,13 @@ fn run_pnpm(dir: &Path, args: &[&str], timeout: Duration) -> Result<String, Stri
 
 /// 执行 dsh 命令行（带超时），返回合并后的输出。
 fn run_dsh_cli(dsh_path: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
-    let child = Command::new(dsh_path)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    let mut command = Command::new(dsh_path);
+    let (envs, _) = launcher_environment();
+    command.envs(envs);
+    suppress_console_window(&mut command);
+    command.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    configure_command_process_group(&mut command);
+    let child = command
         .spawn()
         .map_err(|error| format!("启动 dsh 失败：{error}"))?;
     wait_for_output(child, format!("dsh {}", args.join(" ")), timeout)
@@ -2851,9 +2910,17 @@ fn open_content_webview_child(
             // 不导航的复用不会触发新的加载事件：页面已在展示，直接标记为就绪
             let _ = app.emit("content-page-load", true);
         }
-        if content_should_hide() {
+        if !allow_navigate {
+            // 用户显式请求揭示：确保取消隐藏标记并展示
+            if let Some(state) = app.try_state::<crate::AppState>() {
+                state.content_hidden.store(false, Ordering::Release);
+            }
+            let _ = webview.show();
+            raise_window(&main_window)?;
+        } else if content_should_hide() {
             let _ = webview.hide();
         } else {
+            let _ = webview.show();
             raise_window(&main_window)?;
         }
         return Ok(());
@@ -2869,7 +2936,7 @@ fn open_content_webview_child(
     let _ = app.emit("content-page-load", false);
     let webview = main_window
         .add_child(
-            content_webview_builder(parsed),
+            content_webview_builder(app, parsed),
             LogicalPosition::new(0.0, TITLEBAR_HEIGHT),
             LogicalSize::new(width, height),
         )
@@ -2885,12 +2952,19 @@ fn open_content_webview_child(
 /// 构造 DSH 内容子 WebView：同源导航放行，外部 http(s) 链接转交系统浏览器，
 /// 新窗口一律拒绝，并注入系统主题脚本供 DSH 页面跟随深浅色。
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn content_webview_builder(parsed: Url) -> tauri::WebviewBuilder<tauri::Wry> {
+fn content_webview_builder(app: &AppHandle, parsed: Url) -> tauri::WebviewBuilder<tauri::Wry> {
     let allowed_scheme = parsed.scheme().to_string();
     let allowed_host = parsed.host_str().map(str::to_string);
     let allowed_port = parsed.port_or_known_default();
+    let app_nav = app.clone();
     WebviewBuilder::new("content", WebviewUrl::External(parsed))
         .on_navigation(move |next_url| {
+            if let Some(fragment) = next_url.fragment() {
+                if let Some(theme) = fragment.strip_prefix("__dsh_theme__=") {
+                    let theme = if theme == "dark" { "dark" } else { "light" };
+                    let _ = app_nav.emit("content-theme-changed", theme);
+                }
+            }
             let same_origin = next_url.scheme() == allowed_scheme
                 && next_url.host_str().map(str::to_string) == allowed_host
                 && next_url.port_or_known_default() == allowed_port;
@@ -2910,17 +2984,10 @@ fn content_webview_builder(parsed: Url) -> tauri::WebviewBuilder<tauri::Wry> {
         })
         .initialization_script(SYSTEM_THEME_SCRIPT)
         .initialization_script(CONTENT_THEME_WATCHER_SCRIPT)
-        // 主题侦测脚本通过 document.title 哨兵值上报 DSH 实际主题；
-        // 解析后转发给标题栏，并把窗口标题恢复为固定值
+        // 把 DSH 页面的真实 document.title 上报给前端主窗口标题栏展示
         .on_document_title_changed(|webview, title| {
-            if let Some(theme) = title.strip_prefix("__dsh_theme__:") {
-                let theme = if theme == "dark" { "dark" } else { "light" };
-                let app = webview.app_handle();
-                let _ = app.emit("content-theme-changed", theme);
-                if let Some(window) = app.get_window("main") {
-                    let _ = window.set_title("DSH Launcher");
-                }
-            }
+            let app = webview.app_handle();
+            let _ = app.emit("content-title-changed", title);
         })
         // 页面加载进度上报：标题栏层在 Finished 前保持内容隐藏，避免启动/切换
         // 时 webview 未渲染完成的闪烁；Finished 同时重推启动器主题
@@ -2992,6 +3059,8 @@ fn open_embedded_webview_window(
             window
                 .navigate(parsed)
                 .map_err(|error| format!("导航内置 WebView 失败：{error}"))?;
+        } else {
+            let _ = app.emit("content-page-load", true);
         }
         return window
             .show()
@@ -3051,6 +3120,7 @@ fn open_embedded_webview_window(
         .show()
         .and_then(|_| window.set_focus())
         .map_err(|error| format!("显示内置 WebView 失败：{error}"))?;
+    let _ = app.emit("content-page-load", true);
     let _ = app.emit("content-webview-changed", true);
     Ok(())
 }
