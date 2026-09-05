@@ -51,6 +51,7 @@ const SYSTEM_THEME_SCRIPT: &str = r#"
     if (document.documentElement) {
       document.documentElement.dataset.systemTheme = theme;
       document.documentElement.style.colorScheme = theme;
+      document.documentElement.style.backgroundColor = theme === 'dark' ? '#17181b' : '#f7f7f8';
     }
     if (document.body) {
       if (theme === 'dark') document.body.setAttribute('data-ds-dark-theme', '');
@@ -96,6 +97,30 @@ pub(crate) const CONTENT_THEME_WATCHER_SCRIPT: &str = r#"
 (() => {
   const THEME_PREFIX = '#__dsh_theme__=';
   let last = null;
+
+  const report = (theme) => {
+    if (theme && theme !== last) {
+      last = theme;
+      try {
+        window.location.hash = THEME_PREFIX + theme;
+      } catch (e) {}
+    }
+  };
+
+  // 1. 监听用户在 DSH 设置项中的点击交互（Light / Dark / Follow system）
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    const text = (btn.textContent || '').trim();
+    if (text.includes('跟随系统') || text.includes('Follow system') || text.includes('System')) {
+      report('system');
+    } else if (text.includes('深色') || text.includes('Dark')) {
+      report('dark');
+    } else if (text.includes('浅色') || text.includes('Light')) {
+      report('light');
+    }
+  }, true);
+
   const parseColor = (color) => {
     const match = /rgba?\(([^)]+)\)/.exec(color);
     if (!match) return null;
@@ -104,16 +129,27 @@ pub(crate) const CONTENT_THEME_WATCHER_SCRIPT: &str = r#"
     if (parts[3] === 0) return null;
     return parts;
   };
+
   const detect = () => {
     try {
+      // 检查当前是否有选中的设置项（设置面板打开时）
+      const selected = document.querySelector('button[aria-pressed="true"]');
+      if (selected) {
+        const text = (selected.textContent || '').trim();
+        if (text.includes('跟随系统') || text.includes('Follow system') || text.includes('System')) {
+          report('system');
+          return;
+        }
+      }
+
       let theme = null;
-      // 1. 优先读取 DSH 官方属性 data-ds-dark-theme 与 color-scheme
+      // 优先读取 DSH 官方属性 data-ds-dark-theme 与 color-scheme
       if (document.body && document.body.hasAttribute('data-ds-dark-theme')) {
         theme = 'dark';
       } else if (document.documentElement && document.documentElement.style.colorScheme) {
         theme = document.documentElement.style.colorScheme === 'dark' ? 'dark' : 'light';
       } else {
-        // 2. 回退到背景色亮度判断
+        // 回退到背景色亮度判断
         let el = document.body || document.documentElement;
         if (el) {
           let bg = getComputedStyle(el).backgroundColor;
@@ -124,12 +160,8 @@ pub(crate) const CONTENT_THEME_WATCHER_SCRIPT: &str = r#"
           }
         }
       }
-      if (!theme) return;
-      if (theme !== last) {
-        last = theme;
-        try {
-          window.location.hash = THEME_PREFIX + theme;
-        } catch (e) {}
+      if (theme) {
+        report(theme);
       }
     } catch (error) {}
   };
@@ -316,9 +348,8 @@ impl ServiceManager {
                     message: "检测到端口上已有 Web 服务，启动器不会接管".into(),
                 };
                 set_status(&self.status, &app, status.clone());
-                // 外部 DSH 在运行：Dock/托盘回到正常图标（服务健康）；因拿不到 launch token，
+                // 外部 DSH 在运行：托盘回到正常图标（服务健康）；因拿不到 launch token，
                 // 无会话监视，保持常态。
-                crate::dock_blink::set_running_healthy();
                 crate::tray::set_running_healthy();
                 emit_log(
                     &app,
@@ -1076,7 +1107,6 @@ fn begin_handoff(
                         &format!("Reattached session monitor for adopted DSH process {candidate_pid}"),
                     );
                 } else {
-                    crate::dock_blink::set_running_healthy();
                     crate::tray::set_running_healthy();
                 }
                 set_status(
@@ -1364,10 +1394,9 @@ fn set_status(status: &Arc<Mutex<ServiceStatus>>, app: &AppHandle, next: Service
     if let Ok(mut current) = status.lock() {
         *current = next.clone();
     }
-    // Dock 与托盘指示联动：服务未处于 "running" 即回到常态/Idle
+    // 托盘指示联动：服务未处于 "running" 即回到常态/Idle
     // （已停止/启动中/失败/外部检测皆视为服务未就绪；会话监视随后接手 Healthy/Busy）。
     if next.phase != "running" {
-        crate::dock_blink::set_idle();
         crate::tray::set_idle();
     }
     let _ = app.emit("service-status", next);
@@ -2571,13 +2600,16 @@ fn semver_terminator_ok(bytes: &[u8], end: usize) -> bool {
     }
 }
 
-pub fn discover_profiles() -> Vec<String> {
-    let Some(home) = std::env::var_os("DSH_HOME")
+pub fn dsh_home_directory() -> Option<PathBuf> {
+    std::env::var_os("DSH_HOME")
         .map(PathBuf::from)
         .filter(|home| !home.as_os_str().is_empty())
         // 跨平台主目录：Windows 读 USERPROFILE，其余平台读 HOME（与 dsh 自身行为一致）。
         .or_else(|| user_home().map(|home| home.join(".dsh")))
-    else {
+}
+
+pub fn discover_profiles() -> Vec<String> {
+    let Some(home) = dsh_home_directory() else {
         return vec!["web".into()];
     };
     let mut profiles = fs::read_dir(home.join("profiles"))
@@ -2597,16 +2629,50 @@ pub fn discover_profiles() -> Vec<String> {
 }
 
 pub fn profile_directory(profile: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("DSH_HOME")
-        .map(PathBuf::from)
-        .filter(|home| !home.as_os_str().is_empty())
-        .or_else(|| user_home().map(|home| home.join(".dsh")))?;
+    let home = dsh_home_directory()?;
     let trimmed = profile.trim();
     let name = if trimmed.is_empty() { "web" } else { trimmed };
     if name == "." || name == ".." || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')) {
         return None;
     }
     Some(home.join("profiles").join(name))
+}
+
+/// 读取 DSH 全局主题偏好（"system" | "dark" | "light"，未配置或解析失败默认 "system"）。
+pub fn read_dsh_theme_preference() -> String {
+    let Some(home) = dsh_home_directory() else {
+        return "system".into();
+    };
+    let path = home.join("settings.yaml");
+    let Ok(content) = fs::read_to_string(path) else {
+        return "system".into();
+    };
+    parse_dsh_theme_preference(&content)
+}
+
+/// 解析 YAML 文本中的 `ui-theme.preference` 字段
+pub fn parse_dsh_theme_preference(yaml_text: &str) -> String {
+    let mut in_ui_theme = false;
+    for line in yaml_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("ui-theme:") {
+            in_ui_theme = true;
+            continue;
+        }
+        if in_ui_theme {
+            if !line.starts_with(' ') && !line.starts_with('\t') && trimmed.contains(':') {
+                in_ui_theme = false;
+                continue;
+            }
+            if let Some(val) = trimmed.strip_prefix("preference:") {
+                let val = val.trim().trim_matches(|c| c == '\'' || c == '"');
+                if val == "dark" || val == "light" || val == "system" {
+                    return val.to_string();
+                }
+            }
+        }
+    }
+    "system".into()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2960,11 +3026,23 @@ fn content_webview_builder(app: &AppHandle, parsed: Url) -> tauri::WebviewBuilde
     let allowed_host = parsed.host_str().map(str::to_string);
     let allowed_port = parsed.port_or_known_default();
     let app_nav = app.clone();
+    let is_dark = crate::tray::is_system_dark(app);
+    let bg_color = if is_dark {
+        tauri::webview::Color(23, 24, 27, 255)
+    } else {
+        tauri::webview::Color(247, 247, 248, 255)
+    };
     WebviewBuilder::new("content", WebviewUrl::External(parsed))
+        .background_color(bg_color)
         .on_navigation(move |next_url| {
             if let Some(fragment) = next_url.fragment() {
                 if let Some(theme) = fragment.strip_prefix("__dsh_theme__=") {
-                    let theme = if theme == "dark" { "dark" } else { "light" };
+                    let theme = match theme {
+                        "system" => "system",
+                        "dark" => "dark",
+                        "light" => "light",
+                        _ => "system",
+                    };
                     let _ = app_nav.emit("content-theme-changed", theme);
                 }
             }
@@ -3407,6 +3485,27 @@ mod tests {
         assert!(validate_plugin_name("pkg name").is_err());
         assert!(validate_plugin_name("@scope/").is_err());
         assert!(validate_plugin_name("/pkg").is_err());
+    }
+
+    #[test]
+    fn dsh_theme_preference_parsing_matches_settings() {
+        assert_eq!(
+            parse_dsh_theme_preference("ui-theme:\n  preference: system"),
+            "system"
+        );
+        assert_eq!(
+            parse_dsh_theme_preference("ui-theme:\n  preference: dark"),
+            "dark"
+        );
+        assert_eq!(
+            parse_dsh_theme_preference("ui-theme:\n  preference: 'light'"),
+            "light"
+        );
+        assert_eq!(
+            parse_dsh_theme_preference("other:\n  preference: dark"),
+            "system"
+        );
+        assert_eq!(parse_dsh_theme_preference(""), "system");
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]

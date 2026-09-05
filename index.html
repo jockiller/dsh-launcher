@@ -19,7 +19,8 @@
     </script>
     <style>
       /* 渲染就绪前的窗口底色跟随主题，消除窗口创建到首帧之间的白闪 */
-      html:has([data-theme="dark"]) { background: #17181b; }
+      html[data-theme="dark"], html[data-theme="dark"] body { background: #17181b; color: #e4e5e8; }
+      html[data-theme="light"], html[data-theme="light"] body { background: #f7f7f8; color: #24262b; }
     </style>
   </head>
   <body>

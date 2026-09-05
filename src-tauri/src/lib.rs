@@ -1,6 +1,5 @@
 mod app_update;
 mod config;
-mod dock_blink;
 mod managed;
 mod service;
 mod session_monitor;
@@ -38,6 +37,7 @@ struct Bootstrap {
     config: LauncherConfig,
     detected_dsh: Option<String>,
     dsh_version: Option<String>,
+    dsh_theme_preference: String,
     profiles: Vec<String>,
     status: ServiceStatus,
 }
@@ -77,6 +77,7 @@ fn bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<Bootstrap, St
         .and_then(|path| service::dsh_version(path).ok());
     let profiles = service::discover_profiles();
     let status = state.service.lock().map_err(|e| e.to_string())?.status();
+    let dsh_theme_preference = service::read_dsh_theme_preference();
 
     Ok(Bootstrap {
         app_version: env!("CARGO_PKG_VERSION"),
@@ -84,6 +85,7 @@ fn bootstrap(app: AppHandle, state: State<'_, AppState>) -> Result<Bootstrap, St
         config,
         detected_dsh: detected.map(|path| path.to_string_lossy().into_owned()),
         dsh_version: version,
+        dsh_theme_preference,
         profiles,
         status,
     })
@@ -432,7 +434,6 @@ async fn check_dsh_version(current_version: String) -> Result<managed::DshVersio
 }
 
 pub fn shutdown_service(handle: &AppHandle) {
-    dock_blink::stop();
     tray::stop();
     if let Some(state) = handle.try_state::<AppState>()
         && let Ok(mut service) = state.service.lock()
@@ -455,7 +456,6 @@ pub fn run() {
                 .plugin(tauri_plugin_updater::Builder::new().build())
                 .map_err(|error| format!("注册 updater 插件失败：{error}"))?;
 
-            let config = LauncherConfig::load();
             // 主窗口：本地前端渲染自定义标题栏与空态页。macOS 保留原生红绿灯
             // （Overlay 覆盖在标题栏上），Windows/Linux 完全无边框、由前端自绘控制按钮。
             let mut main_builder =
@@ -509,14 +509,6 @@ pub fn run() {
                     "warning",
                     &format!("初始化系统托盘失败：{error}"),
                 );
-            }
-            // Dock 图标动态指示（macOS）：纯外挂，失败只影响自身，不影响主流程。
-            dock_blink::init(app.handle().clone());
-            if config.auto_start {
-                let state = app.state::<AppState>();
-                if let Ok(mut service) = state.service.lock() {
-                    let _ = service.start(app.handle().clone(), config, false);
-                }
             }
             Ok(())
         })

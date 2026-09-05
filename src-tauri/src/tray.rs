@@ -33,8 +33,7 @@ pub fn show_main_window(app: &AppHandle) {
 pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let title_item = MenuItem::with_id(app, "title", "DSH Launcher", false, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
-    let show_item = MenuItem::with_id(app, "show_main", "打开主界面", true, None::<&str>)?;
-    let web_item = MenuItem::with_id(app, "open_web", "打开 Web GUI", true, None::<&str>)?;
+    let open_item = MenuItem::with_id(app, "open_app", "打开", true, None::<&str>)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
     let start_item = MenuItem::with_id(app, "start_service", "启动服务", true, None::<&str>)?;
     let stop_item = MenuItem::with_id(app, "stop_service", "停止服务", true, None::<&str>)?;
@@ -47,8 +46,7 @@ pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         &[
             &title_item,
             &sep1,
-            &show_item,
-            &web_item,
+            &open_item,
             &sep2,
             &start_item,
             &stop_item,
@@ -72,19 +70,24 @@ pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 
     builder
         .on_menu_event(move |app, event| match event.id().as_ref() {
-            "show_main" => {
-                show_main_window(app);
-            }
-            "open_web" => {
-                // 打开内置 DSH 视图（可能创建子 WebView，add_child 需派发主线程），
-                // 放到异步运行时执行，避免在菜单事件（主线程）里同步阻塞。
+            "open_app" => {
+                // 打开：优先展示正在运行的 DSH 内嵌 WebView，否则唤起主窗口
                 let app_handle = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    if let Some(state) = app_handle.try_state::<crate::AppState>()
-                        && let Ok(service) = state.service.lock()
-                        && let Some(url) = service.authenticated_url().or_else(|| service.status().url)
-                    {
+                    let maybe_url = if let Some(state) = app_handle.try_state::<crate::AppState>() {
+                        if let Ok(service) = state.service.lock() {
+                            service.authenticated_url().or_else(|| service.status().url)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some(url) = maybe_url {
                         let _ = crate::service::open_content_view(&app_handle, &url, false);
+                    } else {
+                        show_main_window(&app_handle);
                     }
                 });
             }
@@ -205,7 +208,7 @@ pub fn apply_visibility(app: &AppHandle, visible: bool) {
 }
 
 /// 判断当前宿主是否处于深色外观模式（暗色菜单栏/任务栏）
-fn is_system_dark(app: &AppHandle) -> bool {
+pub(crate) fn is_system_dark(app: &AppHandle) -> bool {
     if let Some(window) = app.get_window("main") {
         if let Ok(theme) = window.theme() {
             return theme == tauri::Theme::Dark;
@@ -243,9 +246,10 @@ fn generate_tray_frame(raw_rgba: &[u8], width: u32, height: u32, is_dark: bool, 
     }
 
     if with_green_dot {
-        // 在右下角绘制浑圆且带抗锯齿平滑边缘的高对比小绿点
-        let (cx, cy) = (24.5_f64, 24.5_f64);
-        let r = 3.8_f64;
+        // 在右下角绘制浑圆且带抗锯齿平滑边缘的高对比小绿点（自适应宽高比例定位）
+        let cx = (width as f64) - 5.5_f64;
+        let cy = (height as f64) - 5.5_f64;
+        let r = 3.6_f64;
         let dot_rgb = [34_u8, 197_u8, 94_u8]; // 翠绿 #22c55e
 
         for y in 0..height {
@@ -350,19 +354,21 @@ mod tests {
 
     #[test]
     fn tray_green_dot_generation_adds_bright_green_pixels() {
-        let raw = vec![0_u8; 32 * 32 * 4];
-        let frame_with_dot = generate_tray_frame(&raw, 32, 32, true, true);
-        assert_eq!(frame_with_dot.len(), 32 * 32 * 4);
+        let (w, h) = (34, 28);
+        let raw = vec![0_u8; (w * h * 4) as usize];
+        let frame_with_dot = generate_tray_frame(&raw, w, h, true, true);
+        assert_eq!(frame_with_dot.len(), (w * h * 4) as usize);
 
-        // 检查圆心 (24, 24) 附近像素应为鲜绿色
-        let idx = ((24 * 32 + 24) * 4) as usize;
+        // 检查圆心附近像素应为鲜绿色
+        let (dot_x, dot_y) = (28, 22);
+        let idx = ((dot_y * w + dot_x) * 4) as usize;
         assert_eq!(frame_with_dot[idx], 34);     // R
         assert_eq!(frame_with_dot[idx + 1], 197); // G
         assert_eq!(frame_with_dot[idx + 2], 94);  // B
         assert_eq!(frame_with_dot[idx + 3], 255); // A
 
         // 检查无绿点帧：对应像素应为全透明
-        let frame_no_dot = generate_tray_frame(&raw, 32, 32, true, false);
+        let frame_no_dot = generate_tray_frame(&raw, w, h, true, false);
         assert_eq!(frame_no_dot[idx + 3], 0);
     }
 }

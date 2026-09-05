@@ -60,6 +60,7 @@ interface Bootstrap {
   config: Config;
   detectedDsh: string | null;
   dshVersion: string | null;
+  dshThemePreference: "system" | "dark" | "light";
   profiles: string[];
   status: ServiceStatus;
 }
@@ -106,7 +107,6 @@ interface ProfilePlugin {
 // 与后端 ServiceStatus 默认值一致；展示时经 translateBackendMessage 按当前语言渲染
 const emptyStatus: ServiceStatus = { phase: "stopped", pid: null, url: null, message: "服务未运行" };
 const STARTUP_OVERLAY_MIN_MS = 700;
-const STARTUP_OVERLAY_MAX_MS = 12_000;
 
 function errorMessage(error: unknown) {
   return typeof error === "string" ? error : error instanceof Error ? error.message : String(error);
@@ -240,6 +240,7 @@ export default function App() {
   const previousDialogRef = useRef<"install" | "update" | "dsh-version" | "plugins" | null>(null);
   const versionCheckSeq = useRef(0);
   const appVersionCheckSeq = useRef(0);
+  const autoStartTriggered = useRef(false);
 
   const isMac = platform === "macos";
 
@@ -264,6 +265,13 @@ export default function App() {
         setDshVersionInfo(null);
         setProfiles(data.profiles);
         setStatus(data.status);
+        if (data.dshThemePreference === "system") {
+          // DSH 配置为跟随系统：清除本地旧缓存覆盖，使主页面严格跟随系统
+          setThemeOverride(null);
+          localStorage.removeItem("dsh-launcher-theme-preference");
+        } else if (data.dshThemePreference === "dark" || data.dshThemePreference === "light") {
+          setThemeOverride(data.dshThemePreference);
+        }
         if (data.status.phase === "external") {
           setExternalStopOffered(true);
         }
@@ -305,9 +313,14 @@ export default function App() {
     const contentViewListener = listen<boolean>("content-webview-changed", ({ payload }) => {
       setEmbeddedWebviewOpen(payload);
     });
-    // DSH 内容页的主题侦测上报：以 DSH 实际主题为准，标题栏跟随（持久化覆盖值）
+    // DSH 内容页的主题侦测上报：若为 system 则主页面跟随系统，否则固定为对应主题
     const contentThemeListener = listen<string>("content-theme-changed", ({ payload }) => {
-      setThemeOverride(payload === "dark" ? "dark" : "light");
+      if (payload === "system") {
+        setThemeOverride(null);
+        localStorage.removeItem("dsh-launcher-theme-preference");
+      } else if (payload === "dark" || payload === "light") {
+        setThemeOverride(payload);
+      }
     });
     // 内容页加载进度：Started/Finished
     const contentPageLoadListener = listen<boolean>("content-page-load", ({ payload }) => {
@@ -392,7 +405,13 @@ export default function App() {
 
   // 内容关闭时重置就绪状态；加载事件异常时 8 秒兜底揭示
   useEffect(() => {
-    if (!embeddedWebviewOpen) setContentPageReady(false);
+    if (!embeddedWebviewOpen) {
+      setContentPageReady(false);
+    } else {
+      // 当 webview 成功打开时，自动取消设置面板和错误面板的打开状态，防止遮挡或快速回退
+      setSettingsOpen(false);
+      setErrorPanelOpen(false);
+    }
   }, [embeddedWebviewOpen]);
   useEffect(() => {
     if (!embeddedWebviewOpen || contentPageReady) return;
@@ -510,14 +529,17 @@ export default function App() {
 
   useEffect(() => {
     if (!config || !minStartupElapsed) return;
-    const waitingForAutoStart = config.autoStart && status.phase === "starting";
-    if (!waitingForAutoStart) {
-      setStartupReady(true);
-      return;
+    setStartupReady(true);
+  }, [config, minStartupElapsed]);
+
+  // 当主窗口就绪且配置要求自动启动时，以标准的启动流程自动触发（先展示主窗口，中心带过渡卡片，等就绪后再平滑切入 webview）
+  useEffect(() => {
+    if (!startupReady || !config?.autoStart || autoStartTriggered.current) return;
+    if (status.phase === "stopped") {
+      autoStartTriggered.current = true;
+      void runCommand("start_service");
     }
-    const timeout = window.setTimeout(() => setStartupReady(true), STARTUP_OVERLAY_MAX_MS);
-    return () => clearTimeout(timeout);
-  }, [config, minStartupElapsed, status.phase]);
+  }, [startupReady, config?.autoStart, status.phase]);
 
   // 强制关闭入口提供恢复路径：Esc 退回普通 external 状态（再次点击启动即为重新检测）
   useEffect(() => {
@@ -879,6 +901,11 @@ export default function App() {
   async function runCommand(command: "start_service" | "stop_service" | "restart_service") {
     if (!config) return;
     const action = command === "start_service" ? "start" : command === "stop_service" ? "stop" : "restart";
+    if (command === "start_service" || command === "restart_service") {
+      // 启动或重启时自动取消设置的选中状态与弹层，确保服务就绪后直接呈现 webview
+      setSettingsOpen(false);
+      setErrorPanelOpen(false);
+    }
     flushSync(() => {
       setBusy(true);
       setPendingAction(action);

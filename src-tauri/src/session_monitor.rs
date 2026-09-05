@@ -77,9 +77,8 @@ pub(crate) fn spawn(
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run(app.clone(), credentials, cancel.clone());
         }));
-        // 退出时的 Dock/托盘指示复位（带 cancel 校验——stop/restart 时 service 层
-        // 已将图标设为红色/常态 Idle，此处不再覆盖）。
-        crate::dock_blink::set_running_checked(false, &cancel);
+        // 退出时的托盘指示复位（带 cancel 校验——stop/restart 时 service 层
+        // 已将图标设为常态 Idle，此处不再覆盖）。
         crate::tray::set_running_checked(false, &cancel);
         if result.is_err() {
             emit_log(&app, "monitor", "error", "会话监视：意外异常退出（不影响其他功能）");
@@ -171,11 +170,10 @@ fn run(
         match poll_running(&agent, &origin, &current_cookie, &sequence) {
             Ok(snapshot) => {
                 failures = 0;
-                // 同步 Dock 与状态栏托盘图标指示：有运行中会话（含子代理）时闪烁指示。
+                // 同步状态栏托盘图标指示：有运行中会话（含子代理）时闪烁指示。
                 // 带代际校验：cancel（服务停止/重启）后旧线程的写入被忽略，
                 // 不会覆盖 stop 时由 service 层设置的 Idle 状态。
                 let active = snapshot.main > 0 || snapshot.subagents > 0;
-                crate::dock_blink::set_running_checked(active, &cancel);
                 crate::tray::set_running_checked(active, &cancel);
             }
             Err(PollFailure::Unauthorized) => {
