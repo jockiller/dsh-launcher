@@ -316,9 +316,10 @@ impl ServiceManager {
                     message: "检测到端口上已有 Web 服务，启动器不会接管".into(),
                 };
                 set_status(&self.status, &app, status.clone());
-                // 外部 DSH 在运行：Dock 回到绿色（服务健康）；因拿不到 launch token，
-                // 无会话监视，保持绿色常亮。
+                // 外部 DSH 在运行：Dock/托盘回到正常图标（服务健康）；因拿不到 launch token，
+                // 无会话监视，保持常态。
                 crate::dock_blink::set_running_healthy();
+                crate::tray::set_running_healthy();
                 emit_log(
                     &app,
                     "launcher",
@@ -1076,6 +1077,7 @@ fn begin_handoff(
                     );
                 } else {
                     crate::dock_blink::set_running_healthy();
+                    crate::tray::set_running_healthy();
                 }
                 set_status(
                     &status,
@@ -1362,10 +1364,11 @@ fn set_status(status: &Arc<Mutex<ServiceStatus>>, app: &AppHandle, next: Service
     if let Ok(mut current) = status.lock() {
         *current = next.clone();
     }
-    // Dock 指示联动：服务未处于 "running" 即回到红色 Idle
+    // Dock 与托盘指示联动：服务未处于 "running" 即回到常态/Idle
     // （已停止/启动中/失败/外部检测皆视为服务未就绪；会话监视随后接手 Healthy/Busy）。
     if next.phase != "running" {
         crate::dock_blink::set_idle();
+        crate::tray::set_idle();
     }
     let _ = app.emit("service-status", next);
 }

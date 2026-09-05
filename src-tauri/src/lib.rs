@@ -433,6 +433,7 @@ async fn check_dsh_version(current_version: String) -> Result<managed::DshVersio
 
 pub fn shutdown_service(handle: &AppHandle) {
     dock_blink::stop();
+    tray::stop();
     if let Some(state) = handle.try_state::<AppState>()
         && let Ok(mut service) = state.service.lock()
     {
