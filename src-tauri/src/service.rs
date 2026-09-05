@@ -21,10 +21,12 @@ use std::time::{Duration, Instant};
 
 use chrono::Local;
 use serde::Serialize;
-use tauri::webview::{NewWindowResponse, PageLoadEvent};
+use tauri::webview::NewWindowResponse;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, Manager, Url, WebviewUrl};
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-use tauri::{PhysicalPosition, PhysicalSize, WebviewWindowBuilder, WindowEvent};
+use tauri::{PhysicalPosition, PhysicalSize, WebviewWindow, WebviewWindowBuilder, WindowEvent};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use tauri::{LogicalPosition, LogicalSize, Rect, WebviewBuilder};
 
@@ -2231,6 +2233,7 @@ fn login_shell_base_environment(shell: &Path, output_file: &Path) -> Vec<(OsStri
 
 #[cfg(unix)]
 fn default_login_shell_path() -> OsString {
+    #[allow(unused_mut)]
     let mut entries = vec![
         PathBuf::from("/usr/local/sbin"),
         PathBuf::from("/usr/local/bin"),
@@ -3215,7 +3218,7 @@ fn register_window_state_persistence(window: &WebviewWindow) {
     let app = window.app_handle().clone();
     window.on_window_event(move |event| {
         if let WindowEvent::CloseRequested { api, .. } = event
-            && let Some(window) = app.get_webview_window("dsh-webview")
+            && let Some(window) = app.get_window("dsh-webview")
         {
             save_window_state(&window);
             api.prevent_close();
@@ -3288,7 +3291,7 @@ fn close_embedded_webview(app: &AppHandle) {
         let _ = app.emit("content-webview-changed", false);
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    if let Some(window) = app.get_webview_window("dsh-webview") {
+    if let Some(window) = app.get_window("dsh-webview") {
         save_window_state(&window);
         let _ = window.destroy();
         let _ = app.emit("content-webview-changed", false);
