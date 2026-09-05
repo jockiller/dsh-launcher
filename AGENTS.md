@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-DSH Launcher is a cross-platform desktop manager for DeepSeek Harness (DSH) Web services.
+DSH Desktop is a cross-platform desktop manager for DeepSeek Harness (DSH) Web services.
 
 - Stack: Tauri 2, Rust 2024, React 19, TypeScript, and Vite
 - Platforms: macOS, Windows, and Linux

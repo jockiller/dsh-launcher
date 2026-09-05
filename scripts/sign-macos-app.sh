@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-app="${1:-src-tauri/target/release/bundle/macos/DSH Launcher.app}"
+app="${1:-src-tauri/target/release/bundle/macos/DSH Desktop.app}"
 if [[ -z "$app" || ! -d "$app" ]]; then
   echo "No macOS app bundle found." >&2
   exit 1
@@ -14,7 +14,7 @@ test -n "$description"
 test "$local_networking" = "true"
 
 if [[ -z "${APPLE_CERTIFICATE:-}" ]]; then
-  codesign --force --deep --sign - --identifier ai.deepseek.dsh-launcher "$app"
+  codesign --force --deep --sign - --identifier ai.deepseek.dsh-desktop "$app"
 fi
 codesign --verify --deep --strict --verbose=2 "$app"
 printf 'Signed and verified: %s\n' "$app"

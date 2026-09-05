@@ -31,7 +31,7 @@ pub fn show_main_window(app: &AppHandle) {
 }
 
 pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    let title_item = MenuItem::with_id(app, "title", "DSH Launcher", false, None::<&str>)?;
+    let title_item = MenuItem::with_id(app, "title", "DSH Desktop", false, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
     let open_item = MenuItem::with_id(app, "open_app", "打开", true, None::<&str>)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
@@ -62,7 +62,7 @@ pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     )))?;
 
     let builder = TrayIconBuilder::with_id("dsh-tray")
-        .tooltip("DSH Launcher")
+        .tooltip("DSH Desktop")
         .icon(tray_icon)
         .icon_as_template(true)
         .menu(&menu)

@@ -7,11 +7,11 @@
 //   本地调试时可显式传入 repo 与 tag 参数。
 //
 // 平台映射（按 .sig 文件名匹配，url 指向同 Release 的对应产物。各平台产物在
-// build.yml 中统一改名为 DSH_Launcher_<系统>-<架构>...，无空格，与最终资产名一致）：
-//   DSH_Launcher_macos-arm64.app.tar.gz.sig   -> darwin-aarch64   （macOS arm64 热更包，CI 重签后改名）
-//   DSH_Launcher_macos-x64.app.tar.gz.sig     -> darwin-x86_64    （macOS x64 热更包）
-//   DSH_Launcher_windows-x64-setup.exe.sig    -> windows-x86_64   （NSIS 安装器，per-user 静默重装）
-//   DSH_Launcher_windows-arm64-setup.exe.sig  -> windows-aarch64
+// build.yml 中统一改名为 DSH_Desktop_<系统>-<架构>...，无空格，与最终资产名一致）：
+//   DSH_Desktop_macos-arm64.app.tar.gz.sig   -> darwin-aarch64   （macOS arm64 热更包，CI 重签后改名）
+//   DSH_Desktop_macos-x64.app.tar.gz.sig     -> darwin-x86_64    （macOS x64 热更包）
+//   DSH_Desktop_windows-x64-setup.exe.sig    -> windows-x86_64   （NSIS 安装器，per-user 静默重装）
+//   DSH_Desktop_windows-arm64-setup.exe.sig  -> windows-aarch64
 //
 // 注意：latest.json 只输出这 4 个平台——热更新仅支持 macOS 与 Windows；Linux
 //（DEB/RPM/AppImage）不参与热更：AppImage 自替换未经实机验证、deb/rpm 需要
@@ -22,7 +22,7 @@ import { join } from "node:path";
 
 const dir = process.argv[2] ?? "release-assets";
 const out = process.argv[3] ?? join(dir, "latest.json");
-const repo = process.env.GITHUB_REPOSITORY ?? "jockiller/dsh-launcher";
+const repo = process.env.GITHUB_REPOSITORY ?? "jockiller/dsh-desktop";
 const rawTag = process.env.GITHUB_REF_NAME ?? process.argv[4] ?? "";
 const version = rawTag.replace(/^v/i, "");
 
@@ -32,10 +32,10 @@ if (!/^\d+\.\d+\.\d+/.test(version)) {
 }
 
 const ROUTES = [
-  [/^DSH_Launcher_macos-arm64\.app\.tar\.gz\.sig$/, "darwin-aarch64"],
-  [/^DSH_Launcher_macos-x64\.app\.tar\.gz\.sig$/, "darwin-x86_64"],
-  [/^DSH_Launcher_windows-x64-setup\.exe\.sig$/, "windows-x86_64"],
-  [/^DSH_Launcher_windows-arm64-setup\.exe\.sig$/, "windows-aarch64"],
+  [/^DSH_Desktop_macos-arm64\.app\.tar\.gz\.sig$/, "darwin-aarch64"],
+  [/^DSH_Desktop_macos-x64\.app\.tar\.gz\.sig$/, "darwin-x86_64"],
+  [/^DSH_Desktop_windows-x64-setup\.exe\.sig$/, "windows-x86_64"],
+  [/^DSH_Desktop_windows-arm64-setup\.exe\.sig$/, "windows-aarch64"],
 ];
 
 function collectFiles(root) {
@@ -61,8 +61,8 @@ for (const path of collectFiles(dir).sort()) {
     console.error(`平台 ${platform} 出现重复签名文件：${name}`);
     process.exit(1);
   }
-  // GitHub 上传 Release 资产时会把文件名中的空格替换为点号（DSH Launcher_x.exe →
-  // DSH.Launcher_x...），latest.json 的 URL 必须与上传后的资产名一致，否则 404。
+  // GitHub 上传 Release 资产时会把文件名中的空格替换为点号（DSH Desktop_x.exe →
+  // DSH.Desktop_x...），latest.json 的 URL 必须与上传后的资产名一致，否则 404。
   // 构建侧已负责把产物改名（空格→下划线/点），这里对剩余空格做同样归一化兜底。
   const assetName = basenameWithoutSig(name).replaceAll(" ", ".");
   const url = `https://github.com/${repo}/releases/download/${rawTag}/${assetName}`;

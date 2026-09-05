@@ -5,7 +5,8 @@
 
 export type Lang = "zh" | "en";
 
-export const LANG_STORAGE_KEY = "dsh-launcher-lang";
+export const LANG_STORAGE_KEY = "dsh-desktop-lang";
+export const LEGACY_LANG_STORAGE_KEY = "dsh-launcher-lang";
 
 const zhDict = {
   loading: "正在加载...",
@@ -81,8 +82,8 @@ const zhDict = {
   viewOnGitHub: "在 GitHub 上查看项目",
   openGitHub: "跳转到 GitHub",
   checkForUpdates: "检查更新",
-  launcherUpdateAvailable: "发现 Launcher v{0}，点击查看更新日志",
-  appVersionDialogTitle: "Launcher 版本",
+  launcherUpdateAvailable: "发现 DSH Desktop v{0}，点击查看更新日志",
+  appVersionDialogTitle: "DSH Desktop 版本",
   appVersionClickTitle: "点击查看当前版本更新内容",
   appVersionCurrentNotesLabel: "当前版本更新内容",
   appVersionLatestNotesLabel: "新版本更新内容",
@@ -217,8 +218,8 @@ const enDict: Dict = {
   viewOnGitHub: "View project on GitHub",
   openGitHub: "Open GitHub",
   checkForUpdates: "Check for updates",
-  launcherUpdateAvailable: "Launcher v{0} is available; click to view the update log",
-  appVersionDialogTitle: "Launcher version",
+  launcherUpdateAvailable: "DSH Desktop v{0} is available; click to view the update log",
+  appVersionDialogTitle: "DSH Desktop version",
   appVersionClickTitle: "View what's new in this version",
   appVersionCurrentNotesLabel: "What's new in this version",
   appVersionLatestNotesLabel: "What's new in the latest version",
@@ -292,7 +293,7 @@ export function format(template: string, ...params: Array<string | number>): str
 export function detectLanguage(): Lang {
   let saved: string | null = null;
   try {
-    saved = localStorage.getItem(LANG_STORAGE_KEY);
+    saved = localStorage.getItem(LANG_STORAGE_KEY) ?? localStorage.getItem(LEGACY_LANG_STORAGE_KEY);
   } catch {
     // localStorage 不可用（隐私模式等）时退回浏览器语言判断
     saved = null;
@@ -321,6 +322,10 @@ export function persistLanguage(lang: Lang): void {
 
 /** 精确匹配：后端完整中文原文 → 英文。 */
 const backendExact: Record<string, string> = {
+  "仅允许打开 DSH Desktop 的 GitHub Release 页面":
+    "Only opening DSH Desktop's GitHub Release page is permitted",
+  "仅允许打开 DSH Launcher 的 GitHub Release 页面":
+    "Only opening DSH Desktop's GitHub Release page is permitted",
   服务未运行: "Service not running",
   "检测到端口上已有 Web 服务，启动器不会接管":
     "A web service is already running on this port. The launcher will not take it over.",

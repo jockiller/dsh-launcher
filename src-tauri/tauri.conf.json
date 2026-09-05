@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "DSH Launcher",
-  "version": "1.4.1",
-  "identifier": "ai.deepseek.dsh-launcher",
+  "productName": "DSH Desktop",
+  "version": "1.5.0",
+  "identifier": "ai.deepseek.dsh-desktop",
   "build": {
     "beforeDevCommand": "pnpm run dev",
     "devUrl": "http://localhost:1420",
@@ -24,7 +24,7 @@
     "license": "MIT",
     "licenseFile": "../LICENSE",
     "shortDescription": "Launch and manage an existing DSH Web service.",
-    "longDescription": "A lightweight desktop launcher for starting, stopping, and monitoring an existing DeepSeek Harness installation.",
+    "longDescription": "A lightweight desktop app for starting, stopping, and monitoring an existing DeepSeek Harness installation.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -55,7 +55,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEEyQkY0NUMwOTNBNzdENApSV1RVZHpvSlhQUXJDdDFNWUV6dDh4WGlOSTM0a1VYckMrb1NyK3BDSUxMeXF0RWdHU1hCMW5uQQo=",
       "endpoints": [
-        "https://github.com/jockiller/dsh-launcher/releases/latest/download/latest.json"
+        "https://github.com/jockiller/dsh-desktop/releases/latest/download/latest.json"
       ]
     }
   }

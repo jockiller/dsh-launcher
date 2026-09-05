@@ -1,14 +1,14 @@
-# DSH Launcher
+# DSH Desktop
 
 简体中文 | [English](README_EN.md)
 
-**超小的 DSH 启动器，无侵入，你不需要担心有任何插件冲突。支持一键安装和自动启动。**
+**超小的 DSH 桌面应用，无侵入，你不需要担心有任何插件冲突。支持一键安装和自动启动。**
 
 轻量桌面应用，一键安装、启动和管理本地 DeepSeek Harness（DSH）Web 服务。基于 Tauri 2 + React + Rust。
 
 ## 界面
 
-![DSH Launcher 桌面界面](docs/images/launcher.png)
+![DSH Desktop 桌面界面](docs/images/launcher.png)
 
 ![DeepSeek 内置 WebView](docs/images/webview.png)
 
@@ -17,7 +17,7 @@
 - **自动识别**：自动检测已安装的 DSH，也可手动选择
 - **一键安装**：在空目录中自动下载校验 Node LTS 并安装 DSH，不修改系统 PATH
 - **一键升级**：自动检测托管 DSH 新版本，确认后停止服务再升级
-- **应用内热更新**：Launcher 自身检测新版本并弹出更新日志，经签名校验后自动下载安装、一键重启，全程无需手动下载
+- **应用内热更新**：DSH Desktop 自身检测新版本并弹出更新日志，经签名校验后自动下载安装、一键重启，全程无需手动下载
 - **服务管理**：启动 / 停止 / 重启，HTTP 健康检查，实时日志
 - **开箱即用**：服务就绪后自动打开内置 WebView 或默认浏览器
 - **灵活配置**：Profile、监听地址、端口与附加 DSH 参数
@@ -32,10 +32,10 @@
 
 ## macOS 首次启动
 
-- 应用未经 Apple 公证，若提示"未知开发者"，将 `DSH Launcher.app` 放入 `/Applications` 后执行：
+- 应用未经 Apple 公证，若提示"未知开发者"，将 `DSH Desktop.app` 放入 `/Applications` 后执行：
 
   ```bash
-  sudo xattr -r -d com.apple.quarantine "/Applications/DSH Launcher.app"
+  sudo xattr -r -d com.apple.quarantine "/Applications/DSH Desktop.app"
   ```
 
 - macOS 15+ 首次启动会请求"本地网络"权限——如需访问本地局域网中的模型服务，请允许该权限（系统设置 → 隐私与安全性 → 本地网络）

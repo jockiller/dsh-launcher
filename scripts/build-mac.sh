@@ -5,18 +5,32 @@
 set -euo pipefail
 
 if [[ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
-  key_file="${TAURI_SIGNING_PRIVATE_KEY_FILE:-$HOME/.tauri/dsh-launcher.key}"
+  key_file="${TAURI_SIGNING_PRIVATE_KEY_FILE:-}"
+  if [[ -z "$key_file" ]]; then
+    if [[ -s "$HOME/.tauri/dsh-desktop.key" ]]; then
+      key_file="$HOME/.tauri/dsh-desktop.key"
+    else
+      key_file="$HOME/.tauri/dsh-launcher.key"
+    fi
+  fi
   if [[ -s "$key_file" ]]; then
     export TAURI_SIGNING_PRIVATE_KEY="$(cat "$key_file")"
   else
     echo "未找到 updater 签名私钥（$key_file）。" >&2
-    echo "请运行：pnpm exec tauri signer generate -w ~/.tauri/dsh-launcher.key --password \"<你的密码>\" --ci" >&2
+    echo "请运行：pnpm exec tauri signer generate -w ~/.tauri/dsh-desktop.key --password \"<你的密码>\" --ci" >&2
     exit 1
   fi
 fi
 
 if [[ -z "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]]; then
-  password_file="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD_FILE:-$HOME/.tauri/dsh-launcher.key.password}"
+  password_file="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD_FILE:-}"
+  if [[ -z "$password_file" ]]; then
+    if [[ -s "$HOME/.tauri/dsh-desktop.key.password" ]]; then
+      password_file="$HOME/.tauri/dsh-desktop.key.password"
+    else
+      password_file="$HOME/.tauri/dsh-launcher.key.password"
+    fi
+  fi
   if [[ -s "$password_file" ]]; then
     export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$(cat "$password_file")"
   else

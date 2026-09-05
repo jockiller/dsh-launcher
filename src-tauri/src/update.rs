@@ -11,13 +11,13 @@ use serde::{Deserialize, Serialize};
 use tauri::async_runtime::spawn_blocking;
 
 /// GitHub latest release API 地址。
-const RELEASE_API_URL: &str = "https://api.github.com/repos/jockiller/dsh-launcher/releases/latest";
+const RELEASE_API_URL: &str = "https://api.github.com/repos/jockiller/dsh-desktop/releases/latest";
 
 /// Release 列表兜底跳转地址；仅当 API 返回的 html_url 未通过校验时使用。
-pub const RELEASES_PAGE_URL: &str = "https://github.com/jockiller/dsh-launcher/releases";
+pub const RELEASES_PAGE_URL: &str = "https://github.com/jockiller/dsh-desktop/releases";
 
 /// 允许打开的 URL 前缀：只放行本项目的 GitHub Release 相关页面。
-const ALLOWED_URL_PREFIX: &str = "https://github.com/jockiller/dsh-launcher/releases";
+const ALLOWED_URL_PREFIX: &str = "https://github.com/jockiller/dsh-desktop/releases";
 
 /// 网络请求整体超时。
 const FETCH_TIMEOUT: Duration = Duration::from_secs(12);
@@ -101,7 +101,7 @@ fn fetch_latest_release() -> Option<ReleaseUpdate> {
     let agent = ureq::AgentBuilder::new().timeout(FETCH_TIMEOUT).build();
     let payload = agent
         .get(RELEASE_API_URL)
-        .set("User-Agent", "dsh-launcher")
+        .set("User-Agent", "dsh-desktop")
         .set("Accept", "application/vnd.github+json")
         .call()
         .ok()?
@@ -168,7 +168,7 @@ fn normalize_tag(tag: &str) -> Option<String> {
     (!stripped.is_empty()).then(|| stripped.to_string())
 }
 
-/// 纯逻辑：仅放行本项目的 Release 页面（`https://github.com/jockiller/dsh-launcher/releases`
+/// 纯逻辑：仅放行本项目的 Release 页面（`https://github.com/jockiller/dsh-desktop/releases`
 /// 及其子路径），供版本按钮点击时打开；拒绝其他协议、主机、转义字符与路径穿越，
 /// 避免界面把任意 URL 交给系统打开。
 pub fn validate_release_url(url: &str) -> bool {
@@ -203,19 +203,19 @@ mod tests {
     #[test]
     fn release_url_accepts_project_release_pages_only() {
         assert!(validate_release_url(
-            "https://github.com/jockiller/dsh-launcher/releases"
+            "https://github.com/jockiller/dsh-desktop/releases"
         ));
         assert!(validate_release_url(
-            "https://github.com/jockiller/dsh-launcher/releases/"
+            "https://github.com/jockiller/dsh-desktop/releases/"
         ));
         assert!(validate_release_url(
-            "https://github.com/jockiller/dsh-launcher/releases/tag/v0.2.0"
+            "https://github.com/jockiller/dsh-desktop/releases/tag/v0.2.0"
         ));
         assert!(validate_release_url(
-            "https://github.com/jockiller/dsh-launcher/releases/latest"
+            "https://github.com/jockiller/dsh-desktop/releases/latest"
         ));
         assert!(validate_release_url(
-            "  https://github.com/jockiller/dsh-launcher/releases/tag/v1.0.0  "
+            "  https://github.com/jockiller/dsh-desktop/releases/tag/v1.0.0  "
         ));
     }
 
@@ -223,32 +223,32 @@ mod tests {
     fn release_url_rejects_other_schemes_hosts_and_paths() {
         // 非 https 协议
         assert!(!validate_release_url(
-            "http://github.com/jockiller/dsh-launcher/releases"
+            "http://github.com/jockiller/dsh-desktop/releases"
         ));
         // 非 Release 路径
         assert!(!validate_release_url(
-            "https://github.com/jockiller/dsh-launcher"
+            "https://github.com/jockiller/dsh-desktop"
         ));
         assert!(!validate_release_url(
-            "https://github.com/jockiller/dsh-launcher/actions"
+            "https://github.com/jockiller/dsh-desktop/actions"
         ));
         // 前缀必须完整（ releasesX 之类不放行）
         assert!(!validate_release_url(
-            "https://github.com/jockiller/dsh-launcher/releasesX"
+            "https://github.com/jockiller/dsh-desktop/releasesX"
         ));
         // 其他仓库与其他主机
         assert!(!validate_release_url(
-            "https://github.com/evil/dsh-launcher/releases"
+            "https://github.com/evil/dsh-desktop/releases"
         ));
         assert!(!validate_release_url(
-            "https://evil.com/jockiller/dsh-launcher/releases"
+            "https://evil.com/jockiller/dsh-desktop/releases"
         ));
         // 转义与路径穿越
         assert!(!validate_release_url(
-            "https://github.com/jockiller/dsh-launcher/releases/tag/v1%2e0"
+            "https://github.com/jockiller/dsh-desktop/releases/tag/v1%2e0"
         ));
         assert!(!validate_release_url(
-            "https://github.com/jockiller/dsh-launcher/releases/../admin"
+            "https://github.com/jockiller/dsh-desktop/releases/../admin"
         ));
         // 其他协议头与注入形态
         assert!(!validate_release_url("javascript:alert(1)"));
@@ -259,10 +259,10 @@ mod tests {
     #[test]
     fn release_json_parses_github_payload() {
         const PAYLOAD: &str = r###"{
-            "url": "https://api.github.com/repos/jockiller/dsh-launcher/releases/1",
+            "url": "https://api.github.com/repos/jockiller/dsh-desktop/releases/1",
             "tag_name": "v0.2.0",
-            "name": "DSH Launcher 0.2.0",
-            "html_url": "https://github.com/jockiller/dsh-launcher/releases/tag/v0.2.0",
+            "name": "DSH Desktop 0.2.0",
+            "html_url": "https://github.com/jockiller/dsh-desktop/releases/tag/v0.2.0",
             "body": "## 修复\n- 一键安装",
             "prerelease": false
         }"###;
@@ -270,7 +270,7 @@ mod tests {
         assert_eq!(tag_name, "v0.2.0");
         assert_eq!(
             html_url,
-            "https://github.com/jockiller/dsh-launcher/releases/tag/v0.2.0"
+            "https://github.com/jockiller/dsh-desktop/releases/tag/v0.2.0"
         );
         assert_eq!(body.as_deref(), Some("## 修复\n- 一键安装"));
         // 缺 tag_name 视为失败；非法 JSON 同样失败
@@ -286,7 +286,7 @@ mod tests {
         // 新版本：红点
         let update = evaluate_release(
             "v0.2.0",
-            "https://github.com/jockiller/dsh-launcher/releases/tag/v0.2.0",
+            "https://github.com/jockiller/dsh-desktop/releases/tag/v0.2.0",
             Some("## 更新内容\n- 修复一键安装"),
             "0.1.0",
         );
@@ -295,7 +295,7 @@ mod tests {
             ReleaseUpdate {
                 latest_version: Some("0.2.0".into()),
                 release_url: Some(
-                    "https://github.com/jockiller/dsh-launcher/releases/tag/v0.2.0".into()
+                    "https://github.com/jockiller/dsh-desktop/releases/tag/v0.2.0".into()
                 ),
                 update_available: true,
                 notes: Some("## 更新内容\n- 修复一键安装".into()),
@@ -329,7 +329,7 @@ mod tests {
         // release 页面偏离白名单时回退到固定列表页
         let update = evaluate_release(
             "v0.2.0",
-            "https://evil.com/jockiller/dsh-launcher/releases/tag/v0.2.0",
+            "https://evil.com/jockiller/dsh-desktop/releases/tag/v0.2.0",
             None,
             "0.1.0",
         );

@@ -3,14 +3,14 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>DSH Launcher</title>
+    <title>DSH Desktop</title>
     <script>
       // 首帧前同步主题，避免 React 挂载后设置 data-theme 造成的白底闪烁。
       // 与 App.tsx 的偏好键保持一致；后续主脚本会覆盖为最终值。
       (() => {
         let theme = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
         try {
-          const saved = localStorage.getItem("dsh-launcher-theme-preference");
+          const saved = localStorage.getItem("dsh-desktop-theme-preference") ?? localStorage.getItem("dsh-launcher-theme-preference");
           if (saved === "light" || saved === "dark") theme = saved;
         } catch {}
         document.documentElement.dataset.theme = theme;

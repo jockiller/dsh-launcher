@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.5.0 - 2026-09-05
+
+### 重大升级与重命名
+
+- **项目全面升级更名为 DSH Desktop**：
+  - 项目名称由 `dsh-launcher` 正式更名为 `dsh-desktop`，应用产品名称升级为 **DSH Desktop**；
+  - 标识符同步升级为 `ai.deepseek.dsh-desktop`，更新发布源地址与 GitHub 仓库无缝迁移至 `jockiller/dsh-desktop`；
+  - 优化全平台打包产物命名规范（统一为 `DSH_Desktop_*`）；
+  - 运行时标记与本地存储全面平滑兼容迁移，保证已有环境无缝衔接。
+
 ## v1.4.1 - 2026-09-05
 
 ### 新增与优化

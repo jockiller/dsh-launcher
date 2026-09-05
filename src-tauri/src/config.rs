@@ -158,8 +158,8 @@ pub(crate) fn user_home() -> Option<PathBuf> {
     home_dir_for(current_platform(), &|key| std::env::var(key).ok())
 }
 
-/// 跨平台配置目录：Windows %APPDATA%\DSH Launcher（缺失时回退
-/// USERPROFILE\AppData\Roaming），macOS ~/Library/Application Support/DSH Launcher，
+/// 跨平台配置目录：Windows %APPDATA%\DSH Desktop（缺失时回退
+/// USERPROFILE\AppData\Roaming），macOS ~/Library/Application Support/DSH Desktop，
 /// Linux/其他遵循 XDG_CONFIG_HOME（仅接受绝对路径）否则回退 ~/.config。
 fn platform_config_dir(platform: PlatformTarget, lookup: EnvLookup<'_>) -> Option<PathBuf> {
     let home = home_dir_for(platform, lookup)?;
@@ -185,7 +185,7 @@ fn platform_config_dir(platform: PlatformTarget, lookup: EnvLookup<'_>) -> Optio
     })
 }
 
-const APP_DIR_NAME: &str = "DSH Launcher";
+const APP_DIR_NAME: &str = "DSH Desktop";
 
 fn env_lookup(key: &str) -> Option<String> {
     std::env::var(key)
@@ -296,7 +296,7 @@ mod tests {
         assert_eq!(
             platform_config_dir(PlatformTarget::MacOS, &lookup),
             Some(PathBuf::from(
-                "/Users/demo/Library/Application Support/DSH Launcher"
+                "/Users/demo/Library/Application Support/DSH Desktop"
             ))
         );
     }
@@ -309,13 +309,13 @@ mod tests {
         ]);
         assert_eq!(
             platform_config_dir(PlatformTarget::Unix, &absolute),
-            Some(PathBuf::from("/etc/dsh-config/DSH Launcher"))
+            Some(PathBuf::from("/etc/dsh-config/DSH Desktop"))
         );
         // XDG 规范：相对路径视作无效，回退 ~/.config
         let relative = lookup_for(&[("HOME", "/home/demo"), ("XDG_CONFIG_HOME", "relative/dir")]);
         assert_eq!(
             platform_config_dir(PlatformTarget::Unix, &relative),
-            Some(PathBuf::from("/home/demo/.config/DSH Launcher"))
+            Some(PathBuf::from("/home/demo/.config/DSH Desktop"))
         );
     }
 
@@ -326,7 +326,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let root =
-            std::env::temp_dir().join(format!("dsh-launcher-test-{}-{nanos}", std::process::id()));
+            std::env::temp_dir().join(format!("dsh-desktop-test-{}-{nanos}", std::process::id()));
         let path = root.join("nested").join("config.json");
         let first = LauncherConfig::default();
         first.write_atomic(&path).unwrap();

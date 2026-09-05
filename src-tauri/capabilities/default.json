@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default DSH Launcher permissions",
+  "description": "Default DSH Desktop permissions",
   "windows": ["main"],
   "webviews": ["main"],
   "permissions": [

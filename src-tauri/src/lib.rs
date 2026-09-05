@@ -282,7 +282,7 @@ async fn open_embedded_view(app: AppHandle, state: State<'_, AppState>) -> Resul
 
 #[tauri::command]
 fn open_project_page() -> Result<(), String> {
-    service::open_default("https://github.com/jockiller/dsh-launcher")
+    service::open_default("https://github.com/jockiller/dsh-desktop")
 }
 
 #[tauri::command]
@@ -329,7 +329,7 @@ fn open_release_page(url: String) -> Result<(), String> {
     if update::validate_release_url(&url) {
         service::open_default(url.trim())
     } else {
-        Err("仅允许打开 DSH Launcher 的 GitHub Release 页面".into())
+        Err("仅允许打开 DSH Desktop 的 GitHub Release 页面".into())
     }
 }
 
@@ -460,7 +460,7 @@ pub fn run() {
             // （Overlay 覆盖在标题栏上），Windows/Linux 完全无边框、由前端自绘控制按钮。
             let mut main_builder =
                 tauri::WebviewWindowBuilder::new(app.handle(), "main", tauri::WebviewUrl::default())
-                    .title("DSH Launcher")
+                    .title("DSH Desktop")
                     .inner_size(1180.0, 780.0)
                     .min_inner_size(760.0, 520.0)
                     .resizable(true);
@@ -545,7 +545,7 @@ pub fn run() {
             app_update::app_update_restart,
         ])
         .build(tauri::generate_context!())
-        .expect("failed to build DSH Launcher");
+        .expect("failed to build DSH Desktop");
 
     app.run(|handle, event| {
         // macOS 平台关闭窗口仅隐藏，不退出应用，应用与 DSH 继续常驻在状态栏托盘/Dock 中。

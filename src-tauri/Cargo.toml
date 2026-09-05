@@ -1,15 +1,15 @@
 [package]
-name = "dsh-launcher"
-version = "1.4.1"
-description = "A lightweight launcher for DSH Web"
+name = "dsh-desktop"
+version = "1.5.0"
+description = "A lightweight desktop app for DSH Web"
 license = "MIT"
-authors = ["DSH Launcher"]
+authors = ["DSH Desktop"]
 edition = "2024"
 rust-version = "1.88"
 publish = false
 
 [lib]
-name = "dsh_launcher_lib"
+name = "dsh_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

@@ -25,8 +25,8 @@ jobs:
             updater-arch: arm64
             paths: |
               src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
-              src-tauri/target/aarch64-apple-darwin/release/bundle/macos/DSH_Launcher_macos-arm64.app.tar.gz
-              src-tauri/target/aarch64-apple-darwin/release/bundle/macos/DSH_Launcher_macos-arm64.app.tar.gz.sig
+              src-tauri/target/aarch64-apple-darwin/release/bundle/macos/DSH_Desktop_macos-arm64.app.tar.gz
+              src-tauri/target/aarch64-apple-darwin/release/bundle/macos/DSH_Desktop_macos-arm64.app.tar.gz.sig
           - name: macOS x64
             os: macos-15-intel
             rust-target: x86_64-apple-darwin
@@ -35,8 +35,8 @@ jobs:
             updater-arch: x64
             paths: |
               src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
-              src-tauri/target/x86_64-apple-darwin/release/bundle/macos/DSH_Launcher_macos-x64.app.tar.gz
-              src-tauri/target/x86_64-apple-darwin/release/bundle/macos/DSH_Launcher_macos-x64.app.tar.gz.sig
+              src-tauri/target/x86_64-apple-darwin/release/bundle/macos/DSH_Desktop_macos-x64.app.tar.gz
+              src-tauri/target/x86_64-apple-darwin/release/bundle/macos/DSH_Desktop_macos-x64.app.tar.gz.sig
           - name: Windows x64
             os: windows-latest
             rust-target: x86_64-pc-windows-msvc
@@ -160,39 +160,39 @@ jobs:
 
           scripts/sign-macos-app.sh "$app"
 
-          tarball_base="DSH_Launcher_macos-${{ matrix.updater-arch }}.app.tar.gz"
+          tarball_base="DSH_Desktop_macos-${{ matrix.updater-arch }}.app.tar.gz"
           rm -f "$bundle_dir/macos/$tarball_base" "$bundle_dir/macos/$tarball_base.sig"
           tar -czf "$bundle_dir/macos/$tarball_base" -C "$(dirname "$app")" "$(basename "$app")"
           pnpm exec tauri signer sign "$bundle_dir/macos/$tarball_base"
 
           dmg_dir="$bundle_dir/dmg"
           stage="$dmg_dir/.stage"
-          dmg="$dmg_dir/DSH_Launcher_${{ matrix.artifact }}.dmg"
+          dmg="$dmg_dir/DSH_Desktop_${{ matrix.artifact }}.dmg"
           rm -rf "$stage"
           mkdir -p "$stage"
-          ditto "$app" "$stage/DSH Launcher.app"
+          ditto "$app" "$stage/DSH Desktop.app"
           ln -s /Applications "$stage/Applications"
           rm -f "$dmg"
-          hdiutil create -quiet -volname "DSH Launcher" -srcfolder "$stage" -ov -format UDZO "$dmg"
+          hdiutil create -quiet -volname "DSH Desktop" -srcfolder "$stage" -ov -format UDZO "$dmg"
           rm -rf "$stage"
 
       - name: Rename Windows assets for updater URLs
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          # 统一 Release 资产命名为 DSH_Launcher_windows-<arch>-setup.exe（arch:
+          # 统一 Release 资产命名为 DSH_Desktop_windows-<arch>-setup.exe（arch:
           # x64/arm64），文件名自带系统标识；同时保持不含空格——GitHub 上传
           # Release 资产时会把空格替换为点号，latest.json 的 URL 必须与最终资产
           # 名一致，否则热更下载会 404。
           cd "src-tauri/target/${{ matrix.rust-target }}/release/bundle/nsis"
           for f in *-setup.exe *-setup.exe.sig; do
             [[ -e "$f" ]] || continue
-            # tauri 产物名形如 "DSH Launcher_<版本>_<arch>-setup.exe[.sig]"
+            # tauri 产物名形如 "DSH Desktop_<版本>_<arch>-setup.exe[.sig]"
             tail="${f##*_}"
             if [[ "$f" == *.sig ]]; then
-              mv -f "$f" "DSH_Launcher_windows-${tail%%-setup.exe*}-setup.exe.sig"
+              mv -f "$f" "DSH_Desktop_windows-${tail%%-setup.exe*}-setup.exe.sig"
             else
-              mv -f "$f" "DSH_Launcher_windows-${tail%%-setup.exe*}-setup.exe"
+              mv -f "$f" "DSH_Desktop_windows-${tail%%-setup.exe*}-setup.exe"
             fi
           done
 
@@ -200,25 +200,25 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          # 统一 Release 资产命名为 DSH_Launcher_linux-<arch>.<ext>，文件名自带
+          # 统一 Release 资产命名为 DSH_Desktop_linux-<arch>.<ext>，文件名自带
           # 系统标识，不必单靠扩展名辨认平台；<arch> 沿用各包格式惯例：
           # deb 用 amd64/arm64，rpm 用 x86_64/aarch64，AppImage 用 amd64/aarch64。
           bundle_dir="src-tauri/target/${{ matrix.rust-target }}/release/bundle"
 
-          # deb：tauri 产物名形如 "DSH Launcher_<版本>_amd64.deb"
+          # deb：tauri 产物名形如 "DSH Desktop_<版本>_amd64.deb"
           for f in "$bundle_dir"/deb/*.deb; do
             [[ -e "$f" ]] || continue
             base="$(basename "$f")"
-            mv -f "$f" "$bundle_dir/deb/DSH_Launcher_linux-${base##*_}"
+            mv -f "$f" "$bundle_dir/deb/DSH_Desktop_linux-${base##*_}"
           done
 
-          # rpm：tauri 产物名形如 "DSH Launcher-<版本>-<release>.<arch>.rpm"
+          # rpm：tauri 产物名形如 "DSH Desktop-<版本>-<release>.<arch>.rpm"
           for f in "$bundle_dir"/rpm/*.rpm; do
             [[ -e "$f" ]] || continue
             base="$(basename "$f")"
             release_arch="${base%.rpm}"
             release_arch="${release_arch##*-}"   # "<release>.<arch>"
-            mv -f "$f" "$bundle_dir/rpm/DSH_Launcher_linux-${release_arch#*.}.rpm"
+            mv -f "$f" "$bundle_dir/rpm/DSH_Desktop_linux-${release_arch#*.}.rpm"
           done
 
           # AppImage：补执行位、改名后打包（解压出来即统一命名的 AppImage）
@@ -228,14 +228,14 @@ jobs:
           base="$(basename "$appimage")"
           arch="${base%.AppImage}"
           arch="${arch##*_}"
-          new_name="DSH_Launcher_linux-${arch}.AppImage"
+          new_name="DSH_Desktop_linux-${arch}.AppImage"
           chmod +x "$appimage"
           mv -f "$appimage" "$appimage_dir/$new_name"
           tar -czf "$appimage_dir/$new_name.tar.gz" -C "$appimage_dir" "$new_name"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: dsh-launcher-${{ matrix.artifact }}
+          name: dsh-desktop-${{ matrix.artifact }}
           path: ${{ matrix.paths }}
           if-no-files-found: error
 
@@ -246,7 +246,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: dsh-launcher-windows-x64
+          name: dsh-desktop-windows-x64
           path: installer
 
       - name: Install NSIS package silently
@@ -262,8 +262,8 @@ jobs:
         run: |
           $desktop = [Environment]::GetFolderPath('Desktop')
           $candidates = @(
-            (Join-Path $desktop 'DSH Launcher.lnk'),
-            (Join-Path $env:PUBLIC 'Desktop\DSH Launcher.lnk')
+            (Join-Path $desktop 'DSH Desktop.lnk'),
+            (Join-Path $env:PUBLIC 'Desktop\DSH Desktop.lnk')
           )
           $shortcutPath = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
           if (-not $shortcutPath) { throw "Desktop shortcut not found: $($candidates -join ', ')" }
@@ -290,7 +290,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          pattern: dsh-launcher-*
+          pattern: dsh-desktop-*
           path: release-assets
           merge-multiple: true
 
@@ -309,9 +309,9 @@ jobs:
           fi
           printf '%s\n' "$notes" > release-notes.md
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release edit "$GITHUB_REF_NAME" --notes-file release-notes.md --title "DSH Launcher $GITHUB_REF_NAME"
+            gh release edit "$GITHUB_REF_NAME" --notes-file release-notes.md --title "DSH Desktop $GITHUB_REF_NAME"
           else
-            gh release create "$GITHUB_REF_NAME" --verify-tag --notes-file release-notes.md --title "DSH Launcher $GITHUB_REF_NAME"
+            gh release create "$GITHUB_REF_NAME" --verify-tag --notes-file release-notes.md --title "DSH Desktop $GITHUB_REF_NAME"
           fi
           rm -f release-notes.md
 

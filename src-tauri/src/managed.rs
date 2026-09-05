@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter};
 
-const MARKER_NAME: &str = ".dsh-launcher-managed.json";
+const MARKER_NAME: &str = ".dsh-desktop-managed.json";
+const LEGACY_MARKER_NAME: &str = ".dsh-launcher-managed.json";
 const NODE_INDEX_URL: &str = "https://nodejs.org/dist/index.json";
 const NODE_MIRROR_INDEX_URL: &str = "https://npmmirror.com/mirrors/node/index.json";
 const NPM_LATEST_URL: &str = "https://registry.npmjs.org/@deepseek-ai%2Fdsh/latest";
@@ -119,7 +120,7 @@ pub fn install_managed(
     };
     let base_url = format!("{download_dist}/{}/", release.version);
     let checksum_base_url = format!("{NODE_OFFICIAL_DIST}/{}/", release.version);
-    let staging = root.join(".dsh-launcher-staging");
+    let staging = root.join(".dsh-desktop-staging");
     let archive = staging.join(&archive_name);
     let result = (|| {
         fs::create_dir_all(&staging).map_err(|e| format!("创建安装临时目录失败：{e}"))?;
@@ -181,7 +182,7 @@ pub fn install_managed(
         Ok(status_from(&root, marker))
     })();
     let _ = fs::remove_dir_all(&staging);
-    if result.is_err() && !root.join(MARKER_NAME).is_file() {
+    if result.is_err() && !root.join(MARKER_NAME).is_file() && !root.join(LEGACY_MARKER_NAME).is_file() {
         let _ = fs::remove_dir_all(root.join("node"));
         let _ = fs::remove_dir_all(runtime_dir(&root));
         let _ = fs::remove_file(managed_dsh_path(&root));
@@ -330,7 +331,7 @@ fn fetch_release_notes(version: &str) -> Option<String> {
         .timeout(HTTP_TIMEOUT)
         .build()
         .get(&url)
-        .set("User-Agent", "dsh-launcher")
+        .set("User-Agent", "dsh-desktop")
         .set("Accept", "application/vnd.github+json")
         .call()
         .ok()?
@@ -367,7 +368,7 @@ fn fetch_text(url: &str) -> Result<String, String> {
         .timeout(HTTP_TIMEOUT)
         .build()
         .get(url)
-        .set("User-Agent", "dsh-launcher")
+        .set("User-Agent", "dsh-desktop")
         .call()
         .map_err(|e| format!("网络请求失败：{e}"))?
         .into_string()
@@ -379,7 +380,7 @@ fn download_to(app: &AppHandle, url: &str, path: &Path) -> Result<(), String> {
         .timeout(DOWNLOAD_TIMEOUT)
         .build()
         .get(url)
-        .set("User-Agent", "dsh-launcher")
+        .set("User-Agent", "dsh-desktop")
         .call()
         .map_err(|e| format!("下载 Node 失败：{e}"))?;
     let total = response
@@ -694,7 +695,12 @@ fn validate_install_root(root: &Path) -> Result<(), String> {
 }
 
 fn read_marker(root: &Path) -> Result<Marker, String> {
-    let payload = fs::read_to_string(root.join(MARKER_NAME))
+    let path = if root.join(MARKER_NAME).is_file() {
+        root.join(MARKER_NAME)
+    } else {
+        root.join(LEGACY_MARKER_NAME)
+    };
+    let payload = fs::read_to_string(path)
         .map_err(|_| "该目录不是 Launcher 托管的运行环境".to_string())?;
     let marker: Marker =
         serde_json::from_str(&payload).map_err(|e| format!("托管环境标记损坏：{e}"))?;
@@ -853,7 +859,7 @@ pub fn legacy_managed_dsh_path(root: &Path) -> PathBuf {
 /// 返回迁移（或校验）后的托管入口完整路径。
 pub fn migrate_layout(root: &Path) -> Result<PathBuf, String> {
     let wrapper = managed_dsh_path(root);
-    if !root.join(MARKER_NAME).is_file() {
+    if !root.join(MARKER_NAME).is_file() && !root.join(LEGACY_MARKER_NAME).is_file() {
         return Ok(wrapper);
     }
     let runtime = runtime_dir(root);
@@ -1037,7 +1043,7 @@ mod tests {
     #[test]
     fn marker_mirror_follows_saved_marker() {
         let dir =
-            std::env::temp_dir().join(format!("dsh-launcher-mirror-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("dsh-desktop-mirror-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         write_marker(
             &dir,
@@ -1084,7 +1090,7 @@ mod tests {
     #[test]
     fn managed_dsh_requires_canonical_entry_and_runtime() {
         let root =
-            std::env::temp_dir().join(format!("dsh-launcher-managed-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("dsh-desktop-managed-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let wrapper = managed_dsh_path(&root);

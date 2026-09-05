@@ -2312,7 +2312,7 @@ fn create_login_shell_capture_file() -> Option<(PathBuf, PathBuf)> {
     let temp_root = std::env::temp_dir();
     for attempt in 0..16 {
         let directory = temp_root.join(format!(
-            "dsh-launcher-{}-{stamp}-{attempt}",
+            "dsh-desktop-{}-{stamp}-{attempt}",
             std::process::id()
         ));
         if fs::create_dir(&directory).is_err() {
@@ -2356,7 +2356,7 @@ fn run_login_shell_capture(
         };
         let mut argv: Vec<&OsStr> = argset.iter().map(OsStr::new).collect();
         argv.push(OsStr::new(script));
-        argv.push(OsStr::new("dsh-launcher"));
+        argv.push(OsStr::new("dsh-desktop"));
         if let SpawnOutcome::Completed { success: true } =
             spawn_with_timeout(&shell, &argv, remaining, Some(&shell_environment))
             && let Ok(content) = fs::read(&temp_file)
@@ -3709,7 +3709,7 @@ mod tests {
         let original = std::env::vars_os().collect::<Vec<_>>();
         let environment = login_shell_base_environment(
             Path::new("/bin/sh"),
-            Path::new("/tmp/dsh-launcher-test-env"),
+            Path::new("/tmp/dsh-desktop-test-env"),
         );
         for (key, value) in original {
             if !environment_key_eq(&key, OsStr::new("PATH"))
@@ -3728,7 +3728,7 @@ mod tests {
         );
         assert_eq!(
             environment_value(&environment, "DSH_LAUNCHER_ENV_FILE"),
-            Some(&OsString::from("/tmp/dsh-launcher-test-env"))
+            Some(&OsString::from("/tmp/dsh-desktop-test-env"))
         );
         assert_eq!(
             environment_value(&environment, "PATH"),
@@ -3961,7 +3961,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let root =
-            std::env::temp_dir().join(format!("dsh-launcher-nvm-{}-{stamp}", std::process::id()));
+            std::env::temp_dir().join(format!("dsh-desktop-nvm-{}-{stamp}", std::process::id()));
         for name in ["v20.11.0", "v22.19.0", "v9.11.2"] {
             fs::create_dir_all(root.join(name)).unwrap();
         }

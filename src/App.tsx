@@ -176,7 +176,9 @@ export default function App() {
     window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light",
   );
   const [themeOverride, setThemeOverride] = useState<Theme | null>(() => {
-    const saved = localStorage.getItem("dsh-launcher-theme-preference");
+    const saved =
+      localStorage.getItem("dsh-desktop-theme-preference") ??
+      localStorage.getItem("dsh-launcher-theme-preference");
     return saved === "light" || saved === "dark" ? saved : null;
   });
   const theme = themeOverride ?? systemTheme;
@@ -271,6 +273,7 @@ export default function App() {
         if (data.dshThemePreference === "system") {
           // DSH 配置为跟随系统：清除本地旧缓存覆盖，使主页面严格跟随系统
           setThemeOverride(null);
+          localStorage.removeItem("dsh-desktop-theme-preference");
           localStorage.removeItem("dsh-launcher-theme-preference");
         } else if (data.dshThemePreference === "dark" || data.dshThemePreference === "light") {
           setThemeOverride(data.dshThemePreference);
@@ -332,6 +335,7 @@ export default function App() {
     const contentThemeListener = listen<string>("content-theme-changed", ({ payload }) => {
       if (payload === "system") {
         setThemeOverride(null);
+        localStorage.removeItem("dsh-desktop-theme-preference");
         localStorage.removeItem("dsh-launcher-theme-preference");
       } else if (payload === "dark" || payload === "light") {
         setThemeOverride(payload);
@@ -404,8 +408,12 @@ export default function App() {
   }, [theme]);
 
   useEffect(() => {
-    if (themeOverride) localStorage.setItem("dsh-launcher-theme-preference", themeOverride);
-    else localStorage.removeItem("dsh-launcher-theme-preference");
+    if (themeOverride) {
+      localStorage.setItem("dsh-desktop-theme-preference", themeOverride);
+    } else {
+      localStorage.removeItem("dsh-desktop-theme-preference");
+    }
+    localStorage.removeItem("dsh-launcher-theme-preference");
     localStorage.removeItem("dsh-launcher-theme");
   }, [themeOverride]);
 
@@ -1063,7 +1071,7 @@ export default function App() {
             </button>
           )}
           <div className="tb-title" data-tauri-drag-region="deep">
-            {contentTitle || "DSH Launcher"}
+            {contentTitle || "DSH Desktop"}
           </div>
           <div className="tb-spacer" />
           <div className="tb-actions">

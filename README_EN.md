@@ -1,14 +1,14 @@
-# DSH Launcher
+# DSH Desktop
 
 English | [简体中文](README.md)
 
-**A tiny, non-intrusive DSH launcher — no plugin conflicts to worry about. One-click install and auto start.**
+**A tiny, non-intrusive DSH desktop app — no plugin conflicts to worry about. One-click install and auto start.**
 
 A lightweight desktop app to install, start, and manage a local DeepSeek Harness (DSH) Web service. Built with Tauri 2 + React + Rust.
 
 ## Screenshots
 
-![DSH Launcher desktop interface](docs/images/launcher.png)
+![DSH Desktop desktop interface](docs/images/launcher.png)
 
 ![DeepSeek embedded WebView](docs/images/webview.png)
 
@@ -17,7 +17,7 @@ A lightweight desktop app to install, start, and manage a local DeepSeek Harness
 - **Auto-detect**: automatically finds an installed DSH, or pick one manually
 - **One-click install**: downloads and verifies Node LTS, then installs DSH into an empty directory — no system PATH changes
 - **One-click upgrade**: detects new managed DSH releases, stops the service after confirmation, then upgrades
-- **In-place self-update**: the Launcher detects its own new versions, shows the update log, verifies signatures, and installs with a single restart — no manual download required
+- **In-place self-update**: DSH Desktop detects its own new versions, shows the update log, verifies signatures, and installs with a single restart — no manual download required
 - **Service management**: start / stop / restart, HTTP health checks, live logs
 - **Ready to use**: opens an embedded WebView or the default browser once the service is up
 - **Flexible config**: profile, bind address, port, and extra DSH arguments
@@ -32,10 +32,10 @@ A lightweight desktop app to install, start, and manage a local DeepSeek Harness
 
 ## macOS First Launch
 
-- The app is not notarized. If macOS reports an unidentified developer, move `DSH Launcher.app` to `/Applications` and run:
+- The app is not notarized. If macOS reports an unidentified developer, move `DSH Desktop.app` to `/Applications` and run:
 
   ```bash
-  sudo xattr -r -d com.apple.quarantine "/Applications/DSH Launcher.app"
+  sudo xattr -r -d com.apple.quarantine "/Applications/DSH Desktop.app"
   ```
 
 - On macOS 15+, the app asks for Local Network permission on first launch — allow it if you need to reach model services on your LAN (System Settings → Privacy & Security → Local Network)
