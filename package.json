@@ -1,9 +1,10 @@
 {
   "name": "dsh-launcher",
   "private": true,
-  "version": "1.4.0",
+  "version": "1.4.1",
   "license": "MIT",
   "type": "module",
+  "packageManager": "pnpm@10.5.2",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",

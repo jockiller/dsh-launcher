@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.4.1 - 2026-09-05
+
+### 新增与优化
+
+- **消除 WebView 与主窗口视口滚动回弹（Rubber-banding / Bounce）**：
+  - 注入 `DISABLE_BOUNCE_SCRIPT` 脚本，将页面 `html` 与 `body` 的 `overscroll-behavior` 强制设置为 `none !important`；
+  - 消除 macOS / Windows / Linux 各端在触控板或滚轮滚动到边界时的弹性拉伸与晃动，还原纯正桌面原生质感；
+  - 保持长对话、代码块等页面内部元素顺滑滚动不受任何影响；
+  - 主窗口前端骨架样式同步增加 `overscroll-behavior: none`。
+- **规范前端包管理器声明**：
+  - 在 `package.json` 中增加标准 `packageManager` 声明（`pnpm@10.5.2`），避免 IntelliJ IDEA / WebStorm 等 IDE 误提示 `npm install`。
+
 ## v1.4.0 - 2026-09-05
 
 ### 新增与优化

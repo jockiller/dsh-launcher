@@ -69,6 +69,38 @@ const SYSTEM_THEME_SCRIPT: &str = r#"
 })();
 "#;
 
+/// 禁用 WebView 回弹/橡皮筋效果脚本：
+/// 注入全局 CSS 规则并设置 documentElement / body 的 overscroll-behavior 为 none，
+/// 消除触控板或鼠标滚动到边缘时的拉伸弹跳，提升桌面原生沉浸感。
+const DISABLE_BOUNCE_SCRIPT: &str = r#"
+(() => {
+  const STYLE_ID = '__dsh_disable_bounce__';
+  const apply = () => {
+    try {
+      if (document.documentElement) {
+        document.documentElement.style.setProperty('overscroll-behavior', 'none', 'important');
+      }
+      if (document.body) {
+        document.body.style.setProperty('overscroll-behavior', 'none', 'important');
+      }
+      if (!document.getElementById(STYLE_ID)) {
+        const target = document.head || document.documentElement;
+        if (target) {
+          const style = document.createElement('style');
+          style.id = STYLE_ID;
+          style.textContent = 'html, body { overscroll-behavior: none !important; }';
+          target.appendChild(style);
+        }
+      }
+    } catch (e) {}
+  };
+  apply();
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', apply, { once: true });
+  }
+})();
+"#;
+
 /// 生成把指定主题写入 DSH 页面的脚本：持久化到 localStorage（下次加载免闪）、
 /// 立即应用并派发主题变更事件（DSH 侧订阅该事件）。
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -3070,6 +3102,7 @@ fn content_webview_builder(app: &AppHandle, parsed: Url) -> tauri::WebviewBuilde
         })
         .initialization_script(SYSTEM_THEME_SCRIPT)
         .initialization_script(CONTENT_THEME_WATCHER_SCRIPT)
+        .initialization_script(DISABLE_BOUNCE_SCRIPT)
         // 把 DSH 页面的真实 document.title 上报给前端主窗口标题栏展示
         .on_document_title_changed(|webview, title| {
             let app = webview.app_handle();
@@ -3089,6 +3122,7 @@ fn content_webview_builder(app: &AppHandle, parsed: Url) -> tauri::WebviewBuilde
                 {
                     let _ = webview.eval(theme_apply_script(&theme));
                 }
+                let _ = webview.eval(DISABLE_BOUNCE_SCRIPT);
             }
             let _ = app.emit("content-page-load", finished);
         })
@@ -3184,6 +3218,7 @@ fn open_embedded_webview_window(
         .min_inner_size(760.0, 520.0)
         .visible(false)
         .initialization_script(SYSTEM_THEME_SCRIPT)
+        .initialization_script(DISABLE_BOUNCE_SCRIPT)
         .build()
         .map_err(|error| format!("打开内置 WebView 失败：{error}"))?;
 

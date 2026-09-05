@@ -9,6 +9,7 @@
 
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; }
+html, body { overscroll-behavior: none; }
 body { margin: 0; overflow: hidden; }
 button, input, select { font: inherit; letter-spacing: 0; }
 button { appearance: none; cursor: pointer; }
